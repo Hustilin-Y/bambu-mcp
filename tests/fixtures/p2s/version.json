@@ -1,0 +1,78 @@
+{
+ "info": {
+  "command": "get_version",
+  "module": [
+   {
+    "flag": 3,
+    "hw_ver": "N/A",
+    "loader_ver": "00.00.00.00",
+    "name": "ota",
+    "product_name": "Bambu Lab P2S",
+    "sn": "SN",
+    "sw_ver": "01.03.00.00",
+    "visible": true
+   },
+   {
+    "flag": 0,
+    "hw_ver": "N3F05",
+    "loader_ver": "00.00.00.00",
+    "name": "n3f/0",
+    "product_name": "AMS 2 Pro (1)",
+    "sn": "SN",
+    "sw_ver": "05.00.22.22",
+    "visible": true
+   },
+   {
+    "flag": 0,
+    "hw_ver": "AHB-N703",
+    "loader_ver": "00.00.05.29",
+    "name": "ahb",
+    "product_name": "Filament Buffer - for P2",
+    "sn": "SN",
+    "sw_ver": "01.01.16.19",
+    "visible": true
+   },
+   {
+    "flag": 0,
+    "hw_ver": "TH03",
+    "loader_ver": "00.00.00.10",
+    "name": "th",
+    "product_name": "",
+    "sn": "SN",
+    "sw_ver": "03.00.25.84",
+    "visible": false
+   },
+   {
+    "flag": 0,
+    "hw_ver": "SMC01",
+    "loader_ver": "00.00.06.03",
+    "name": "smc",
+    "product_name": "",
+    "sn": "SN",
+    "sw_ver": "02.00.13.93",
+    "visible": false
+   },
+   {
+    "flag": 0,
+    "hw_ver": "MC06",
+    "loader_ver": "00.01.02.19",
+    "name": "mc",
+    "product_name": "",
+    "sn": "SN",
+    "sw_ver": "04.00.85.78",
+    "visible": false
+   },
+   {
+    "flag": 0,
+    "hw_ver": "AP02",
+    "loader_ver": "00.00.02.04",
+    "name": "ap2",
+    "product_name": "",
+    "sn": "SN",
+    "sw_ver": "00.00.68.31",
+    "visible": false
+   }
+  ],
+  "sequence_id": "0"
+ }
+}
