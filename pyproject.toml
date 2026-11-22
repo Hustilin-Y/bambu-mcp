@@ -32,3 +32,6 @@ packages = ["src/bambu_mcp"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "synthetic: test uses a hand-built payload, not a captured P2S report",
+]
