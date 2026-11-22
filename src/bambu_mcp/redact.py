@@ -23,12 +23,34 @@ class RedactingFilter(logging.Filter):
         super().__init__()
         self._secrets = tuple(s for s in secrets if s)
 
+    def _clean(self, value):
+        if isinstance(value, str):
+            return redact(value, self._secrets)
+        text = str(value)
+        cleaned = redact(text, self._secrets)
+        return cleaned if cleaned != text else value
+
     def filter(self, record: logging.LogRecord) -> bool:
         if not self._secrets:
             return True
-        # Format first so non-str args (objects, dicts) are covered too.
-        record.msg = redact(record.getMessage(), self._secrets)
-        record.args = None
+        # Keep the args structure (formatters such as uvicorn's access
+        # formatter unpack record.args), redacting items in place.
+        original_msg, original_args = record.msg, record.args
+        try:
+            record.msg = self._clean(record.msg)
+            if isinstance(record.args, tuple):
+                record.args = tuple(self._clean(a) for a in record.args)
+            elif isinstance(record.args, dict):
+                record.args = {k: self._clean(v) for k, v in record.args.items()}
+            message = record.getMessage()
+            cleaned = redact(message, self._secrets)
+            if cleaned != message:  # a secret only appears once formatted
+                record.msg, record.args = cleaned, None
+        except Exception:
+            # Malformed log call: never raise from the record factory, the
+            # standard path reports it through Handler.handleError.
+            record.msg = redact(f"{original_msg!s} {original_args!r}", self._secrets)
+            record.args = None
         if record.exc_info and not record.exc_text:
             record.exc_text = logging.Formatter().formatException(record.exc_info)
         if record.exc_text:
