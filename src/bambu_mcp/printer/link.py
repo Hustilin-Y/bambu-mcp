@@ -67,17 +67,14 @@ def _subject_cn(cert: dict[str, Any]) -> str | None:
 
 
 def _verify_peer(sock: Any, tls_mode: str, serial: str | None, pin: str | None) -> None:
-    """Raises ``ssl.SSLCertVerificationError`` unless the peer is the printer.
-
-    ``serial`` None skips the CN check (``ca`` mode without a known serial).
-    """
+    """Raises ``ssl.SSLCertVerificationError`` unless the peer is the printer."""
     if tls_mode == "pin":
         der = sock.getpeercert(binary_form=True)
         digest = hashlib.sha256(der).hexdigest() if der else ""
         if not hmac.compare_digest(digest, pin or "-"):
             raise ssl.SSLCertVerificationError("peer certificate does not match the pinned SHA-256")
-    elif tls_mode == "ca" and serial is not None:
-        if _subject_cn(sock.getpeercert() or {}) != serial:
+    elif tls_mode == "ca":
+        if not serial or _subject_cn(sock.getpeercert() or {}) != serial:
             raise ssl.SSLCertVerificationError("peer certificate CN is not the printer serial")
 
 
@@ -92,7 +89,8 @@ def build_tls_context(settings: Settings, serial: str | None = None) -> ssl.SSLC
     """TLS context for the printer's MQTT port.
 
     ``ca``: chain verified against ``settings.ca_file``, hostname check off
-    (paho passes the IP), peer CN must equal ``serial``. ``ca-no-hostname``:
+    (paho passes the IP), peer CN must equal ``serial`` (required, a ``ca``
+    context without it would silently be ``ca-no-hostname``). ``ca-no-hostname``:
     chain only. ``pin``: no CA, the DER certificate's SHA-256 must equal
     ``settings.cert_sha256``. The identity check runs inside the handshake.
     """
@@ -103,6 +101,8 @@ def build_tls_context(settings: Settings, serial: str | None = None) -> ssl.SSLC
     if mode in ("ca", "ca-no-hostname"):
         if settings.ca_file is None:
             raise ValueError(f"tls_mode {mode!r} needs ca_file")
+        if mode == "ca" and not serial:
+            raise ValueError("tls_mode 'ca' needs the printer serial for the CN check")
         ctx.verify_mode = ssl.CERT_REQUIRED
         ctx.load_verify_locations(cafile=str(settings.ca_file))
     elif mode == "pin":

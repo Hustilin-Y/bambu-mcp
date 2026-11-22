@@ -343,14 +343,34 @@ def test_ca_no_hostname_skips_cn_check():
 
 @pytest.mark.parametrize("mode", ["ca", "ca-no-hostname"])
 def test_ca_modes_verify_chain_without_hostname(mode):
-    ctx = build_tls_context(ca_settings(mode))
+    ctx = build_tls_context(ca_settings(mode), serial=SERIAL)
     assert ctx.verify_mode == ssl.CERT_REQUIRED
     assert ctx.check_hostname is False
 
 
 def test_ca_mode_requires_ca_file():
     with pytest.raises(ValueError):
-        build_tls_context(Settings(tls_mode="ca"))
+        build_tls_context(Settings(tls_mode="ca"), serial=SERIAL)
+
+
+@pytest.mark.parametrize("serial", [None, ""])
+def test_ca_mode_requires_serial(serial):
+    with pytest.raises(ValueError):
+        build_tls_context(ca_settings(), serial=serial)
+    with pytest.raises(ValueError):
+        build_tls_context(ca_settings())
+
+
+def test_ca_no_hostname_needs_no_serial():
+    _handshake(build_tls_context(ca_settings("ca-no-hostname")), "other")
+
+
+@pytest.mark.parametrize("serial", [None, ""])
+def test_ca_peer_check_without_serial_fails_closed(serial):
+    from bambu_mcp.printer.link import _verify_peer
+
+    with pytest.raises(ssl.SSLCertVerificationError):
+        _verify_peer(FakeSocket(cn=""), "ca", serial, None)
 
 
 def test_pin_mode_uses_no_ca():
