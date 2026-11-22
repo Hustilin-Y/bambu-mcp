@@ -1,0 +1,23 @@
+# bambu-mcp settings. Every key is shown with its default.
+# Secrets (access code, serial, tokens) live in .env, never here.
+
+data_dir = "data"
+
+# "host:port" entries. PC client on the LAN address, assistant on loopback.
+listen = ["192.168.88.11:8765", "127.0.0.1:8765"]
+
+# "ca": verify chain against the Bambu root bundle, check CN == serial.
+# "ca-no-hostname": chain only. "pin": compare cert_sha256.
+tls_mode = "ca"
+# ca_file = "/path/to/bambu-root.pem"
+# cert_sha256 = "<hex sha256 of the printer certificate>"
+
+# notify_url = "http://127.0.0.1:8080/notify"
+
+camera_backend = "pyav"
+heatup_kwh = 0.05
+timezone = "Europe/Kyiv"
+
+# Average power draw per filament type, watts.
+[power_w]
+PLA = 200.0
