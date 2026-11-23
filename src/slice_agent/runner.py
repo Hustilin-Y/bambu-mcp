@@ -26,6 +26,7 @@ _RESERVED = re.compile(r"(con|prn|aux|nul|com[1-9]|lpt[1-9])", re.IGNORECASE)
 _LOG_TAIL_LINES = 20
 _LOG_TAIL_BYTES = 8192
 _KILL_WAIT_S = 10
+TASKKILL_FALLBACK = r"C:\Windows\System32\taskkill.exe"  # never a bare name: no PATH lookup
 
 
 def _is_int(v: object) -> bool:
@@ -156,7 +157,7 @@ def taskkill_exe(env: Mapping[str, str] | None = None) -> str:
     """taskkill by absolute path so a planted taskkill.exe on PATH or in the cwd is never run."""
     env = os.environ if env is None else env
     root = env.get("SystemRoot")
-    return str(Path(root) / "System32" / "taskkill.exe") if root else "taskkill"
+    return str(Path(root) / "System32" / "taskkill.exe") if root else TASKKILL_FALLBACK
 
 
 def kill_tree(proc) -> None:

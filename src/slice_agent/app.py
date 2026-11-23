@@ -47,6 +47,7 @@ MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_JOB_BYTES = 64 * 1024
 MAX_PLATES = 50
 MAX_JOB_ID = 10**12
+MAX_NAME = 60  # keeps sliced_dir\.work-<out>\<out>.gcode.3mf well under MAX_PATH
 INCOMING = ".incoming"
 ZIP_MAGIC = b"PK\x03\x04"
 _BODY_SLACK = 64 * 1024  # multipart boundaries and part headers
@@ -110,6 +111,8 @@ def parse_job(raw: bytes, cfg: AgentConfig) -> Job:
     name = data["name"]
     if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name.startswith("."):
         raise BadRequest("name must be 1..100 characters of A-Z a-z 0-9 . _ - space, not starting with a dot")
+    if len(name) > MAX_NAME:
+        raise BadRequest(f"name must be at most {MAX_NAME} characters")
     try:
         check_out_name(name)  # no spaces, no reserved Windows names, no trailing dot
     except ValueError:
@@ -237,13 +240,13 @@ class _Upload:
             self._parser.write(chunk)
         except BadRequest:
             raise
-        except Exception:  # noqa: BLE001 - parser errors are client errors
+        except ValueError:  # python_multipart parse errors; an OSError here is ours (500)
             raise BadRequest("malformed multipart body") from None
 
     def finish(self) -> tuple[bytes, Path]:
         try:
             self._parser.finalize()
-        except Exception:  # noqa: BLE001
+        except ValueError:
             raise BadRequest("malformed multipart body") from None
         if not self.ended:
             raise BadRequest("incomplete multipart body")
@@ -260,7 +263,8 @@ class _Upload:
             self._fh.close()
             self._fh = None
         if self.path is not None:
-            self.path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):  # e.g. a scanner still holds it: .incoming is cleared next time
+                self.path.unlink(missing_ok=True)
 
 
 def _clear_incoming(incoming: Path) -> None:
@@ -268,7 +272,37 @@ def _clear_incoming(incoming: Path) -> None:
     incoming.mkdir(parents=True, exist_ok=True)
     for stale in incoming.iterdir():
         if stale.is_file():
-            stale.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                stale.unlink(missing_ok=True)
+
+
+class Redactor:
+    """Replace the PC's own paths in CLI text with placeholders before it leaves the agent."""
+
+    def __init__(self, cfg: AgentConfig, home: Path | None = None, ignore_case: bool | None = None) -> None:
+        home = home or Path(os.environ.get("USERPROFILE") or Path.home())
+        ignore_case = sys.platform == "win32" if ignore_case is None else ignore_case
+        named = [
+            (cfg.profiles_dir, "<profiles>"),
+            (cfg.studio_data, "<studio-data>"),
+            (cfg.studio_resources, "<studio-resources>"),
+            (cfg.studio_exe.parent, "<studio>"),
+            (cfg.sliced_dir, "<sliced>"),
+            (home, "~"),
+        ]
+        self._rules = []
+        for path, placeholder in sorted(named, key=lambda item: len(str(item[0])), reverse=True):
+            parts = [p for p in re.split(r"[\\/]+", str(path)) if p]
+            if len(parts) < 2:
+                continue  # ".", "/" or "C:" alone would match far too much
+            lead = r"[\\/]+" if re.match(r"[\\/]", str(path)) else ""
+            pattern = lead + r"[\\/]+".join(re.escape(p) for p in parts) + r"(?![A-Za-z0-9_.-])"
+            self._rules.append((re.compile(pattern, re.IGNORECASE if ignore_case else 0), placeholder))
+
+    def __call__(self, text: str) -> str:
+        for pattern, placeholder in self._rules:
+            text = pattern.sub(lambda _m, p=placeholder: p, text)
+        return text
 
 
 def _error(status: int, error: str, **extra) -> JSONResponse:
@@ -293,6 +327,7 @@ class SliceAgent:
         self.max_file_bytes = max_file_bytes
         self.max_job_bytes = max_job_bytes
         self.busy = threading.Lock()
+        self.redact = Redactor(cfg)
 
     def authorized(self, request: Request) -> bool:
         expected = self.cfg.slice_token
@@ -353,6 +388,11 @@ class SliceAgent:
                 upload.discard()
             log.info("slice request refused: %s", _detail(str(e)))
             return _error(422, "bad_request", detail=_detail(str(e)))
+        except Exception:
+            if upload is not None:
+                upload.discard()
+            log.exception("slice upload failed unexpectedly")
+            return _error(500, "slice_failed", detail="internal error in slice-agent", log_tail="")
         try:
             t0 = time.monotonic()
             log.info("slice job %s -> %s started (%d bytes)", job.job_id, job.out_name, upload.size)
@@ -368,6 +408,9 @@ class SliceAgent:
             return _error(500, "slice_failed", detail="internal error in slice-agent", log_tail="")
         finally:
             upload.discard()
+
+    def _failed(self, detail: str, log_tail: str) -> dict:
+        return {"error": "slice_failed", "detail": _detail(self.redact(detail)), "log_tail": self.redact(log_tail)}
 
     def _slice_sync(self, job: Job, upload: Path) -> tuple[int, dict]:
         run, final = self.slicer(
@@ -388,7 +431,7 @@ class SliceAgent:
                 detail = f"exit code {run.return_code}"
             else:
                 detail = "the slicer produced no output file"
-            return 500, {"error": "slice_failed", "detail": _detail(detail), "log_tail": run.log_tail}
+            return 500, self._failed(detail, run.log_tail)
         try:
             result = read_output(final, job.plates[0])
             check_output(result, job.nozzle)
@@ -398,7 +441,7 @@ class SliceAgent:
                     raise OutputError(f"plate {plate} is not in the sliced file")
         except OutputError as e:
             final.unlink(missing_ok=True)  # never leave a file that failed the checks to be printed
-            return 500, {"error": "slice_failed", "detail": _detail(str(e)), "log_tail": run.log_tail}
+            return 500, self._failed(str(e), run.log_tail)
         wanted = set(job.plates)
         plates = [
             {

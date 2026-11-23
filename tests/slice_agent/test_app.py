@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import json
+import os
 import threading
 import zipfile
 from pathlib import Path
@@ -431,3 +432,67 @@ def test_part_order_does_not_matter(tmp_path):
     parts = files()
     r = client.post("/slice", files={"file": parts["file"], "job": parts["job"]}, headers=AUTH)
     assert r.status_code == 200 and slicer.calls[0]["upload"] == UPLOAD
+
+
+def test_failure_text_redacts_pc_paths(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    home = tmp_path / "home"
+    prof, sep = str(cfg.profiles_dir), os.sep
+    redact = app_mod.Redactor(cfg, home=home, ignore_case=True)
+    assert redact(f"loading {prof}{sep}machine-0.4.json") == f"loading <profiles>{sep}machine-0.4.json"
+    assert redact(f"loading {prof.replace(sep, '/')}/p.json") == "loading <profiles>/p.json"
+    bs = "\\"
+    assert redact(f"loading {prof.replace(sep, bs).upper()}{bs}p.json") == f"loading <profiles>{bs}p.json"
+    assert redact(r"exe C:\BS\bambu-studio.exe, c:/bs/x.dll") == r"exe <studio>\bambu-studio.exe, <studio>/x.dll"
+    assert redact(f"{cfg.studio_data} {cfg.studio_resources}") == "<studio-data> <studio-resources>"
+    assert redact(f"{cfg.sliced_dir}{sep}.work-a {home}{sep}Desktop") == f"<sliced>{sep}.work-a ~{sep}Desktop"
+    assert redact(f"{prof}2{sep}x") == f"{prof}2{sep}x"  # only whole path components match
+
+    monkeypatch.setenv("USERPROFILE", str(home))
+    tail = "\n".join(
+        [f"loading {prof}{sep}machine-0.4.json", f"out {cfg.sliced_dir}{sep}.work-a", f"user {home}{sep}x"]
+    )
+    slicer = FakeSlicer(run=SliceRun(-51, f"cannot load {prof}{sep}filament-x.json", tail))
+    client = TestClient(create_app(cfg, slicer=slicer, pc_agent=PcAgent().client()))
+    r = client.post("/slice", files=files(), headers=AUTH)
+    assert r.status_code == 500
+    assert r.json()["detail"] == f"cannot load <profiles>{sep}filament-x.json"
+    assert r.json()["log_tail"].splitlines() == [
+        f"loading <profiles>{sep}machine-0.4.json", f"out <sliced>{sep}.work-a", f"user ~{sep}x",
+    ]
+    assert str(tmp_path) not in r.text and str(tmp_path).replace(sep, "/") not in r.text
+
+
+def test_discard_and_upload_errors_never_break_the_response(tmp_path, monkeypatch):
+    cfg, slicer, pc, client = harness(tmp_path)
+    real_unlink = Path.unlink
+
+    def locked_unlink(self, *a, **kw):
+        if self.name.startswith("upload-"):
+            raise PermissionError("held by a scanner")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", locked_unlink)
+    r = client.post("/slice", files=files(), headers=AUTH)
+    assert r.status_code == 200 and r.json()["file"] == "example-bracket-7-p1.gcode.3mf"
+    r = client.post("/slice", files=files(), headers=AUTH)  # stale upload in .incoming: clearing it must not fail
+    assert r.status_code == 200
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+
+    def no_space(*a, **kw):
+        raise OSError(28, "No space left on device", str(tmp_path))
+
+    monkeypatch.setattr(app_mod.tempfile, "mkstemp", no_space)
+    r = client.post("/slice", files=files(), headers=AUTH)
+    assert r.status_code == 500 and r.json() == {
+        "error": "slice_failed", "detail": "internal error in slice-agent", "log_tail": "",
+    }
+    monkeypatch.undo()
+    assert client.post("/slice", files=files(), headers=AUTH).status_code == 200  # lock released
+
+
+def test_name_capped_at_60(tmp_path):
+    cfg, slicer, pc, client = harness(tmp_path)
+    r = client.post("/slice", files=files(job(name="n" * 61)), headers=AUTH)
+    assert r.status_code == 422 and "60" in r.json()["detail"]
+    assert client.post("/slice", files=files(job(name="n" * 60)), headers=AUTH).status_code == 200

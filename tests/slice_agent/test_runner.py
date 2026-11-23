@@ -217,6 +217,7 @@ def test_run_slice_timeout_real_process_tree(tmp_path):
     script.write_text(CHILD, encoding="utf-8")
     hb = tmp_path / "hb"
     out = tmp_path / "o"
+    passed = False
     try:
         t0 = time.monotonic()
         r = run_slice([sys.executable, "-I", str(script), str(hb)], out, timeout_s=6)
@@ -229,13 +230,15 @@ def test_run_slice_timeout_real_process_tree(tmp_path):
         time.sleep(0.8)
         assert sizes == (grand.stat().st_size, child.stat().st_size)  # nobody writes any more
         shutil.rmtree(out)  # log files released: the work dir can be removed
+        passed = True
     finally:
-        _kill_pids(tmp_path / "hb.pids")  # never leak the tree if an assertion failed
+        if not passed:  # after success the PIDs are dead and may be recycled: never kill them then
+            _kill_pids(tmp_path / "hb.pids")
 
 
 def test_taskkill_by_absolute_path(monkeypatch):
     assert taskkill_exe({"SystemRoot": r"C:\Windows"}) == str(Path(r"C:\Windows") / "System32" / "taskkill.exe")
-    assert taskkill_exe({}) == "taskkill"
+    assert taskkill_exe({}) == r"C:\Windows\System32\taskkill.exe"
     seen = []
     monkeypatch.setattr(runner.sys, "platform", "win32")
     monkeypatch.setenv("SystemRoot", r"D:\Win")
