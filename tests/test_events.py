@@ -156,3 +156,76 @@ def test_reconnect_does_not_repeat_hms_error():
     d = EventDetector(seen)
     assert kinds(run(d, [running, with_hms])) == [EventKind.STARTED, EventKind.HMS_ERROR]
     assert run(d, [PrinterState.empty(), with_hms], start=with_hms) == []
+
+
+@pytest.mark.synthetic
+def test_active_to_idle_is_failed_with_previous_identity():
+    running = fx("running_layer2")
+    idle = replace(PrinterState.empty(), gcode_state="IDLE", subtask_name="", task_id="")
+    events = run(EventDetector(FakeSeen()), [idle], start=running)
+    assert kinds(events) == [EventKind.FAILED]
+    assert events[0].identity == ("cube", "1795385329", "")
+    assert events[0].state.subtask_name == "cube"
+
+
+@pytest.mark.synthetic
+def test_unknown_state_does_not_replace_last_known_state():
+    d = EventDetector(FakeSeen())
+    running = fx("running_layer2")
+    unknown = replace(running, gcode_state="UNKNOWN", raw_unknown_state="WEIRD")
+    finish = fx("finish")
+    assert kinds(run(d, [running, unknown, finish])) == [
+        EventKind.STARTED,
+        EventKind.FIRST_LAYER_DONE,
+        EventKind.FINISHED,
+    ]
+
+
+@pytest.mark.synthetic
+def test_unknown_blip_does_not_restart_the_print_even_with_fresh_dedupe():
+    d = EventDetector(FakeSeen())
+    running = fx("running_layer2")
+    unknown = replace(running, gcode_state="UNKNOWN", raw_unknown_state="WEIRD")
+    d.feed(PrinterState.empty(), running, AT)
+    d._seen = FakeSeen()  # the transition alone must not emit "started" again
+    assert d.feed(running, unknown, AT) == []
+    assert d.feed(unknown, running, AT) == []
+
+
+@pytest.mark.synthetic
+def test_identity_change_while_active_emits_started():
+    stale = replace(fx("running_layer0"), subtask_name="old-job", task_id="111")
+    seen = FakeSeen()
+    seen.seen_add("old-job|111||started")  # the previous job's start was already seen
+    events = run(EventDetector(seen), [fx("pushall_idle"), stale, fx("running_layer0")])
+    assert kinds(events) == [EventKind.STARTED]
+    assert events[0].identity[0] == "cube"
+
+
+@pytest.mark.synthetic
+def test_identity_cleared_while_active_is_not_a_start():
+    running = fx("running_layer1")
+    cleared = replace(running, subtask_name="", task_id="")
+    assert run(EventDetector(FakeSeen()), [cleared], start=running) == []
+
+
+@pytest.mark.synthetic
+def test_stale_identity_at_start_is_not_reported_as_the_old_job():
+    # FINISH of job A, then RUNNING still naming A for one report, then B: only B starts,
+    # even when A's start was never seen (no fake start for A).
+    finished_a = fx("pushall_idle")
+    stale = replace(fx("running_layer0"), subtask_name=finished_a.subtask_name, task_id=finished_a.task_id)
+    events = run(EventDetector(FakeSeen()), [finished_a, stale, fx("running_layer0")])
+    assert kinds(events) == [EventKind.STARTED]
+    assert events[0].identity[0] == "cube"
+
+
+@pytest.mark.synthetic
+def test_reprint_with_unchanged_identity_starts_one_report_later():
+    finished = fx("finish")
+    again = replace(fx("running_layer0"), gcode_start_time="new")
+    same = replace(fx("running_layer0"))
+    events = run(EventDetector(FakeSeen()), [finished, same, same])
+    assert kinds(events) == [EventKind.STARTED]
+    events = run(EventDetector(FakeSeen()), [finished, again])
+    assert kinds(events) == [EventKind.STARTED]

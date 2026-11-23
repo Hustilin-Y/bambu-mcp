@@ -1,20 +1,36 @@
 from __future__ import annotations
 
+import contextlib
+import json
 import sqlite3
 import threading
 import time
+from collections.abc import Iterator
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from bambu_mcp.store.models import Plate, PrintRow, Spool, Tariff
+from bambu_mcp.store.models import OutboxRow, Plate, PrintRow, Spool, Tariff
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
-_SCHEMA_VERSION = 2
-# schema.sql is the version-1 schema; each later version is one ALTER script.
+_SCHEMA_VERSION = 3
+# schema.sql is the version-1 schema; each later version is one migration script.
 _MIGRATIONS = {
     2: "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
     "ALTER TABLE prints ADD COLUMN deducted_g REAL;",
+    # Telegram messages waiting to be delivered, oldest first. A snapshot is a flag:
+    # the picture is taken at the first attempt, never stored.
+    3: "CREATE TABLE outbox (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    kind TEXT NOT NULL,\n"
+    "    text TEXT NOT NULL,\n"
+    "    buttons TEXT,\n"
+    "    snapshot INTEGER NOT NULL DEFAULT 0,\n"
+    "    dedupe TEXT NOT NULL UNIQUE,\n"
+    "    created_at REAL NOT NULL,\n"
+    "    attempts INTEGER NOT NULL DEFAULT 0,\n"
+    "    next_attempt_at REAL NOT NULL\n"
+    ");",
 }
 _SEEN_TTL_S = 30 * 24 * 3600
 _DEFAULT_TARIFF = (date(2024, 6, 1), 4.32, None)
@@ -100,6 +116,43 @@ class Store:
                 self._conns.append(conn)
         return conn
 
+    @contextlib.contextmanager
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        """A write transaction, or a savepoint inside the thread's open ``transaction()``."""
+        conn = self._conn()
+        depth = getattr(self._local, "depth", 0)
+        if depth == 0:
+            with conn:  # commits, or rolls back on an exception
+                if not conn.in_transaction:
+                    conn.execute("BEGIN")
+                self._local.depth = 1
+                try:
+                    yield conn
+                finally:
+                    self._local.depth = 0
+            return
+        name = f"sp{depth}"
+        conn.execute(f"SAVEPOINT {name}")
+        self._local.depth = depth + 1
+        try:
+            yield conn
+        except BaseException:
+            conn.execute(f"ROLLBACK TO {name}")
+            conn.execute(f"RELEASE {name}")
+            raise
+        else:
+            conn.execute(f"RELEASE {name}")
+        finally:
+            self._local.depth = depth
+
+    def transaction(self) -> contextlib.AbstractContextManager[sqlite3.Connection]:
+        """Group several store calls into one atomic write. Nested calls are savepoints.
+
+        Synchronous code only: never hold it across an ``await``, since other tasks on
+        the same thread share the connection.
+        """
+        return self._tx()
+
     def close(self) -> None:
         """Close every connection. Call when no other thread is using the store."""
         with self._lock:
@@ -136,7 +189,7 @@ class Store:
         return row is not None
 
     def seen_add(self, key: str) -> None:
-        with self._conn() as conn:
+        with self._tx() as conn:
             conn.execute("INSERT OR IGNORE INTO seen (key, seen_at) VALUES (?, ?)", (key, time.time()))
 
     # -- meta ------------------------------------------------------------
@@ -146,7 +199,7 @@ class Store:
         return row["value"] if row else None
 
     def set_meta(self, key: str, value: str) -> None:
-        with self._conn() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -165,7 +218,7 @@ class Store:
         price_uah: float,
         net_g: float,
     ) -> int:
-        with self._conn() as conn:
+        with self._tx() as conn:
             cur = conn.execute(
                 "INSERT INTO spools (brand, material, color_name, color_hex, filament_preset,"
                 " price_uah, net_g, remaining_g) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -182,7 +235,7 @@ class Store:
         if "active" in fields:
             fields["active"] = int(bool(fields["active"]))
         assignments = ", ".join(f"{name} = ?" for name in fields)
-        with self._conn() as conn:
+        with self._tx() as conn:
             cur = conn.execute(f"UPDATE spools SET {assignments} WHERE id = ?", (*fields.values(), id))
             if cur.rowcount == 0:
                 raise KeyError(f"no spool {id}")
@@ -193,7 +246,7 @@ class Store:
 
     def adjust_spool(self, id: int, used_g: float) -> None:
         """Subtract used grams from the remaining weight (floored at 0)."""
-        with self._conn() as conn:
+        with self._tx() as conn:
             cur = conn.execute(
                 "UPDATE spools SET remaining_g = MAX(remaining_g - ?, 0) WHERE id = ?", (used_g, id)
             )
@@ -207,7 +260,7 @@ class Store:
 
     def map_slot(self, ams: int, slot: int, spool_id: int | None) -> None:
         """Map an AMS slot to a spool, replacing any previous mapping. None clears the slot."""
-        with self._conn() as conn:
+        with self._tx() as conn:
             if spool_id is None:
                 conn.execute("DELETE FROM slots WHERE ams = ? AND slot = ?", (ams, slot))
             else:
@@ -232,7 +285,7 @@ class Store:
     # -- plates ----------------------------------------------------------
 
     def add_plate(self, name: str, bed_type: str) -> int:
-        with self._conn() as conn:
+        with self._tx() as conn:
             cur = conn.execute("INSERT INTO plates (name, bed_type) VALUES (?, ?)", (name, bed_type))
             return int(cur.lastrowid)
 
@@ -241,7 +294,7 @@ class Store:
         return [Plate(r["id"], r["name"], r["bed_type"], bool(r["is_default"])) for r in rows]
 
     def set_default_plate(self, id: int) -> None:
-        with self._conn() as conn:
+        with self._tx() as conn:
             if conn.execute("SELECT 1 FROM plates WHERE id = ?", (id,)).fetchone() is None:
                 raise KeyError(f"no plate {id}")
             conn.execute("UPDATE plates SET is_default = (id = ?)", (id,))
@@ -249,7 +302,7 @@ class Store:
     # -- tariffs ---------------------------------------------------------
 
     def add_tariff(self, valid_from: date, day_uah: float, night_uah: float | None) -> None:
-        with self._conn() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "INSERT INTO tariffs (valid_from, day_uah, night_uah) VALUES (?, ?, ?) "
                 "ON CONFLICT(valid_from) DO UPDATE SET day_uah = excluded.day_uah,"
@@ -276,7 +329,7 @@ class Store:
         self, identity: tuple, started_at: datetime, source: Literal["external", "job"]
     ) -> int:
         name, task_id, start = _norm(identity)
-        with self._conn() as conn:
+        with self._tx() as conn:
             cur = conn.execute(
                 "INSERT INTO prints (name, task_id, gcode_start, source, started_at)"
                 " VALUES (?, ?, ?, ?, ?)",
@@ -284,8 +337,10 @@ class Store:
             )
             return int(cur.lastrowid)
 
-    def close_print(self, id: int, outcome: str, ended_at: datetime, actual_min: float) -> None:
-        with self._conn() as conn:
+    def close_print(
+        self, id: int, outcome: str, ended_at: datetime, actual_min: float | None
+    ) -> None:
+        with self._tx() as conn:
             cur = conn.execute(
                 "UPDATE prints SET outcome = ?, ended_at = ?, actual_min = ? WHERE id = ?",
                 (outcome, ended_at.isoformat(), actual_min, id),
@@ -300,7 +355,7 @@ class Store:
         if not fields:
             return
         assignments = ", ".join(f"{name} = ?" for name in fields)
-        with self._conn() as conn:
+        with self._tx() as conn:
             cur = conn.execute(f"UPDATE prints SET {assignments} WHERE id = ?", (*fields.values(), id))
             if cur.rowcount == 0:
                 raise KeyError(f"no print {id}")
@@ -331,7 +386,7 @@ class Store:
         the spool they were removed from (``deducted_spool_id``). Then ``grams`` are
         removed from ``spool_id`` (at most its remaining weight) and recorded.
         """
-        with self._conn() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 "SELECT deducted_spool_id, deducted_g FROM prints WHERE id = ?", (id,)
             ).fetchone()
@@ -362,6 +417,11 @@ class Store:
                 (spool_id, grams, cost_filament_uah, deducted_spool, deducted, id),
             )
 
+    def open_prints(self) -> list[PrintRow]:
+        """Rows without an end, oldest first."""
+        rows = self._conn().execute("SELECT * FROM prints WHERE ended_at IS NULL ORDER BY id")
+        return [_print(r) for r in rows]
+
     def print_by_id(self, id: int) -> PrintRow | None:
         row = self._conn().execute("SELECT * FROM prints WHERE id = ?", (id,)).fetchone()
         return _print(row) if row else None
@@ -377,3 +437,63 @@ class Store:
         sql += " ORDER BY started_at DESC, id DESC LIMIT ?"
         args.append(limit)
         return [_print(r) for r in self._conn().execute(sql, args)]
+
+    # -- outbox ----------------------------------------------------------
+
+    def outbox_add(
+        self,
+        kind: str,
+        text: str,
+        dedupe: str,
+        *,
+        buttons: list[list[dict[str, str]]] | None = None,
+        snapshot: bool = False,
+        now: float,
+    ) -> bool:
+        """Queue a message. False when one with the same dedupe key is already waiting."""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO outbox (kind, text, buttons, snapshot, dedupe, created_at,"
+                " next_attempt_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    kind,
+                    text,
+                    json.dumps(buttons, ensure_ascii=False) if buttons else None,
+                    int(snapshot),
+                    dedupe,
+                    now,
+                    now,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def outbox_head(self) -> OutboxRow | None:
+        """The oldest waiting message: delivery is strictly in order."""
+        row = self._conn().execute("SELECT * FROM outbox ORDER BY id LIMIT 1").fetchone()
+        if row is None:
+            return None
+        return OutboxRow(
+            id=row["id"],
+            kind=row["kind"],
+            text=row["text"],
+            buttons=json.loads(row["buttons"]) if row["buttons"] else None,
+            snapshot=bool(row["snapshot"]),
+            dedupe=row["dedupe"],
+            created_at=row["created_at"],
+            attempts=row["attempts"],
+            next_attempt_at=row["next_attempt_at"],
+        )
+
+    def outbox_defer(self, id: int, attempts: int, next_attempt_at: float) -> None:
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE outbox SET attempts = ?, next_attempt_at = ? WHERE id = ?",
+                (attempts, next_attempt_at, id),
+            )
+
+    def outbox_delete(self, id: int) -> None:
+        with self._tx() as conn:
+            conn.execute("DELETE FROM outbox WHERE id = ?", (id,))
+
+    def outbox_count(self) -> int:
+        return int(self._conn().execute("SELECT COUNT(*) FROM outbox").fetchone()[0])

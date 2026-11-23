@@ -26,6 +26,8 @@ from typing import Any, Final
 import paho.mqtt.client as mqtt
 
 from bambu_mcp.config import Secrets, Settings
+from bambu_mcp.logthrottle import Throttle
+from bambu_mcp.redact import redact
 
 log = logging.getLogger(__name__)
 
@@ -142,6 +144,9 @@ class PrinterLink:
         self._pin = _normalise_pin(settings.cert_sha256) if settings.tls_mode == "pin" else None
         self._serial = secrets.serial
         self._host = secrets.host
+        self._secret_values = (secrets.access_code, secrets.serial)
+        # While the printer is off every attempt fails the same way: log the first, then hourly.
+        self._quiet = Throttle(log)
         self._report_topic = f"device/{secrets.serial}/report"
         self._request_topic = f"device/{secrets.serial}/request"
         self._on_report = on_report
@@ -205,15 +210,19 @@ class PrinterLink:
         if self._stopped:
             return
         self._emit(LinkStatus.CONNECTING)
-        self._client.loop_stop()  # the previous network thread, if any, has ended
         try:
+            self._client.loop_stop()  # the previous network thread, if any, has ended
             self._client.connect(self._host, PORT, keepalive=KEEPALIVE_S)
-        except OSError as exc:  # includes TLS and peer identity failures
-            log.warning("printer connection failed: %s: %s", type(exc).__name__, exc)
+            self._client.loop_start()
+        except Exception as exc:  # OSError (TLS, peer identity) and anything else, e.g. a bad host
+            self._quiet.warning(
+                "connect",
+                "printer connection failed: %s: %s",
+                type(exc).__name__,
+                redact(str(exc), self._secret_values),
+            )
             self._emit(LinkStatus.DISCONNECTED)
             self._schedule_reconnect()
-            return
-        self._client.loop_start()
 
     def _schedule_reconnect(self) -> None:
         with self._lock:
@@ -221,7 +230,7 @@ class PrinterLink:
                 return
             delay = self._delay
             self._delay = min(delay * 2, BACKOFF_MAX_S)
-        log.info("reconnecting to the printer in %.0f s", delay)
+        self._quiet.info("reconnect", "reconnecting to the printer in %.0f s", delay)
         self._schedule(delay, self._attempt)
 
     def _peer_ok(self, client: Any) -> bool:
@@ -251,6 +260,8 @@ class PrinterLink:
         with self._lock:
             self._verified = True
             self._delay = BACKOFF_START_S
+        for key in ("connect", "reconnect", "lost"):
+            self._quiet.reset(key)
         self._emit(LinkStatus.CONNECTED)
         client.subscribe(self._report_topic)
         for payload in READ_COMMANDS:
@@ -262,7 +273,7 @@ class PrinterLink:
             stopped = self._stopped
         if stopped:
             return
-        log.warning("printer link lost: %s", reason_code)
+        self._quiet.warning("lost", "printer link lost: %s", reason_code)
         self._emit(LinkStatus.DISCONNECTED)
         self._schedule_reconnect()
 

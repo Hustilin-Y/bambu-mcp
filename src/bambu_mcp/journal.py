@@ -42,16 +42,19 @@ class Journal:
 
     # -- events --------------------------------------------------------------
 
-    def on_event(self, event: Event, slot: Slot | None = None) -> int | None:
+    def on_event(
+        self, event: Event, slot: Slot | None = None, first_seen: datetime | None = None
+    ) -> int | None:
         """Open a row on ``started``, close it on a terminal event. Returns the row id.
 
         ``slot`` is the AMS slot the print fed from, if known: its mapped spool is
-        recorded on the row and its material picks the average power.
+        recorded on the row and its material picks the average power. ``first_seen``
+        is when the service first saw this job, the start time of a row opened late.
         """
         if event.kind is EventKind.STARTED:
             return self._open(event)
         if event.kind in TERMINAL_KINDS:
-            return self._close(event, slot)
+            return self._close(event, slot, first_seen)
         return None
 
     def _open(self, event: Event) -> int:
@@ -60,19 +63,43 @@ class Journal:
             return row.id  # already open (dedupe key expired, or a repeated start)
         return self._store.open_print(event.identity, _utc(event.at), "external")
 
-    def _close(self, event: Event, slot: Slot | None) -> int | None:
+    def _close(self, event: Event, slot: Slot | None, first_seen: datetime | None) -> int | None:
         row = self._store.print_by_identity(event.identity)
         if row is None:
-            log.warning("no journal row for a %s print, not recorded", event.kind)
-            return None
+            # The start was missed (e.g. a stale job identity): record it from the first sight.
+            log.warning("no journal row for a %s print, opening one now", event.kind)
+            self._store.open_print(event.identity, _utc(first_seen or event.at), "external")
+            row = self._store.print_by_identity(event.identity)
+            assert row is not None
         if row.ended_at is not None:
             return row.id
         ended = _utc(event.at)
         started = _utc(row.started_at)
-        minutes = max((ended - started).total_seconds() / 60, 0.0)
+        minutes = None if event.end_unknown else max((ended - started).total_seconds() / 60, 0.0)
         self._store.close_print(row.id, str(event.kind), ended, minutes)
 
         spool = self._store.slot_spool(*slot) if slot is not None else None
+        if spool is not None and row.spool_id is None:
+            # Grams given earlier without a spool are deducted from this one now.
+            rebook_grams(self._store, row.id, spool, row.grams)
+        if minutes is None:
+            return row.id  # no duration, so no energy or cost either
+        try:
+            self._record_power(row.id, started, ended, minutes, spool, slot, event)
+        except Exception:
+            log.exception("print cost for a %s print failed, recorded without cost", event.kind)
+        return row.id
+
+    def _record_power(
+        self,
+        print_id: int,
+        started: datetime,
+        ended: datetime,
+        minutes: float,
+        spool: Spool | None,
+        slot: Slot | None,
+        event: Event,
+    ) -> None:
         material = DEFAULT_MATERIAL
         if spool is not None:
             material = spool.material
@@ -82,14 +109,8 @@ class Journal:
                 material = tray.tray_type
         kwh = print_kwh(minutes, material, self._settings)
         tariff = self._store.tariff_on(started.astimezone(self._tz).date())
-        fields: dict = {
-            "kwh": kwh,
-            "cost_power_uah": power_cost(started, max(ended, started), kwh, tariff, self._settings),
-        }
-        if spool is not None and row.spool_id is None:
-            fields["spool_id"] = spool.id
-        self._store.set_print_fields(row.id, **fields)
-        return row.id
+        cost = power_cost(started, max(ended, started), kwh, tariff, self._settings)
+        self._store.set_print_fields(print_id, kwh=kwh, cost_power_uah=cost)
 
     def cost_line(self, row: PrintRow) -> CostLine | None:
         """Power cost of a closed row as computed at close (filament unknown in phase 1)."""

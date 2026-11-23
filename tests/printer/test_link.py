@@ -441,3 +441,27 @@ def test_handshake_pin_accepts_pinned_cert():
 def test_handshake_pin_rejects_other_cert():
     with pytest.raises(ssl.SSLCertVerificationError):
         _handshake(build_tls_context(pin_settings()), "other")
+
+
+def test_non_oserror_on_connect_reschedules_with_backoff(h, caplog):
+    h.client.connect_error = ValueError(f"Invalid host. {ACCESS_CODE} {SERIAL}")
+    h.client.fire_disconnect()
+    with caplog.at_level(logging.WARNING):
+        h.run_next()
+    assert h.statuses[-2:] == [LinkStatus.CONNECTING, LinkStatus.DISCONNECTED]
+    assert [d for d, _ in h.scheduled] == [10]
+    assert "ValueError" in caplog.text
+    assert ACCESS_CODE not in caplog.text and SERIAL not in caplog.text
+
+
+def test_repeated_connect_failures_are_logged_once(h, caplog):
+    h.client.connect_error = ConnectionRefusedError("refused")
+    h.client.fire_disconnect()
+    with caplog.at_level(logging.INFO, logger="bambu_mcp.printer.link"):
+        for _ in range(6):
+            h.run_next()
+    failed = [r for r in caplog.records if "printer connection failed" in r.getMessage()]
+    reconnecting = [r for r in caplog.records if "reconnecting to the printer" in r.getMessage()]
+    assert len(failed) == 1
+    assert len(reconnecting) <= 1
+    assert len(h.scheduled) == 1  # still retrying

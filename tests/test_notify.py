@@ -3,8 +3,9 @@ import json
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 
-from bambu_mcp.notify import Button, LogNotifier, Press, ServiceNotifyClient
+from bambu_mcp.notify import Button, LogNotifier, Press, SendError, ServiceNotifyClient
 
 TOKEN = "tok-secret-123"
 
@@ -135,7 +136,7 @@ async def test_presses_survives_errors():
     assert len(sleeps) == 1
 
 
-async def test_retry_on_connection_error():
+async def test_edit_retries_on_connection_error():
     attempts = []
 
     def handler(request):
@@ -145,23 +146,23 @@ async def test_retry_on_connection_error():
         return httpx.Response(200, json={"message_id": "3"})
 
     sleeps: list[float] = []
-    assert await make(handler, sleeps).send("x") == "3"
+    await make(handler, sleeps).edit("3", text="x")
     assert len(attempts) == 2 and len(sleeps) == 1
 
 
-async def test_retry_on_503_then_gives_up(caplog):
+async def test_edit_retries_on_503_then_gives_up(caplog):
     attempts = []
 
     def handler(request):
         attempts.append(1)
         return httpx.Response(503, json={"error": "telegram_unreachable"})
 
-    assert await make(handler).send("x") is None
+    assert await make(handler).edit("1", text="x") is None
     assert len(attempts) == 3
     assert TOKEN not in caplog.text
 
 
-async def test_429_honours_retry_after():
+async def test_edit_429_honours_retry_after():
     attempts = []
 
     def handler(request):
@@ -171,37 +172,93 @@ async def test_429_honours_retry_after():
         return httpx.Response(200, json={"message_id": "5"})
 
     sleeps: list[float] = []
-    assert await make(handler, sleeps).send("x") == "5"
+    await make(handler, sleeps).edit("5", text="x")
     assert sleeps == [7]
 
 
-async def test_4xx_not_retried():
+async def test_send_is_one_attempt_and_raises_retryable_on_connection_error():
     attempts = []
 
     def handler(request):
         attempts.append(1)
-        return httpx.Response(400, json={"error": "bad_request", "detail": "text"})
-
-    assert await make(handler).send("x") is None
-    assert len(attempts) == 1
-
-
-async def test_edit_failure_is_swallowed():
-    def handler(request):
-        return httpx.Response(404, json={"error": "not_found"})
-
-    assert await make(handler).edit("1", text="t") is None
-
-
-async def test_failure_log_has_no_token_or_text(caplog):
-    def handler(request):
         raise httpx.ConnectError(f"cannot reach with {TOKEN}")
 
+    sleeps: list[float] = []
+    with pytest.raises(SendError) as exc:
+        await make(handler, sleeps).send("private text body")
+    assert len(attempts) == 1 and sleeps == []
+    assert exc.value.status is None and exc.value.retryable
+    assert TOKEN not in str(exc.value) and "private text body" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "retryable"),
+    [
+        (503, {"error": "telegram_unreachable"}, True),
+        (429, {"error": "rate_limited", "retry_after": 7}, True),
+        (401, {"error": "unauthorized"}, True),
+        (400, {"error": "bad_request", "detail": "text"}, False),
+        (403, {"error": "recipient_not_allowed"}, False),
+        (413, {"error": "too_large"}, False),
+        (500, {"error": "not_kept"}, False),
+        (502, {"error": "telegram_refused", "detail": "bad"}, False),
+    ],
+)
+async def test_send_error_classification(status, body, retryable):
+    attempts = []
+
+    def handler(request):
+        attempts.append(1)
+        return httpx.Response(status, json=body)
+
+    with pytest.raises(SendError) as exc:
+        await make(handler).send("x", dedupe="k")
+    assert len(attempts) == 1
+    assert exc.value.status == status
+    assert exc.value.code == body["error"]
+    assert exc.value.retryable is retryable
+    assert exc.value.retry_after == body.get("retry_after")
+
+
+async def test_send_non_json_success_raises_retryable():
+    def handler(request):
+        return httpx.Response(200, content=b"oops")
+
+    with pytest.raises(SendError) as exc:
+        await make(handler).send("x")
+    assert exc.value.retryable
+
+
+async def test_presses_survives_non_dict_and_null_bodies(caplog):
+    bodies = [{"presses": None}, [], "text", {"presses": [{"seq": 1, "message_id": "m", "button_id": "b", "at": 1700000000}]}]
+
+    def handler(request):
+        body = bodies.pop(0)
+        return httpx.Response(200, json=body)
+
+    sleeps: list[float] = []
     with caplog.at_level("WARNING"):
-        assert await make(handler).send("private text body") is None
+        async for press in make(handler, sleeps).presses():
+            assert press.seq == 1
+            break
+    assert len(sleeps) == 3
+    assert "TypeError" in caplog.text or "AttributeError" in caplog.text
+
+
+async def test_presses_401_is_logged_once(caplog):
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) > 5:
+            return httpx.Response(200, json={"presses": [{"seq": 1, "message_id": "m", "button_id": "b", "at": 1700000000}]})
+        return httpx.Response(401, json={"error": "unauthorized"})
+
+    with caplog.at_level("WARNING"):
+        async for _ in make(handler, []).presses():
+            break
+    assert sum("presses poll failed" in r.getMessage() for r in caplog.records) == 1
     assert TOKEN not in caplog.text
-    assert "private text body" not in caplog.text
-    assert caplog.records
 
 
 async def test_log_notifier(caplog):

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import sys
+import threading
 from collections.abc import Iterable
 
 MASK = "***"
+log = logging.getLogger(__name__)
 
 
 def redact(text: str, secrets: Iterable[str]) -> str:
@@ -85,3 +88,30 @@ def install_redaction(secrets) -> None:
         return record
 
     logging.setLogRecordFactory(factory)
+    install_excepthooks()
+
+
+def install_excepthooks() -> None:
+    """Send uncaught tracebacks (main thread and other threads) through logging.
+
+    The default hooks write straight to stderr, past the redacting filter.
+    """
+
+    def main_hook(exc_type, exc_value, exc_tb) -> None:
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        log.error("uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+
+    def thread_hook(args: threading.ExceptHookArgs) -> None:
+        if args.exc_type is SystemExit:
+            return
+        name = args.thread.name if args.thread is not None else "?"
+        log.error(
+            "uncaught exception in thread %s",
+            name,
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = main_hook
+    threading.excepthook = thread_hook

@@ -12,11 +12,12 @@ from typing import Any, Protocol
 
 import httpx
 
+from bambu_mcp.logthrottle import Throttle
 from bambu_mcp.redact import redact
 
 log = logging.getLogger(__name__)
 
-SEND_ATTEMPTS = 3
+EDIT_ATTEMPTS = 3
 BACKOFF_BASE_S = 1.0
 BACKOFF_MAX_S = 30.0
 PRESS_WAIT_S = 25
@@ -29,6 +30,37 @@ class Button:
     text: str
 
 
+class SendError(Exception):
+    """A message was not sent. ``status`` is None when the add-in could not be reached.
+
+    Never carries the message text or the token.
+    """
+
+    # 500 not_kept: the message went out without its buttons, sending it again changes nothing.
+    # 502 telegram_refused: Telegram's verdict on this message, the next try gets the same.
+    _FINAL_5XX = frozenset({500, 502})
+
+    def __init__(
+        self,
+        status: int | None,
+        code: str,
+        *,
+        detail: str = "",
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(f"{status if status is not None else 'no answer'} {code}".strip())
+        self.status = status
+        self.code = code
+        self.detail = detail
+        self.retry_after = retry_after
+
+    @property
+    def retryable(self) -> bool:
+        """Worth sending again later: no answer, 401 (token not set up yet), 429 or a 5xx outage."""
+        s = self.status
+        return s is None or s in (401, 429) or (s >= 500 and s not in self._FINAL_5XX)
+
+
 @dataclass(frozen=True)
 class Press:
     seq: int
@@ -38,6 +70,8 @@ class Press:
 
 
 class Notifier(Protocol):
+    """``send`` makes one attempt: the message id (None when only logged) or ``SendError``."""
+
     async def send(
         self,
         text: str,
@@ -106,6 +140,7 @@ class ServiceNotifyClient:
     ) -> None:
         self._token = token
         self._sleep = sleep
+        self._quiet = Throttle(log)
         self._client = httpx.AsyncClient(
             base_url=base_url,
             headers={"Authorization": f"Bearer {token}"},
@@ -120,7 +155,7 @@ class ServiceNotifyClient:
         return redact(str(value), [self._token])
 
     async def _request(
-        self, method: str, path: str, *, attempts: int = SEND_ATTEMPTS, **kwargs: Any
+        self, method: str, path: str, *, attempts: int = EDIT_ATTEMPTS, **kwargs: Any
     ) -> dict[str, Any] | None:
         """One API call with bounded retries. Returns the JSON body or None on failure."""
         for attempt in range(1, attempts + 1):
@@ -156,13 +191,16 @@ class ServiceNotifyClient:
         return None
 
     @staticmethod
-    def _error_info(resp: httpx.Response) -> tuple[str, float | None]:
+    def _error_body(resp: httpx.Response) -> dict[str, Any]:
         try:
             body = resp.json()
         except ValueError:
-            return "", None
-        if not isinstance(body, dict):
-            return "", None
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    @classmethod
+    def _error_info(cls, resp: httpx.Response) -> tuple[str, float | None]:
+        body = cls._error_body(resp)
         retry_after = body.get("retry_after")
         if not isinstance(retry_after, (int, float)) or isinstance(retry_after, bool):
             retry_after = None
@@ -191,9 +229,18 @@ class ServiceNotifyClient:
             payload["expires_in"] = expires_in
         if silent:
             payload["silent"] = True
-        body = await self._request("POST", "/v1/messages", json=payload)
-        if body is None or "message_id" not in body:
-            return None
+        # One attempt: the caller's outbox retries, safely thanks to ``dedupe``.
+        try:
+            resp = await self._client.post("/v1/messages", json=payload)
+        except httpx.TransportError as exc:
+            raise SendError(None, type(exc).__name__) from None
+        if resp.status_code >= 400:
+            error, retry_after = self._error_info(resp)
+            detail = self._safe(self._error_body(resp).get("detail", ""))
+            raise SendError(resp.status_code, self._safe(error), detail=detail, retry_after=retry_after)
+        body = self._error_body(resp)
+        if "message_id" not in body:
+            raise SendError(None, "no_message_id")  # no usable answer: try again
         return str(body["message_id"])
 
     async def edit(
@@ -224,11 +271,16 @@ class ServiceNotifyClient:
                         f"status {resp.status_code}", request=resp.request, response=resp
                     )
                 items = list(resp.json().get("presses", []))
-            except (httpx.HTTPError, ValueError, AttributeError) as exc:
+            except Exception as exc:  # any bad answer: log, back off, poll again
                 failures += 1
-                log.warning("notify presses poll failed: %s", self._safe(repr(exc)))
+                reason = type(exc).__name__
+                if isinstance(exc, httpx.HTTPStatusError):
+                    reason = f"{reason} {exc.response.status_code}"
+                self._quiet.warning(f"presses {reason}", "notify presses poll failed: %s", reason)
                 await self._sleep(min(BACKOFF_BASE_S * 2 ** (failures - 1), BACKOFF_MAX_S))
                 continue
+            if failures:
+                self._quiet = Throttle(log)  # recovered: the next failure is logged at once
             failures = 0
             parsed: list[Press] = []
             for item in items:

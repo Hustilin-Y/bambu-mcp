@@ -41,13 +41,13 @@ class Secrets:
     @classmethod
     def load(cls, env_path: Path) -> Secrets:
         env = _parse_env(Path(env_path))
-        for name in ("BAMBU_ACCESS_CODE", "BAMBU_SERIAL"):
+        for name in ("BAMBU_ACCESS_CODE", "BAMBU_SERIAL", "BAMBU_HOST"):
             if not env.get(name):
                 raise ValueError(f"missing required variable {name}")
         return cls(
             access_code=env["BAMBU_ACCESS_CODE"],
             serial=env["BAMBU_SERIAL"],
-            host=env.get("BAMBU_HOST", ""),
+            host=env["BAMBU_HOST"],
             notify_token=env.get("NOTIFY_TOKEN") or None,
             client_tokens={
                 k[len(_CLIENT_PREFIX):].lower(): v
@@ -103,6 +103,10 @@ class Settings:
                     raise ValueError(f"listen entries must look like 'host:port', got {item!r}")
                 listen.append((host, int(port)))
 
+        power_w = {k: float(v) for k, v in raw.get("power_w", defaults.power_w).items()}
+        if "PLA" not in power_w:
+            raise ValueError("power_w must have a PLA entry (the fallback for other materials)")
+
         ca_file = raw.get("ca_file")
         return cls(
             data_dir=Path(raw.get("data_dir", defaults.data_dir)),
@@ -112,7 +116,7 @@ class Settings:
             cert_sha256=raw.get("cert_sha256"),
             notify_url=raw.get("notify_url"),
             camera_backend=backend,
-            power_w={k: float(v) for k, v in raw.get("power_w", defaults.power_w).items()},
+            power_w=power_w,
             heatup_kwh=float(raw.get("heatup_kwh", defaults.heatup_kwh)),
             timezone=raw.get("timezone", defaults.timezone),
         )

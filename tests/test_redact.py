@@ -1,5 +1,7 @@
 import io
 import logging
+import sys
+import threading
 
 import pytest
 
@@ -20,7 +22,10 @@ def test_redact_ignores_empty_secret():
 
 
 @pytest.fixture
-def captured():
+def captured(monkeypatch):
+    # install_redaction replaces both excepthooks: put them back after each test.
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
     stream = io.StringIO()
     handler = logging.StreamHandler(stream)
     handler.setFormatter(logging.Formatter("%(message)s"))
@@ -111,3 +116,24 @@ def test_non_str_arg_with_secret_is_replaced_by_redacted_str():
     record = logging.LogRecord("x", logging.INFO, __file__, 1, "v=%s", (Obj(),), None)
     flt.filter(record)
     assert record.getMessage() == "v=obj(***)"
+
+
+def test_uncaught_exceptions_go_through_logging_redacted(captured):
+    install_redaction(_secrets())
+    try:
+        raise RuntimeError("top level with 12345678")
+    except RuntimeError as exc:
+        sys.excepthook(type(exc), exc, exc.__traceback__)
+
+    def boom():
+        raise RuntimeError("thread with SERIAL123")
+
+    thread = threading.Thread(target=boom, name="paho-test")
+    thread.start()
+    thread.join()
+
+    out = captured.getvalue()
+    assert "top level with ***" in out
+    assert "thread with ***" in out
+    assert "paho-test" in out
+    assert "12345678" not in out and "SERIAL123" not in out

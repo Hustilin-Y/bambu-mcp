@@ -54,3 +54,16 @@ class PrintRow:
     fit: str | None
     deducted_spool_id: int | None = None  # spool the recorded grams were removed from
     deducted_g: float | None = None  # grams actually removed (after the floor at 0)
+
+
+@dataclass(frozen=True)
+class OutboxRow:
+    id: int
+    kind: str  # event kind, "auth", "fit", "spool" or "tariff": for logs, never the text
+    text: str
+    buttons: list[list[dict[str, str]]] | None  # rows of {"id", "text"}
+    snapshot: bool  # attach a camera snapshot taken at the first attempt
+    dedupe: str
+    created_at: float  # epoch seconds
+    attempts: int
+    next_attempt_at: float

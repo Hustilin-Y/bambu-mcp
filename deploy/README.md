@@ -43,7 +43,7 @@ CLIENT_TOKEN_ASSISTANT=<random token for the multiclaude assistant>
 # NOTIFY_TOKEN=<from `assistant service key bambu`, step 5>
 ```
 
-`BAMBU_ACCESS_CODE` and `BAMBU_SERIAL` are required. `BAMBU_HOST` is also needed for the printer link: it defaults to empty, so without it the service starts but cannot connect. Each `CLIENT_TOKEN_<NAME>` defines one MCP client (the name is only used in logs). Without any, the MCP server does not start. Generate a token with `openssl rand -hex 32`.
+`BAMBU_ACCESS_CODE`, `BAMBU_SERIAL` and `BAMBU_HOST` are required: without any of them the service refuses to start, and the error names the missing variable (never a value). Each `CLIENT_TOKEN_<NAME>` defines one MCP client (the name is only used in logs). Without any, the MCP server does not start. Generate a token with `openssl rand -hex 32`.
 
 ## 3. Settings: `/srv/bambu/config.toml`
 
@@ -56,7 +56,7 @@ ca_file = "/srv/bambu/data/bambu.cert"
 notify_url = "http://127.0.0.1:8790"   # only once step 5 is done
 ```
 
-`data_dir` must be absolute: the default is relative to the app dir. Every other key (`listen`, `camera_backend`, `heatup_kwh`, `timezone`, `[power_w]`) has a default, see `config.example.toml`. Unknown keys fail the start.
+`data_dir` must be absolute: the default is relative to the app dir. Every other key (`listen`, `camera_backend`, `heatup_kwh`, `timezone`, `[power_w]`) has a default, see `config.example.toml`. Unknown keys fail the start. A `[power_w]` table must keep a `PLA` entry: it is the fallback for materials without their own.
 
 ### CA bundle
 
@@ -98,6 +98,8 @@ assistant service key bambu
 ```
 
 Put the printed key into `.env` as `NOTIFY_TOKEN`, set `notify_url` in `config.toml` (the add-in listens on `127.0.0.1:8790` by default) and restart the unit. Without both, the service runs with the logging notifier and the log says so.
+
+Messages wait in an outbox table in `bambu.db` and are sent in order by one task: a router restart, a Telegram or ISP outage or a service restart only delays them. Retries back off from 30 s to 30 min, and every message carries a dedupe key the add-in honours for 7 days, so a retry never shows twice. A message still not delivered after 24 h is dropped with a warning in the log, as is one the add-in refuses for good (400, 403, 413, 500 `not_kept`, 502 `telegram_refused`). A 401 is retried, so pending messages go out once the token is fixed. Repeated identical warnings (presses poll failures, printer reconnects, outbox retries) are logged once, then at most once an hour with a count.
 
 ## 6. Register the MCP
 

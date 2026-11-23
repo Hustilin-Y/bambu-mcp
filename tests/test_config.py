@@ -95,3 +95,22 @@ def test_example_config_matches_defaults(tmp_path):
     empty = tmp_path / "empty.toml"
     empty.write_text("")
     assert Settings.load(example) == Settings.load(empty)
+
+
+def test_secrets_load_requires_host(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("BAMBU_ACCESS_CODE=12345678\nBAMBU_SERIAL=SER\n")
+    with pytest.raises(ValueError) as exc:
+        Secrets.load(env)
+    assert "BAMBU_HOST" in str(exc.value)
+    assert "12345678" not in str(exc.value) and "SER" not in str(exc.value).replace("BAMBU_", "")
+    env.write_text("BAMBU_ACCESS_CODE=12345678\nBAMBU_SERIAL=SER\nBAMBU_HOST=\n")
+    with pytest.raises(ValueError, match="BAMBU_HOST"):
+        Secrets.load(env)
+
+
+def test_settings_power_w_must_have_pla(tmp_path):
+    toml = tmp_path / "config.toml"
+    toml.write_text("[power_w]\nPETG = 220\n")
+    with pytest.raises(ValueError, match="PLA"):
+        Settings.load(toml)

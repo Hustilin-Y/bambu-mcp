@@ -46,14 +46,14 @@ def test_render_finished_without_filament_cost():
 def test_render_hms_unknown_text():
     h = Hms(attr=0x0C000300, code=0x00010001)
     text = render_event(event(EventKind.HMS_ERROR, hms=h), HmsTexts(), None)
-    assert "0C00_0300_0001_0001" in text
+    assert r"0C00\_0300\_0001\_0001" in text  # escaped for Markdown
 
 
 def test_render_hms_known_text():
     h = Hms(attr=0x0C000300, code=0x00030001)
     texts = HmsTexts(hms={"0C00_0300_0003_0001": "Nozzle clogged"})
     text = render_event(event(EventKind.HMS_WARNING, hms=h), texts, None)
-    assert "Nozzle clogged" in text and "0C00_0300_0003_0001" in text
+    assert "Nozzle clogged" in text and r"0C00\_0300\_0003\_0001" in text
 
 
 def test_render_other_kinds_have_title():
@@ -101,3 +101,55 @@ def test_render_duration_full_hours_and_omitted():
     assert "Длительность" not in render_event(
         event(EventKind.STARTED), HmsTexts(), None, duration_min=65
     )
+
+
+def test_render_uses_given_timezone():
+    from zoneinfo import ZoneInfo
+
+    assert "14:30" in render_event(event(EventKind.STARTED), HmsTexts(), None)
+    assert "12:30" in render_event(event(EventKind.STARTED), HmsTexts(), None, tz=ZoneInfo("UTC"))
+    assert "21:30" in render_event(
+        event(EventKind.STARTED), HmsTexts(), None, tz=ZoneInfo("Asia/Tokyo")
+    )
+
+
+def test_md_literal_escapes_markdown_and_html():
+    from bambu_mcp.messages import md_literal
+
+    assert md_literal("a_b*c`d[e]f~g|h=i$j\\k") == r"a\_b\*c\`d\[e\]f\~g\|h\=i\$j\\k"
+    assert md_literal("<b>&") == "&lt;b&gt;&amp;"
+    assert md_literal("plain кубик 1.0") == "plain кубик 1.0"
+
+
+def test_job_name_and_hms_text_are_escaped():
+    st = state()
+    st = replace(st, subtask_name="my_part*v2")
+    text = render_event(event(EventKind.STARTED, st), HmsTexts(), None)
+    assert r"my\_part\*v2" in text and "my_part" not in text
+
+    h = Hms(attr=0x0C000300, code=0x00030001)
+    texts = HmsTexts(hms={"0C00_0300_0003_0001": "Check *nozzle* [A]"})
+    text = render_event(event(EventKind.HMS_WARNING, st, hms=h), texts, None)
+    assert r"Check \*nozzle\* \[A\]" in text
+    assert r"0C00\_0300\_0003\_0001" in text
+
+
+def test_questions_escape_the_name():
+    from bambu_mcp.messages import fit_question, spool_question
+
+    assert fit_question("a_b") == r"Как села деталь «a\_b»?"
+    assert fit_question(None) == "Как села деталь «без названия»?"
+    assert spool_question("a_b").startswith(r"С какой катушки печаталась «a\_b»?")
+
+
+def test_render_end_unknown_and_lost():
+    finished = Event(EventKind.FINISHED, ("Benchy", "1", "t"), AT, state(), end_unknown=True)
+    text = render_event(finished, HmsTexts(), None, duration_min=30)
+    assert text.startswith("✅ Печать завершена")
+    assert "Точное время окончания неизвестно" in text
+    assert "Длительность" not in text
+
+    lost = Event(EventKind.FAILED, ("Benchy", "1", "t"), AT, state(), end_unknown=True, lost=True)
+    text = render_event(lost, HmsTexts(), None)
+    assert text.splitlines()[0] == "❌ Печать прервана, пока сервис не видел"
+    assert "Benchy" in text

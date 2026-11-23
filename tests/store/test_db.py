@@ -30,7 +30,7 @@ def test_migrate_is_idempotent_and_seeds_tariff(tmp_path: Path):
     assert t.day_uah == 4.32
     assert t.night_uah is None
     assert t.valid_from == date(2024, 6, 1)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 2
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 3
     assert s._conn().execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     s.close()
 
@@ -215,7 +215,7 @@ def test_migrate_v1_database_adds_deduction_columns(tmp_path: Path):
     (row,) = s.history(None, 10)
     assert row.identity[0] == "old"
     assert (row.deducted_spool_id, row.deducted_g) == (None, None)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 2
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 3
     s.close()
 
 
@@ -259,3 +259,87 @@ def test_rebook_unknown_ids(store: Store):
     with pytest.raises(KeyError):
         store.rebook_print_grams(pid, 999, 1, None)
     assert _remaining(store) == {a: 1000}
+
+
+def test_migrate_v2_database_adds_outbox(tmp_path: Path):
+    s = Store(tmp_path / "v2.db")
+    conn = s._conn()
+    v1 = (Path(__file__).parents[2] / "src/bambu_mcp/store/schema.sql").read_text(encoding="utf-8")
+    conn.executescript(
+        v1
+        + "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
+        + "ALTER TABLE prints ADD COLUMN deducted_g REAL;\nPRAGMA user_version = 2;"
+    )
+    s.migrate()
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 3
+    assert s.outbox_head() is None
+    s.close()
+
+
+def test_outbox_is_fifo_and_keeps_fields(store: Store):
+    buttons = [[{"id": "fit:1:ok", "text": "OK"}]]
+    assert store.outbox_add("finished", "done", "k1", snapshot=True, now=100.0)
+    assert store.outbox_add("fit", "how?", "k2", buttons=buttons, now=101.0)
+    head = store.outbox_head()
+    assert (head.kind, head.text, head.dedupe, head.snapshot, head.buttons) == (
+        "finished", "done", "k1", True, None
+    )
+    assert (head.created_at, head.attempts, head.next_attempt_at) == (100.0, 0, 100.0)
+    store.outbox_defer(head.id, attempts=1, next_attempt_at=130.0)
+    deferred = store.outbox_head()
+    assert deferred.id == head.id and deferred.attempts == 1 and deferred.next_attempt_at == 130.0
+    store.outbox_delete(head.id)
+    second = store.outbox_head()
+    assert second.dedupe == "k2" and second.buttons == buttons and second.snapshot is False
+    assert store.outbox_count() == 1
+
+
+def test_outbox_ignores_a_pending_duplicate_key(store: Store):
+    assert store.outbox_add("started", "a", "same", now=1.0)
+    assert not store.outbox_add("started", "b", "same", now=2.0)
+    assert store.outbox_count() == 1
+
+
+def test_transaction_commits_seen_and_outbox_together(store: Store):
+    with pytest.raises(RuntimeError):
+        with store.transaction():
+            store.seen_add("evt")
+            store.outbox_add("started", "a", "evt", now=1.0)
+            raise RuntimeError("crash before commit")
+    assert not store.seen_contains("evt") and store.outbox_count() == 0
+
+    with store.transaction():
+        store.seen_add("evt")
+        store.outbox_add("started", "a", "evt", now=1.0)
+    assert store.seen_contains("evt") and store.outbox_count() == 1
+
+
+def test_nested_transaction_rolls_back_only_the_inner_part(store: Store):
+    with store.transaction():
+        store.seen_add("outer")
+        with pytest.raises(RuntimeError):
+            with store.transaction():
+                store.seen_add("inner")
+                raise RuntimeError("inner fails")
+        store.outbox_add("x", "t", "k", now=1.0)
+    assert store.seen_contains("outer") and not store.seen_contains("inner")
+    assert store.outbox_count() == 1
+
+
+def test_transaction_is_invisible_to_other_threads_until_commit(store: Store):
+    seen_from_thread = []
+    with store.transaction():
+        store.seen_add("pending")
+        t = threading.Thread(target=lambda: seen_from_thread.append(store.seen_contains("pending")))
+        t.start()
+        t.join()
+    assert seen_from_thread == [False]
+    assert store.seen_contains("pending")
+
+
+def test_open_prints_and_close_without_minutes(store: Store):
+    a = store.open_print(("a", "1", ""), datetime(2026, 1, 1, tzinfo=timezone.utc), "external")
+    b = store.open_print(("b", "2", ""), datetime(2026, 1, 2, tzinfo=timezone.utc), "external")
+    store.close_print(a, "failed", datetime(2026, 1, 3, tzinfo=timezone.utc), None)
+    assert [r.id for r in store.open_prints()] == [b]
+    assert store.print_by_id(a).actual_min is None
