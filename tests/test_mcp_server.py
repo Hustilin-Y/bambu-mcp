@@ -1,8 +1,13 @@
+import asyncio
 import base64
+import hashlib
 import json
 import logging
+import threading
+import time
 from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -11,11 +16,14 @@ from starlette.testclient import TestClient
 from bambu_mcp.camera import CameraBusy
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.events import Event, EventKind
+from bambu_mcp.jobs import create_job_from_bytes
 from bambu_mcp.journal import Journal
 from bambu_mcp.mcp_server import build_app
-from bambu_mcp.notify import Press
+from bambu_mcp.notify import LogNotifier, Press
 from bambu_mcp.printer.link import LinkStatus
 from bambu_mcp.printer.state import Hms, PrinterState, Tray
+from bambu_mcp.service import Service
+from bambu_mcp.slicer import SliceOutcome
 from bambu_mcp.store.db import Store
 
 ACCESS_CODE = "87654321"
@@ -46,6 +54,11 @@ TOOL_NAMES = {
     "set_default_plate",
     "set_tariff",
     "update_print",
+    "create_job",
+    "propose_job",
+    "slice_job",
+    "job_status",
+    "jobs",
 }
 WRITE_TOOLS = TOOL_NAMES - {
     "printer_status",
@@ -54,6 +67,8 @@ WRITE_TOOLS = TOOL_NAMES - {
     "print_history",
     "spools",
     "plates",
+    "job_status",
+    "jobs",
 }
 
 
@@ -452,3 +467,258 @@ async def test_serve_startup_exit_does_not_stop_the_loop(tmp_path, monkeypatch, 
     store.close()
     assert "MCP server failed to start" in caplog.text
     assert sock.closed
+
+
+# -- jobs --------------------------------------------------------------------------
+
+MANIFESTS = Path(__file__).parent / "fixtures" / "manifest"
+THREE_MF = b"PK\x03\x04fake-3mf-body" + bytes(range(256))
+PRESET = "Generic PETG @BBL P2S"
+JOB_TRAYS = (Tray(0, 0, "PETG", "FFFFFFFF", None), Tray(0, 1, "PLA", "161616FF", None))
+SLICED_PLATES = ({"index": 1, "minutes": 100.0, "grams": {"PETG": 14.0}},)
+
+
+def manifest_bytes(**changes) -> bytes:
+    data = json.loads((MANIFESTS / "part.print.json").read_text(encoding="utf-8"))
+    data["file_sha256"] = hashlib.sha256(THREE_MF).hexdigest()
+    data.update(changes)
+    return json.dumps(data).encode("utf-8")
+
+
+class GatedSlicer:
+    """slice-agent fake; while ``hold`` (thread-safe) is set the slice keeps running."""
+
+    def __init__(self) -> None:
+        self.hold = threading.Event()
+        self.requests: list = []
+
+    async def health(self) -> bool:
+        return True
+
+    async def slice(self, job, file_bytes):
+        self.requests.append(job)
+        while self.hold.is_set():
+            await asyncio.sleep(0.01)
+        return SliceOutcome("ok", file=job.out_file, plates=SLICED_PLATES, slicer_version="02.08.02.61")
+
+    async def fetch_png(self, name, plate):
+        return None
+
+
+class CountingWaker:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def wake_and_wait(self, budget_s: float = 120) -> bool:
+        self.calls += 1
+        return True
+
+
+class JobHarness(Harness):
+    """The MCP app on a real ``Service`` (fake slicer and waker, no printer link)."""
+
+    def __init__(self, tmp_path, *, jobs_root: Path | None = None) -> None:
+        self.settings = Settings(
+            data_dir=tmp_path, power_w={"PLA": 200.0, "PETG": 230.0}, jobs_root_allowed=jobs_root
+        )
+        self.store = Store(tmp_path / "bambu.db")
+        self.store.migrate()
+        self.slicer, self.waker = GatedSlicer(), CountingWaker()
+
+        async def camera():
+            return None
+
+        self.service = Service(
+            SECRETS,
+            self.settings,
+            self.store,
+            LogNotifier(),
+            lambda on_report, on_status: None,
+            camera,
+            slicer=self.slicer,
+            waker=self.waker,
+        )
+        self.service._state = replace(PrinterState.empty(), trays=JOB_TRAYS)
+        self.spool_id = self.store.add_spool("Elegoo", "PETG", "white", "#FFFFFF", PRESET, 550.0, 1000.0)
+        self.store.map_slot(0, 0, self.spool_id)
+        self.app = build_app(self.service, self.store, SECRETS, self.settings, camera=camera)
+        self.client = TestClient(self.app, base_url=BASE_URL)
+        self._id = 0
+
+    def add_job(self, **changes) -> int:
+        return create_job_from_bytes(self.store, self.settings, manifest_bytes(**changes), THREE_MF).id
+
+    def wait_status(self, job_id: int, status: str) -> None:
+        deadline = time.monotonic() + 5
+        while self.store.job(job_id).status != status:
+            assert time.monotonic() < deadline, self.store.job(job_id)
+            time.sleep(0.01)
+
+    def error(self, tool: str, /, **arguments) -> str:
+        result = self.call_raw(tool, **arguments)
+        assert result.get("isError") is True, result
+        return result["content"][0]["text"].removeprefix(f"Error executing tool {tool}: ")
+
+
+@pytest.fixture
+def jh(tmp_path):
+    harness = JobHarness(tmp_path)
+    with harness.client:
+        yield harness
+    harness.store.close()
+
+
+def _strings(value) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for k, v in value.items() for s in (*_strings(k), *_strings(v))]
+    if isinstance(value, list | tuple):
+        return [s for v in value for s in _strings(v)]
+    return []
+
+
+def test_create_job_disabled_without_root(jh):
+    text = jh.error("create_job", manifest_path=str(jh.settings.data_dir / "x.print.json"))
+    assert "path intake is off" in text and "bambu-mcp upload" in text
+    assert jh.store.jobs(10) == []
+
+
+def test_create_job_from_a_path_inside_the_root(tmp_path):
+    root = tmp_path / "builds"
+    (root / "lamp-arm").mkdir(parents=True)
+    (root / "lamp-arm" / "lamp-arm.print.json").write_bytes(manifest_bytes())
+    (root / "lamp-arm" / "lamp-arm.3mf").write_bytes(THREE_MF)
+    outside = tmp_path / "elsewhere.print.json"
+    outside.write_bytes(manifest_bytes())
+    (tmp_path / "data").mkdir()
+    harness = JobHarness(tmp_path / "data", jobs_root=root)
+    with harness.client:
+        created = harness.call("create_job", manifest_path=str(root / "lamp-arm" / "lamp-arm.print.json"))
+        relative = harness.error("create_job", manifest_path="lamp-arm/lamp-arm.print.json")
+        refused = harness.error("create_job", manifest_path=str(outside))
+    jobs = harness.store.jobs(10)
+    harness.store.close()
+    assert created == {"job_id": jobs[0].id, "name": "lamp-arm", "kind": "part", "status": "new"}
+    assert len(jobs) == 1
+    assert "absolute" in relative
+    assert "outside the allowed jobs root" in refused
+    assert str(tmp_path) not in relative + refused
+
+
+def test_propose_job_queues_the_proposal_and_returns_its_text(jh):
+    job_id = jh.add_job()
+    result = jh.call("propose_job", job_id=job_id)
+    assert result["job_id"] == job_id
+    assert "lamp-arm" in result["text"]
+    assert jh.store.outbox_count() == 1
+    assert jh.store.job(job_id).status == "new"
+    assert jh.error("propose_job", job_id=999) == "job 999 not found"
+
+
+def test_slice_job_validates_overrides(jh):
+    job_id = jh.add_job()
+    cases = {
+        "wall_loops": ({"wall_loops": 99}, "1..10"),
+        "layer_height": ({"layer_height": 0.3}, "0.12, 0.16, 0.2, 0.24, 0.28"),
+        "curr_bed_type": ({"curr_bed_type": "Glass"}, "Textured PEI Plate"),
+        "sparse_infill_density": ({"sparse_infill_density": "25%"}, "0..100"),
+        "enable_support": ({"enable_support": "yes"}, "true or false"),
+        "nozzle_temperature": ({"nozzle_temperature": 250}, "wall_loops"),
+        "set": ({"set": "ultra"}, "standard, strong, draft"),
+    }
+    for settings in ({"set": ["strong"]}, {"set": 1}):
+        assert "standard, strong, draft" in jh.error("slice_job", job_id=job_id, settings=settings)
+    for key, (settings, allowed) in cases.items():
+        text = jh.error("slice_job", job_id=job_id, settings=settings)
+        assert key in text and allowed in text, (key, text)
+    assert jh.error("slice_job", job_id=999) == "job 999 not found"
+    assert jh.waker.calls == 0 and jh.slicer.requests == []
+    assert jh.store.job(job_id).status == "new"
+    assert jh.store.outbox_count() == 0
+
+
+def test_slice_job_returns_at_once_and_refuses_a_second_start(jh):
+    job_id = jh.add_job()
+    jh.slicer.hold.set()
+    started = jh.call("slice_job", job_id=job_id)
+    assert started == {"job_id": job_id, "status": "slicing"}
+    assert jh.call("job_status", job_id=job_id)["status"] == "slicing"
+    assert jh.error("slice_job", job_id=job_id) == f"job {job_id} is being sliced already"
+    jh.slicer.hold.clear()
+    jh.wait_status(job_id, "sliced")
+    assert len(jh.slicer.requests) == 1 and jh.waker.calls == 1
+
+
+def test_slice_job_named_set_outranks_the_last_jobs_settings(jh):
+    # R6: a set the owner names is explicit, so it beats the part's frozen settings.
+    first = jh.add_job(hints={})
+    jh.call("slice_job", job_id=first, settings={"wall_loops": 2, "sparse_infill_density": 15})
+    jh.wait_status(first, "sliced")
+    second = jh.add_job(hints={})
+    jh.call("slice_job", job_id=second, settings={"set": "strong"})
+    jh.wait_status(second, "sliced")
+    third = jh.add_job(hints={})
+    jh.call("slice_job", job_id=third, settings={"set": "strong", "wall_loops": 6})
+    jh.wait_status(third, "sliced")
+    overrides = [dict(r.overrides) for r in jh.slicer.requests]
+    assert (overrides[0]["wall_loops"], overrides[0]["sparse_infill_density"]) == (2, 15)
+    assert (overrides[1]["wall_loops"], overrides[1]["sparse_infill_density"]) == (4, 25)
+    assert (overrides[2]["wall_loops"], overrides[2]["sparse_infill_density"]) == (6, 25)
+    assert json.loads(jh.store.job(second).result_json)["named_set"] == "strong"
+
+
+def test_job_status_has_no_paths_outside_names(jh):
+    job_id = jh.add_job()
+    fresh = jh.call("job_status", job_id=job_id)
+    assert fresh["status"] == "new" and fresh["plates"] == [] and fresh["sliced_file"] is None
+    jh.call("slice_job", job_id=job_id, settings={"curr_bed_type": "Cool Plate"})
+    jh.wait_status(job_id, "sliced")
+
+    status = jh.call("job_status", job_id=job_id)
+    assert status["job_id"] == job_id and status["name"] == "lamp-arm"
+    assert status["status"] == "sliced" and status["error"] is None
+    assert status["sliced_file"] == f"lamp-arm-{job_id}-p1.gcode.3mf"
+    assert status["settings"]["curr_bed_type"] == "Cool Plate"
+    assert status["settings"]["wall_loops"] == 4
+    assert (status["plate_type"], status["nozzle"]) == ("Cool Plate", "0.4")
+    assert status["slot"] == {
+        "ams": 0, "slot": 0, "number": 1, "material": "PETG", "color": "white",
+        "spool": "Elegoo PETG white",
+    }
+    (plate,) = status["plates"]
+    assert (plate["index"], plate["minutes"], plate["grams"]) == (1, 100.0, 14.0)
+    assert plate["cost_filament_uah"] == 7.7
+    assert plate["cost_total_uah"] == round(plate["cost_filament_uah"] + plate["cost_power_uah"], 2)
+
+    data_dir = str(jh.settings.data_dir)
+    settings_values = set(_strings(status["settings"]))
+    for text in _strings(status):
+        assert data_dir not in text
+        if text not in settings_values:
+            assert "/" not in text and "\\" not in text, text
+    assert jh.error("job_status", job_id=999) == "job 999 not found"
+
+
+def test_jobs_lists_newest_first_with_a_capped_limit(jh):
+    ids = [jh.add_job() for _ in range(3)]
+    listed = jh.call("jobs")["jobs"]
+    assert [j["job_id"] for j in listed] == ids[::-1]
+    assert listed[0] == {
+        "job_id": ids[-1], "name": "lamp-arm", "kind": "part", "status": "new",
+        "created_at": listed[0]["created_at"], "sliced_file": None,
+    }
+    assert [j["job_id"] for j in jh.call("jobs", limit=2)["jobs"]] == ids[:0:-1]
+    assert len(jh.call("jobs", limit=0)["jobs"]) == 1
+    assert len(jh.call("jobs", limit=500)["jobs"]) == 3
+
+
+def test_override_keys_match_the_slice_agent_whitelist():
+    from bambu_mcp.mcp_server import OVERRIDE_KEYS
+    from bambu_mcp.proposal import NAMED_SETS
+    from slice_agent.runner import Overrides
+
+    for key in OVERRIDE_KEYS:
+        with pytest.raises(ValueError, match="invalid value"):
+            Overrides.parse({key: object()}, "0.4")
+    assert {k for values in NAMED_SETS.values() for k in values} <= set(OVERRIDE_KEYS)

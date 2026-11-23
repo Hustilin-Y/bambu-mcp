@@ -7,6 +7,8 @@ logs. No tool accepts or returns the access code, serial, host or any token.
 
 ``POST /jobs`` (same middleware) takes a CAD Workshop manifest and its 3MF as
 multipart parts ``manifest`` and ``file`` and creates a job; see ``bambu_mcp.jobs``.
+The job tools propose and slice jobs through ``Service`` (the same code path as the
+Telegram buttons) and return file names only, never server paths.
 
 All tools are ``async`` on purpose: the SDK runs sync tools in worker threads,
 and the store keeps one SQLite connection per thread.
@@ -18,10 +20,12 @@ import asyncio
 import contextlib
 import functools
 import hmac
+import json
 import logging
 import socket
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import date
+from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -41,19 +45,23 @@ from bambu_mcp import camera as camera_module
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.jobs import (
     MAX_FILE_BYTES,
+    JobBusy,
     JobError,
     JobTooLarge,
     JobUpload,
     create_job_from_bytes,
+    create_job_from_path,
     incoming_dir,
 )
 from bambu_mcp.journal import FIT_VALUES, rebook_grams
-from bambu_mcp.manifest import MAX_MANIFEST_BYTES
+from bambu_mcp.manifest import INFILL_PATTERNS, MAX_MANIFEST_BYTES, ManifestError, parse_manifest
 from bambu_mcp.printer.hms import hms_code, severity
 from bambu_mcp.printer.link import LinkStatus
 from bambu_mcp.printer.state import PrinterState
+from bambu_mcp.proposal import NAMED_SETS, slot_number
 from bambu_mcp.store.db import Store
-from bambu_mcp.store.models import Plate, PrintRow, Spool, Tariff
+from bambu_mcp.store.models import Job, Plate, PrintRow, Spool, Tariff
+from slice_agent.runner import LAYER_HEIGHTS, PLATE_TYPES, Overrides
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +71,9 @@ _BODY_SLACK = 64 * 1024  # multipart boundaries and part headers
 SERVER_NAME = "bambu-mcp"
 GRACEFUL_SHUTDOWN_S = 5
 HISTORY_MAX = 200
+JOBS_MAX = 50
+SET_KEY = "set"  # slice_job settings: the named set to start from
+PATH_INTAKE_OFF = "path intake is off: upload with `bambu-mcp upload`"
 
 READ = ToolAnnotations(read_only_hint=True)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False)
@@ -78,6 +89,12 @@ class StatusSource(Protocol):
 
     @property
     def link_status(self) -> LinkStatus: ...
+
+    async def propose(self, job_id: int) -> str: ...
+
+    def start_slice(
+        self, job_id: int, explicit: Mapping | None = None, *, named_set: str = ...
+    ) -> Job: ...
 
 
 # -- auth ------------------------------------------------------------------------
@@ -204,6 +221,152 @@ def _tool_errors() -> Iterator[None]:
         raise ToolError(str(exc.args[0]) if exc.args else "not found") from exc
     except (ValueError, LookupError) as exc:
         raise ToolError(str(exc)) from exc
+
+
+# -- jobs ----------------------------------------------------------------------------
+
+# Overrides.parse's whitelist, with what each key accepts (for error messages).
+OVERRIDE_KEYS = (
+    "sparse_infill_density",
+    "sparse_infill_pattern",
+    "wall_loops",
+    "wall_generator",
+    "enable_support",
+    "support_type",
+    "brim_type",
+    "curr_bed_type",
+    "layer_height",
+)
+
+
+def _allowed_values(key: str, nozzle: str) -> str:
+    heights = ", ".join(f"{h:g}" for h in LAYER_HEIGHTS.get(nozzle, ()))
+    return {
+        "sparse_infill_density": "an integer 0..100 (percent)",
+        "sparse_infill_pattern": ", ".join(INFILL_PATTERNS),
+        "wall_loops": "an integer 1..10",
+        "wall_generator": "arachne, classic",
+        "enable_support": "true or false",
+        "support_type": "tree(auto), normal(auto)",
+        "brim_type": "no_brim, auto_brim, outer_only",
+        "curr_bed_type": ", ".join(PLATE_TYPES),
+        "layer_height": heights or f"nothing for nozzle {nozzle}",
+    }[key]
+
+
+def explicit_settings(
+    settings: Mapping[str, Any] | None, nozzle: str
+) -> tuple[dict[str, object], str | None]:
+    """(explicit overrides, named set) from a ``slice_job`` request (ruling R6).
+
+    A named set (``{"set": "strong"}``) is expanded into explicit values and the other
+    keys go on top, so both outrank the part's last settings and its hints. Raises
+    ``ToolError`` naming the key and what it accepts.
+    """
+    raw = dict(settings or {})
+    named = raw.pop(SET_KEY, None)
+    if named is not None and (not isinstance(named, str) or named not in NAMED_SETS):
+        raise ToolError(f"{SET_KEY}: unknown named set {named!r}, allowed: {', '.join(NAMED_SETS)}")
+    explicit: dict[str, object] = {**(NAMED_SETS[named] if named else {}), **raw}
+    for key, value in explicit.items():
+        if key not in OVERRIDE_KEYS:
+            raise ToolError(f"{key}: unknown setting, allowed: {', '.join((SET_KEY, *OVERRIDE_KEYS))}")
+        try:
+            Overrides.parse({key: value}, nozzle)
+        except ValueError:
+            origin = "" if key in raw else f" (from set {named!r})"
+            raise ToolError(
+                f"{key}: {value!r}{origin} is not allowed for nozzle {nozzle}, "
+                f"allowed: {_allowed_values(key, nozzle)}"
+            ) from None
+    return explicit, named
+
+
+def _job_nozzle(job: Job) -> str:
+    try:
+        return f"{parse_manifest(json.loads(job.manifest_json)).nozzle_mm:g}"
+    except (ValueError, RecursionError, ManifestError):
+        raise ToolError(f"job {job.id} has an unreadable manifest") from None
+
+
+def _loads(text: str | None) -> dict | None:
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _job_summary(job: Job, tz: ZoneInfo) -> dict[str, Any]:
+    return {
+        "job_id": job.id,
+        "name": job.name,
+        "kind": job.kind,
+        "status": job.status,
+        "created_at": job.created_at.astimezone(tz).isoformat(),
+        "sliced_file": job.sliced_file,
+    }
+
+
+def _spool_name(store: Store, spool_id: object) -> str | None:
+    if not isinstance(spool_id, int):
+        return None
+    spool = next((s for s in store.spools(active_only=False) if s.id == spool_id), None)
+    if spool is None:
+        return None
+    return " ".join(part for part in (spool.brand, spool.material, spool.color_name) if part)
+
+
+def _job_slot(store: Store, result: dict) -> dict[str, Any] | None:
+    slot = result.get("slot")
+    if not isinstance(slot, dict) or not all(isinstance(slot.get(k), int) for k in ("ams", "slot")):
+        return None
+    return {
+        "ams": slot["ams"],
+        "slot": slot["slot"],
+        "number": slot_number(slot["ams"], slot["slot"]),
+        "material": result.get("material") or slot.get("tray_type"),
+        "color": slot.get("color"),
+        "spool": _spool_name(store, slot.get("spool_id")),
+    }
+
+
+def _job_plates(result: dict) -> list[dict[str, Any]]:
+    costs = {c.get("index"): c for c in result.get("costs") or () if isinstance(c, dict)}
+    plates = []
+    for plate in result.get("plates") or ():
+        if not isinstance(plate, dict):
+            continue
+        cost = costs.get(plate.get("index"), {})
+        grams = plate.get("grams")
+        plates.append(
+            {
+                "index": plate.get("index"),
+                "minutes": plate.get("minutes"),
+                "grams": round(sum(grams.values()), 2) if isinstance(grams, dict) else None,
+                "cost_filament_uah": _money(cost.get("filament_uah")),
+                "cost_power_uah": _money(cost.get("power_uah")),
+                "cost_total_uah": _money(cost.get("total_uah")),
+            }
+        )
+    return plates
+
+
+def _job_status(store: Store, job: Job, tz: ZoneInfo) -> dict[str, Any]:
+    """The job for a client: file and spool names only, never a server path."""
+    result = _loads(job.result_json) or {}
+    return {
+        **_job_summary(job, tz),
+        "settings": _loads(job.settings_json),
+        "named_set": result.get("named_set"),
+        "slot": _job_slot(store, result),
+        "plate_type": result.get("plate_type"),
+        "nozzle": result.get("nozzle") or _job_nozzle(job),
+        "plates": _job_plates(result),
+        "error": job.error,
+    }
 
 
 def _spool_by_id(store: Store, spool_id: int) -> Spool:
@@ -413,6 +576,84 @@ def build_mcp(
         updated = store.print_by_id(print_id)
         assert updated is not None
         return _print(updated, tz)
+
+    # -- jobs ------------------------------------------------------------------
+
+    def job_or_error(job_id: int) -> Job:
+        job = store.job(job_id)
+        if job is None:
+            raise ToolError(f"job {job_id} not found")
+        return job
+
+    @mcp.tool(annotations=WRITE)
+    async def create_job(manifest_path: str) -> dict[str, Any]:
+        """Create a print job from a CAD Workshop manifest, by its absolute path on the service machine.
+
+        Works only when the service allows a jobs root; otherwise upload with `bambu-mcp upload`.
+        """
+        root = settings.jobs_root_allowed
+        if root is None:
+            raise ToolError(PATH_INTAKE_OFF)
+        path = Path(manifest_path)
+        if not path.is_absolute():
+            raise ToolError("manifest_path must be an absolute path")
+        # Synchronous on the event loop on purpose (no await, no thread): intakes never interleave.
+        try:
+            job = create_job_from_path(store, settings, path, root)
+        except JobError as exc:
+            raise ToolError(str(exc)) from None
+        return {"job_id": job.id, "name": job.name, "kind": job.kind, "status": job.status}
+
+    @mcp.tool(annotations=WRITE)
+    async def propose_job(job_id: int) -> dict[str, Any]:
+        """Send the job's proposal (settings, AMS slot, plate) to Telegram with slice/change buttons.
+
+        Returns the same text. Nothing is sliced or printed.
+        """
+        job_or_error(job_id)
+        try:
+            text = await service.propose(job_id)
+        except KeyError:
+            raise ToolError(f"job {job_id} not found") from None
+        except ValueError as exc:
+            raise ToolError(str(exc)) from None
+        return {"job_id": job_id, "text": text}
+
+    @mcp.tool(annotations=WRITE)
+    async def slice_job(job_id: int, settings: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Start slicing a job on the owner's PC (woken if needed). Returns at once, never prints.
+
+        `settings`: {"set": "standard" | "strong" | "draft"} and/or overrides: sparse_infill_density
+        (0..100), sparse_infill_pattern, wall_loops (1..10), wall_generator, enable_support,
+        support_type, brim_type, curr_bed_type, layer_height. They win over the part's last
+        settings and its hints. Follow it with job_status; the summary also goes to Telegram.
+        """
+        job = job_or_error(job_id)
+        explicit, named = explicit_settings(settings, _job_nozzle(job))
+        options = {"named_set": named} if named else {}
+        try:
+            # The Telegram button's path: claimed now, sliced in a background task, so a
+            # cancelled tool call never interrupts the slice.
+            service.start_slice(job_id, explicit, **options)
+        except JobBusy:
+            raise ToolError(f"job {job_id} is being sliced already") from None
+        except KeyError:
+            raise ToolError(f"job {job_id} not found") from None
+        except ValueError as exc:
+            raise ToolError(str(exc)) from None
+        return {"job_id": job_id, "status": "slicing"}
+
+    @mcp.tool(annotations=READ)
+    async def job_status(job_id: int) -> dict[str, Any]:
+        """A job: status, settings, AMS slot, plate type, nozzle, per-plate minutes, grams and
+        cost (UAH), the sliced file name and the last error."""
+        return _job_status(store, job_or_error(job_id), tz)
+
+    @mcp.tool(annotations=READ)
+    async def jobs(limit: int = 10) -> dict[str, Any]:
+        """Print jobs, newest first (limit 1..50)."""
+        limit = max(1, min(limit, JOBS_MAX))
+        return {"jobs": [_job_summary(j, tz) for j in store.jobs(limit)]}
 
     return mcp
 

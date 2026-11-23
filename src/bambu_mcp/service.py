@@ -34,6 +34,7 @@ from bambu_mcp import mcp_server
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.cost import tariff_check_due
 from bambu_mcp.events import CANCEL_ERROR, Event, EventDetector, EventKind, event_identity
+from bambu_mcp.jobs import JobBusy
 from bambu_mcp.journal import NO_SPOOL, TERMINAL_KINDS, Journal, Slot
 from bambu_mcp.logthrottle import Throttle
 from bambu_mcp.manifest import Manifest, ManifestError, parse_manifest, verify_file
@@ -146,10 +147,6 @@ class Waker(Protocol):
     """``slicer.GatewayWaker``."""
 
     async def wake_and_wait(self, budget_s: float = WAKE_BUDGET_S) -> bool: ...
-
-
-class JobBusy(Exception):
-    """The job is being sliced already."""
 
 
 class _SliceFailed(Exception):

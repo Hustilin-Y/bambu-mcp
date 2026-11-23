@@ -51,6 +51,10 @@ class JobTooLarge(JobError):
     """The manifest or the 3MF is over its size cap."""
 
 
+class JobBusy(Exception):
+    """The job is being sliced already."""
+
+
 def _size(n: int) -> str:
     return f"{n / (1024 * 1024):g} MB" if n >= 1024 * 1024 else f"{n} bytes"
 
