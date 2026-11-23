@@ -64,7 +64,14 @@ from bambu_mcp.proposal import (
     slot_number,
 )
 from bambu_mcp.redact import install_redaction
-from bambu_mcp.slicer import WAKE_BUDGET_S, GatewayWaker, SliceClient, SliceOutcome, SliceRequest
+from bambu_mcp.slicer import (
+    WAKE_BUDGET_S,
+    GatewayWaker,
+    SliceClient,
+    SliceOutcome,
+    SliceRequest,
+    WakeError,
+)
 from bambu_mcp.store.db import Store
 from bambu_mcp.store.models import Job, OutboxRow, Spool, Tariff
 from slice_agent.runner import PLATE_TYPES
@@ -95,6 +102,8 @@ _SLOTS_PER_AMS = 4
 _MAX_AMS_TRAY = 15
 # Jobs (phase 2).
 DEFAULT_NAMED_SET = "standard"
+# The agent always slices on its standard process set: a named set travels as overrides.
+PROCESS_SET = "standard"
 DEFAULT_PLATE_TYPE = "Textured PEI Plate"
 JOB_HISTORY = 200  # newest jobs searched for the part's last settings and colour
 BUSY_RETRY_S = 30.0
@@ -103,6 +112,13 @@ SLICE_BUTTON_TEXT = "✂️ Нарезать"
 CHANGE_BUTTON_TEXT = "⚙️ Изменить"
 CHANGE_TEXT = "Скажи ассистенту, что поменять: стенки, заполнение, поддержки, пластину"
 SLICED_KIND = "job_sliced"
+SLICED_TEXT_KIND = "job_sliced_text"  # the summary sent after its picture when too long for a caption
+CAPTION_MAX = 1024  # Telegram photo caption limit, in UTF-16 code units
+_WAKE_TEXTS = {
+    "refused": "шлюз отклонил запрос пробуждения ПК",
+    "unreachable": "шлюз не ответил на запрос пробуждения ПК",
+    "not_configured": "ПК выключен, а шлюз для пробуждения не настроен",
+}
 ATTACHMENTS_DIR = "outbox-files"  # data_dir/<this>/<sha256 of the dedupe key>/<file>
 
 Camera = Callable[[], Awaitable[bytes | None]]
@@ -157,7 +173,7 @@ class SlicePlan:
     color: str | None  # the slot's colour, preferred for the part next time
     plate_type: str
     nozzle: str
-    process_set: str
+    named_set: str  # its values are in ``settings``, the agent always gets PROCESS_SET
     filament: str | None  # the spool's Bambu Studio filament preset
 
 
@@ -272,6 +288,10 @@ class Service:
             self._fail_interrupted_jobs()
         except Exception:
             log.exception("checking for interrupted slices failed")
+        try:
+            self._sweep_attachments()
+        except Exception:
+            log.exception("removing unused message attachments failed")
         link = self._link_factory(self._on_report_threadsafe, self._on_status_threadsafe)
         tasks = [
             asyncio.create_task(self._consume_inbox(), name="bambu-inbox"),
@@ -460,6 +480,22 @@ class Service:
     def _attachments_dir(self, dedupe: str) -> Path:
         name = hashlib.sha256(dedupe.encode("utf-8")).hexdigest()
         return Path(self._settings.data_dir) / ATTACHMENTS_DIR / name
+
+    def _sweep_attachments(self) -> None:
+        """Remove attachment folders no outbox message refers to (a crash before the commit)."""
+        root = Path(self._settings.data_dir) / ATTACHMENTS_DIR
+        if not root.is_dir():
+            return
+        used = {self._attachments_dir(d).name for d in self._store.outbox_dedupes()}
+        for entry in root.iterdir():
+            if entry.name in used and entry.is_dir() and not entry.is_symlink():
+                continue
+            log.info("removing an unused message attachment %s", entry.name)
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                with contextlib.suppress(OSError):
+                    entry.unlink()
 
     def _attachments(self, dedupe: str) -> list[tuple[str, bytes]]:
         """Files stored for an outbox message (a plate picture), kept until it is dropped."""
@@ -735,7 +771,7 @@ class Service:
             color=color,
             plate_type=str(settings.get("curr_bed_type") or self._default_plate_type()),
             nozzle=nozzle,
-            process_set=named_set,
+            named_set=named_set,
             filament=(spool.filament_preset or None) if spool else None,
         )
 
@@ -775,12 +811,13 @@ class Service:
                 f"слайсер не настроен, нужны {md_literal('slice_agent_url')} и {md_literal('SLICE_AGENT_TOKEN')}",
             )
         data = await asyncio.to_thread(self._stored_file, job)
-        if plan.filament is None:
-            raise _SliceFailed(
-                f"no filament preset for {plan.material}: map a spool with a preset to the slot",
-                "не знаю пресет филамента: привяжи к слоту катушку с пресетом",
-            )
-        awake = await (self._waker.wake_and_wait(WAKE_BUDGET_S) if self._waker else slicer.health())
+        problem = _preset_problem(plan)
+        if problem is not None:
+            raise _SliceFailed(*problem)
+        try:
+            awake = await (self._waker.wake_and_wait(WAKE_BUDGET_S) if self._waker else slicer.health())
+        except WakeError as exc:
+            raise _SliceFailed(str(exc), _WAKE_TEXTS.get(exc.kind, "ПК не удалось разбудить")) from None
         if not awake:
             raise _SliceFailed(
                 "the PC did not wake within 2 minutes", "ПК не проснулся за 2 минуты, нарезка не запускалась"
@@ -791,7 +828,7 @@ class Service:
             kit=plan.manifest.kind == "kit",
             plates=tuple(p.index for p in plan.manifest.plates) if plan.manifest.kind == "kit" else (1,),
             nozzle=plan.nozzle,
-            process_set=plan.process_set,
+            process_set=PROCESS_SET,
             filament=plan.filament,
             plate_type=plan.plate_type,
             overrides=plan.settings,
@@ -871,13 +908,17 @@ class Service:
             "material": plan.material,
             "plate_type": plan.plate_type,
             "nozzle": plan.nozzle,
-            "process_set": plan.process_set,
+            "process_set": PROCESS_SET,
+            "named_set": plan.named_set,
             "filament": plan.filament,
             "slicer_version": outcome.slicer_version,
             "sliced_at": now.astimezone(UTC).isoformat(),
         }
         key = _job_key(job.id, "sliced")
-        folder = self._attachments_dir(notify_dedupe(key)) if png else None
+        # A photo caption holds 1024 characters: a longer summary follows its picture.
+        split = png is not None and _caption_len(text) > CAPTION_MAX
+        picture_key = _job_key(job.id, "picture") if split else key
+        folder = self._attachments_dir(notify_dedupe(picture_key)) if png else None
         try:
             if folder is not None and png is not None:
                 folder.mkdir(parents=True, exist_ok=True)
@@ -894,7 +935,12 @@ class Service:
                 )
                 if not done:
                     raise RuntimeError(f"job {job.id} left the slicing status")
-                self._enqueue(SLICED_KIND, text, key)
+                if split:
+                    caption = f"{job_name(job.name)}: пластина {first}"
+                    self._enqueue(SLICED_KIND, caption, picture_key)
+                    self._enqueue(SLICED_TEXT_KIND, text, key)
+                else:
+                    self._enqueue(SLICED_KIND, text, key)
         except BaseException:
             if folder is not None:
                 shutil.rmtree(folder, ignore_errors=True)
@@ -945,6 +991,9 @@ class Service:
         except ValueError as exc:
             log.warning("job %d: slice press refused: %s", job.id, exc)
             return f"Не получилось начать нарезку «{name}»: {md_literal(str(exc))}"
+        except Exception:
+            log.exception("job %d: slice press failed", job.id)
+            return f"Не получилось начать нарезку «{name}»: внутренняя ошибка сервиса"
         return f"✂️ Режу «{name}», пришлю результат"
 
 
@@ -967,17 +1016,39 @@ def _last_color(history: list[Job], name: str) -> str | None:
     return None
 
 
-def _preset_warning(plan: SlicePlan) -> str | None:
-    """Why slicing would stop before it starts: no filament preset to slice with."""
+def _preset_problem(plan: SlicePlan) -> tuple[str, str] | None:
+    """(English error, Russian reason) when there is no filament preset to slice with."""
     if plan.filament is not None:
         return None
     choice = plan.choice
     if choice.ams is None or choice.slot is None:
-        return "⚠️ Без катушки с пресетом филамента нарезка не начнётся"
+        return "no loaded slot with a filament preset", "нет заправленного слота с пресетом филамента"
     n = slot_number(choice.ams, choice.slot)
-    if plan.spool is None:
-        return f"⚠️ Слот {n} не привязан к катушке: без пресета филамента нарезка не начнётся"
-    return f"⚠️ У катушки в слоте {n} не указан пресет филамента: нарезка не начнётся"
+    spool = plan.spool
+    if spool is None:
+        return (
+            f"slot {n} has no spool mapped, so there is no filament preset",
+            f"слот {n} не привязан к катушке, нет пресета филамента",
+        )
+    label = md_literal(f"{spool.brand} {spool.material} {spool.color_name}")
+    return (
+        f"spool {spool.id} in slot {n} has no filament preset",
+        f"у катушки {spool.id} ({label}) в слоте {n} не указан пресет филамента",
+    )
+
+
+def _preset_warning(plan: SlicePlan) -> str | None:
+    """The proposal's line for a slice that would stop before it starts."""
+    problem = _preset_problem(plan)
+    if problem is None:
+        return None
+    reason = problem[1]
+    return f"⚠️ {reason[0].upper()}{reason[1:]}: нарезка не начнётся"
+
+
+def _caption_len(text: str) -> int:
+    """Length as Telegram counts it (UTF-16 code units), before Markdown escapes are removed."""
+    return len(text.encode("utf-16-le")) // 2
 
 
 # -- entry point ---------------------------------------------------------------

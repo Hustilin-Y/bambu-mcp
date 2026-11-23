@@ -536,6 +536,10 @@ class Store:
         with self._tx() as conn:
             conn.execute("DELETE FROM outbox WHERE id = ?", (id,))
 
+    def outbox_dedupes(self) -> set[str]:
+        """Dedupe keys of every waiting message."""
+        return {r["dedupe"] for r in self._conn().execute("SELECT dedupe FROM outbox")}
+
     def outbox_count(self) -> int:
         return int(self._conn().execute("SELECT COUNT(*) FROM outbox").fetchone()[0])
 

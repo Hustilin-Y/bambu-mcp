@@ -25,7 +25,7 @@ from bambu_mcp.service import (
     build_notifier,
     notify_dedupe,
 )
-from bambu_mcp.slicer import SliceOutcome
+from bambu_mcp.slicer import SliceOutcome, WakeError
 from bambu_mcp.store.db import Store
 
 FIXTURES = Path(__file__).parent / "fixtures" / "p2s"
@@ -784,12 +784,14 @@ class FakeSlicer:
 
 
 class FakeWaker:
-    def __init__(self, result: bool = True) -> None:
+    def __init__(self, result: bool | WakeError = True) -> None:
         self.result = result
         self.budgets: list[float] = []
 
     async def wake_and_wait(self, budget_s: float = 120) -> bool:
         self.budgets.append(budget_s)
+        if isinstance(self.result, WakeError):
+            raise self.result
         return self.result
 
 
@@ -1054,13 +1056,29 @@ async def test_damaged_stored_file_is_never_sliced(tmp_path):
 async def test_no_filament_preset_fails_before_waking(tmp_path):
     waker = FakeWaker()
     service, store, notifier = job_service(tmp_path, waker=waker)
-    add_spool(store, preset=None)
+    spool = add_spool(store, preset=None)
     job = add_job(store, service._settings)
     done = await service.slice_job(job.id)
-    assert done.status == "slice_failed" and "filament preset" in done.error
+    assert done.status == "slice_failed"
+    assert done.error == f"spool {spool} in slot 1 has no filament preset"
     assert waker.budgets == []
     await drain(service)
-    assert "пресет" in notifier.sent[0]["text"]
+    text = notifier.sent[0]["text"]
+    assert text.endswith(f"у катушки {spool} (Elegoo petg белый) в слоте 1 не указан пресет филамента")
+    store.close()
+
+
+async def test_no_spool_mapped_to_the_slot_names_the_slot(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    job = add_job(store, service._settings)  # no spool mapped: slot 1 (first PETG tray) is chosen
+    await service.propose(job.id)
+    done = await service.slice_job(job.id)
+    assert done.error == "slot 1 has no spool mapped, so there is no filament preset"
+    await drain(service)
+    assert notifier.sent[0]["text"].splitlines()[-1] == (
+        "⚠️ Слот 1 не привязан к катушке, нет пресета филамента: нарезка не начнётся"
+    )
+    assert notifier.sent[1]["text"].endswith("слот 1 не привязан к катушке, нет пресета филамента")
     store.close()
 
 
@@ -1194,3 +1212,114 @@ async def test_build_slicer(tmp_path, caplog):
         assert isinstance(client, SliceClient) and isinstance(waker, GatewayWaker)
     assert "jobs cannot be sliced" in caplog.text
     assert "agent-token" not in caplog.text
+
+
+
+async def test_named_set_reaches_the_agent_as_standard_plus_overrides(tmp_path):
+    slicer = FakeSlicer()
+    service, store, _ = job_service(tmp_path, slicer)
+    add_spool(store)
+    job = add_job(store, service._settings, hints={})
+    done = await service.slice_job(job.id, named_set="strong")
+    req = slicer.requests[0]
+    assert req.process_set == "standard"
+    assert req.overrides["wall_loops"] == 4 and req.overrides["sparse_infill_density"] == 25
+    result = json.loads(done.result_json)
+    assert result["process_set"] == "standard" and result["named_set"] == "strong"
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [
+        (WakeError("refused", "the gateway refused the wake request (HTTP 401)"),
+         "шлюз отклонил запрос пробуждения ПК"),
+        (WakeError("unreachable", "the gateway did not answer the wake request (ConnectError)"),
+         "шлюз не ответил на запрос пробуждения ПК"),
+        (WakeError("not_configured", "the PC is down and no gateway is configured to wake it"),
+         "ПК выключен, а шлюз для пробуждения не настроен"),
+    ],
+)
+async def test_gateway_failure_has_its_own_message(tmp_path, error, text):
+    slicer = FakeSlicer()
+    service, store, notifier = job_service(tmp_path, slicer, FakeWaker(error))
+    add_spool(store)
+    job = add_job(store, service._settings)
+    done = await service.slice_job(job.id)
+    assert done.status == "slice_failed" and done.error == str(error)
+    assert slicer.requests == []
+    await drain(service)
+    assert notifier.sent[0]["text"].endswith(text)
+    assert "2 минуты" not in notifier.sent[0]["text"]
+    store.close()
+
+
+async def test_orphan_attachment_folders_removed_at_startup(harness):
+    root = harness.settings.data_dir / "outbox-files"
+    orphan = root / ("0" * 64)
+    orphan.mkdir(parents=True)
+    (orphan / "plate-1.png").write_bytes(PNG)
+    stray_file = root / "stray.txt"
+    stray_file.write_text("x")
+    harness.notifier.fail = True  # the queued summary stays in the outbox
+    harness.store.outbox_add("job_sliced", "summary", "job|1|sliced|abc", now=T0.timestamp())
+    service = await harness.start()
+    kept = service._attachments_dir("job|1|sliced|abc")
+    assert not orphan.exists() and not stray_file.exists()
+    kept.mkdir(parents=True)
+    (kept / "plate-1.png").write_bytes(PNG)
+    service._sweep_attachments()
+    assert kept.is_dir()
+
+
+async def test_press_with_an_unexpected_error_answers_the_owner(harness, caplog, monkeypatch):
+    service = await harness.start()
+    job = add_job(harness.store, harness.settings)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("corrupt row")
+
+    monkeypatch.setattr(service, "_plan", broken)
+    with caplog.at_level(logging.ERROR, logger="bambu_mcp.service"):
+        await harness.notifier.press_queue.put(Press(1, "m5", f"job:{job.id}:slice", T0))
+        await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits == [("m5", "Не получилось начать нарезку «lamp-arm»: внутренняя ошибка сервиса")]
+    assert "corrupt row" in caplog.text
+    assert harness.store.job(job.id).status == "new"
+
+
+def long_kit(plates: int) -> dict:
+    raw = json.loads((MANIFESTS / "kit.print.json").read_text(encoding="utf-8"))
+    first = raw["plates"][0]
+    raw["plates"] = [{**first, "index": i} for i in range(1, plates + 1)]
+    return raw
+
+
+async def test_long_summary_sends_the_picture_then_the_text(tmp_path):
+    raw = long_kit(30)
+    plates = tuple({"index": i, "minutes": 61.0, "grams": {"PETG": 3.0}} for i in range(1, 31))
+    slicer = FakeSlicer(ok("desk-kit-1-kit.gcode.3mf", plates))
+    service, store, notifier = job_service(tmp_path, slicer)
+    add_spool(store)
+    job = add_job(store, service._settings, kind="kit", plates=raw["plates"])
+    done = await service.slice_job(job.id)
+    assert done.status == "sliced"
+    await drain(service)
+    assert len(notifier.sent) == 2
+    picture, summary = notifier.sent
+    assert picture["files"] == [("plate-1.png", PNG)]
+    assert len(picture["text"]) <= 1024 and picture["text"] == "desk-kit: пластина 1"
+    assert summary["files"] == [] and len(summary["text"]) > 1024
+    assert summary["text"].startswith("desk-kit, 30 пластин:")
+    assert not any((tmp_path / "outbox-files").glob("*"))
+    store.close()
+
+
+async def test_short_summary_is_the_picture_caption(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    await service.slice_job(job.id)
+    await drain(service)
+    assert len(notifier.sent) == 1 and notifier.sent[0]["files"] == [("plate-1.png", PNG)]
+    store.close()

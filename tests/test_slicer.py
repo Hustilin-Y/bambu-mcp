@@ -6,7 +6,15 @@ import httpx
 import pytest
 
 from bambu_mcp.names import slug
-from bambu_mcp.slicer import GatewayWaker, SliceClient, SliceOutcome, SliceRequest
+from bambu_mcp.slicer import (
+    MAX_JSON_BYTES,
+    MAX_PNG_BYTES,
+    GatewayWaker,
+    SliceClient,
+    SliceOutcome,
+    SliceRequest,
+    WakeError,
+)
 from slice_agent.app import create_app
 from slice_agent.config import AgentConfig
 from slice_agent.runner import SliceRun
@@ -113,15 +121,24 @@ async def test_wake_timeout_returns_false():
     assert len(gw.requests) == 1  # /wake is posted once, never again
 
 
-@pytest.mark.parametrize("status", [401, 500, 0])
-async def test_wake_refused_or_unreachable_gateway_returns_false_at_once(status, caplog):
+@pytest.mark.parametrize(
+    ("status", "kind", "error"),
+    [
+        (401, "refused", "the gateway refused the wake request (HTTP 401)"),
+        (500, "refused", "the gateway refused the wake request (HTTP 500)"),
+        (0, "unreachable", "the gateway did not answer the wake request (ConnectError)"),
+    ],
+)
+async def test_wake_refused_or_unreachable_gateway_raises_at_once(status, kind, error, caplog):
     gw, t = Gateway(status), FakeTime()
     ready, calls = probe([False])
     async with gw.client() as http:
         waker = GatewayWaker(GATEWAY, GATEWAY_KEY, http, ready=ready, clock=t.clock, sleep=t.sleep)
-        assert await waker.wake_and_wait() is False
+        with pytest.raises(WakeError) as exc:
+            await waker.wake_and_wait()
+    assert exc.value.kind == kind and str(exc.value) == error
     assert t.sleeps == [] and len(calls) == 1
-    assert GATEWAY_KEY not in caplog.text
+    assert GATEWAY_KEY not in caplog.text and GATEWAY_KEY not in str(exc.value)
 
 
 async def test_wake_without_gateway_only_probes():
@@ -129,7 +146,9 @@ async def test_wake_without_gateway_only_probes():
     ready, calls = probe([False])
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(500))) as http:
         waker = GatewayWaker(None, None, http, ready=ready, clock=t.clock, sleep=t.sleep)
-        assert await waker.wake_and_wait() is False
+        with pytest.raises(WakeError) as exc:
+            await waker.wake_and_wait()
+    assert exc.value.kind == "not_configured"
     assert len(calls) == 1 and t.sleeps == []
 
 
@@ -342,3 +361,46 @@ async def test_fetch_png_refuses_odd_names_without_a_request(name):
     agent = Agent(httpx.Response(200, content=PNG))
     assert await agent.client().fetch_png(name, 1) is None
     assert agent.requests == []
+
+
+# -- response size caps --------------------------------------------------------------
+
+
+async def test_oversized_ok_body_is_a_clean_failure():
+    body = {**OK_BODY, "padding": "x" * MAX_JSON_BYTES}
+    outcome = await Agent(httpx.Response(200, json=body)).client().slice(request(), UPLOAD)
+    assert outcome == SliceOutcome("failed", detail="slice-agent answered with an oversized body")
+
+
+async def test_oversized_error_body_is_a_clean_failure():
+    body = {"error": "slice_failed", "detail": "x" * (MAX_JSON_BYTES + 1)}
+    outcome = await Agent(httpx.Response(500, json=body)).client().slice(request(), UPLOAD)
+    assert outcome == SliceOutcome("failed", detail="slice-agent answered with an oversized body")
+
+
+async def test_oversized_health_body_is_not_healthy():
+    body = {"ok": True, "padding": "x" * MAX_JSON_BYTES}
+    assert await Agent(httpx.Response(200, json=body)).client().health() is False
+
+
+async def test_streamed_body_over_the_cap_is_cut_off():
+    chunks_read = []
+
+    async def stream():
+        for _ in range(100):
+            chunks_read.append(1)
+            yield b"x" * (64 * 1024)
+
+    agent = Agent(httpx.Response(200, content=stream()))
+    outcome = await agent.client().slice(request(), UPLOAD)
+    assert outcome.detail == "slice-agent answered with an oversized body"
+    assert len(chunks_read) < 100  # stopped reading at the cap
+
+
+async def test_png_over_the_cap_is_none():
+    big = PNG + b"\0" * MAX_PNG_BYTES
+    agent = Agent(httpx.Response(200, content=big, headers={"content-type": "image/png"}))
+    assert await agent.client().fetch_png("lamp-arm-7-p1.gcode.3mf", 1) is None
+    exact = PNG + b"\0" * (MAX_PNG_BYTES - len(PNG))
+    agent = Agent(httpx.Response(200, content=exact, headers={"content-type": "image/png"}))
+    assert await agent.client().fetch_png("lamp-arm-7-p1.gcode.3mf", 1) == exact
