@@ -61,7 +61,17 @@ from bambu_mcp.printer.state import PrinterState
 from bambu_mcp.proposal import NAMED_SETS, slot_number
 from bambu_mcp.store.db import Store
 from bambu_mcp.store.models import Job, Plate, PrintRow, Spool, Tariff
-from slice_agent.runner import LAYER_HEIGHTS, PLATE_TYPES, Overrides
+from slice_agent.runner import (
+    BRIM_TYPES,
+    DENSITY_RANGE,
+    LAYER_HEIGHTS,
+    OVERRIDE_KEYS,
+    PLATE_TYPES,
+    SUPPORT_TYPES,
+    WALL_GENERATORS,
+    WALL_LOOPS_RANGE,
+    Overrides,
+)
 
 log = logging.getLogger(__name__)
 
@@ -225,30 +235,17 @@ def _tool_errors() -> Iterator[None]:
 
 # -- jobs ----------------------------------------------------------------------------
 
-# Overrides.parse's whitelist, with what each key accepts (for error messages).
-OVERRIDE_KEYS = (
-    "sparse_infill_density",
-    "sparse_infill_pattern",
-    "wall_loops",
-    "wall_generator",
-    "enable_support",
-    "support_type",
-    "brim_type",
-    "curr_bed_type",
-    "layer_height",
-)
-
-
 def _allowed_values(key: str, nozzle: str) -> str:
+    """What ``Overrides.parse`` accepts for ``key`` (one of ``OVERRIDE_KEYS``), for error messages."""
     heights = ", ".join(f"{h:g}" for h in LAYER_HEIGHTS.get(nozzle, ()))
     return {
-        "sparse_infill_density": "an integer 0..100 (percent)",
+        "sparse_infill_density": "an integer {}..{} (percent)".format(*DENSITY_RANGE),
         "sparse_infill_pattern": ", ".join(INFILL_PATTERNS),
-        "wall_loops": "an integer 1..10",
-        "wall_generator": "arachne, classic",
+        "wall_loops": "an integer {}..{}".format(*WALL_LOOPS_RANGE),
+        "wall_generator": ", ".join(WALL_GENERATORS),
         "enable_support": "true or false",
-        "support_type": "tree(auto), normal(auto)",
-        "brim_type": "no_brim, auto_brim, outer_only",
+        "support_type": ", ".join(SUPPORT_TYPES),
+        "brim_type": ", ".join(BRIM_TYPES),
         "curr_bed_type": ", ".join(PLATE_TYPES),
         "layer_height": heights or f"nothing for nozzle {nozzle}",
     }[key]
@@ -287,6 +284,14 @@ def _job_nozzle(job: Job) -> str:
         return f"{parse_manifest(json.loads(job.manifest_json)).nozzle_mm:g}"
     except (ValueError, RecursionError, ManifestError):
         raise ToolError(f"job {job.id} has an unreadable manifest") from None
+
+
+def _stored_nozzle(job: Job) -> str | None:
+    """The manifest's nozzle for a status report: None rather than an error when unreadable."""
+    try:
+        return _job_nozzle(job)
+    except ToolError:
+        return None
 
 
 def _loads(text: str | None) -> dict | None:
@@ -363,7 +368,7 @@ def _job_status(store: Store, job: Job, tz: ZoneInfo) -> dict[str, Any]:
         "named_set": result.get("named_set"),
         "slot": _job_slot(store, result),
         "plate_type": result.get("plate_type"),
-        "nozzle": result.get("nozzle") or _job_nozzle(job),
+        "nozzle": result.get("nozzle") or _stored_nozzle(job),
         "plates": _job_plates(result),
         "error": job.error,
     }

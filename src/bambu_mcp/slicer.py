@@ -37,6 +37,14 @@ HEALTH_TIMEOUT = httpx.Timeout(3.0)
 WAKE_TIMEOUT = httpx.Timeout(10.0)
 PNG_TIMEOUT = httpx.Timeout(30.0)
 _SLICED_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}" + re.escape(OUT_SUFFIX))
+# A path left in an agent detail: a drive letter, or two or more separated segments.
+# Placeholders such as <sliced> are not segments, so they survive.
+_SEP = r"[\\/]"
+_SEGMENT = r"""[^\s\\/<>"',;]+"""
+_PATH_RE = re.compile(
+    rf"""[A-Za-z]:{_SEP}[^\s<>"',;]*|{_SEP}*{_SEGMENT}(?:{_SEP}+{_SEGMENT})+{_SEP}*"""
+)
+PATH_PLACEHOLDER = "<path>"
 
 Probe = Callable[[], Awaitable[bool]]
 
@@ -224,7 +232,7 @@ def _plates(raw: object, wanted: tuple[int, ...]) -> tuple[dict, ...] | None:
 def _error_detail(status: int, body: object) -> str:
     detail = body.get("detail") if isinstance(body, dict) else None
     if isinstance(detail, str) and detail.strip():
-        return _cap(detail)
+        return _cap(_PATH_RE.sub(PATH_PLACEHOLDER, detail))
     return f"slice-agent answered HTTP {status}"
 
 

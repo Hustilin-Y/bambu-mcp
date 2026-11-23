@@ -307,6 +307,25 @@ async def test_slice_answers(response, status, detail):
     assert TOKEN not in outcome.detail
 
 
+@pytest.mark.parametrize(
+    ("raw", "detail"),
+    [
+        (r"cannot open C:\Users\owner\AppData\Local\bambu-mcp\profiles\x.json", "cannot open <path>"),
+        ("missing D:/work/x.3mf", "missing <path>"),
+        (r"log at <sliced>\.work-lamp-arm-7-p1\log.txt", "log at <sliced><path>"),
+        ("see /home/owner/studio.log, then retry", "see <path>, then retry"),
+        ("bad file profiles/process-standard.json", "bad file <path>"),
+        (r"\\pc\share\sliced", "<path>"),
+        ("<profiles> missing, support_type tree(auto), 25%", "<profiles> missing, support_type tree(auto), 25%"),
+        ("plates must be [1], not /2", "plates must be [1], not /2"),
+    ],
+)
+async def test_slice_failure_detail_hides_paths(raw, detail):
+    agent = Agent(httpx.Response(500, json={"error": "slice_failed", "detail": raw}))
+    outcome = await agent.client().slice(request(), UPLOAD)
+    assert outcome.detail == detail
+
+
 async def test_slice_failure_detail_is_capped():
     agent = Agent(httpx.Response(500, json={"error": "slice_failed", "detail": "x" * 500}))
     outcome = await agent.client().slice(request(), UPLOAD)

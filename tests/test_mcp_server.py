@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 from dataclasses import replace
@@ -10,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
@@ -23,7 +25,7 @@ from bambu_mcp.notify import LogNotifier, Press
 from bambu_mcp.printer.link import LinkStatus
 from bambu_mcp.printer.state import Hms, PrinterState, Tray
 from bambu_mcp.service import Service
-from bambu_mcp.slicer import SliceOutcome
+from bambu_mcp.slicer import SliceClient, SliceOutcome
 from bambu_mcp.store.db import Store
 
 ACCESS_CODE = "87654321"
@@ -714,11 +716,48 @@ def test_jobs_lists_newest_first_with_a_capped_limit(jh):
 
 
 def test_override_keys_match_the_slice_agent_whitelist():
-    from bambu_mcp.mcp_server import OVERRIDE_KEYS
+    from bambu_mcp.mcp_server import OVERRIDE_KEYS, _allowed_values
     from bambu_mcp.proposal import NAMED_SETS
     from slice_agent.runner import Overrides
 
     for key in OVERRIDE_KEYS:
         with pytest.raises(ValueError, match="invalid value"):
             Overrides.parse({key: object()}, "0.4")
+        assert _allowed_values(key, "0.4")
     assert {k for values in NAMED_SETS.values() for k in values} <= set(OVERRIDE_KEYS)
+
+
+PATH_RUN = re.compile(r"[A-Za-z]:[\\/]|[^\s\\/<>]+[\\/]+[^\s\\/<>]+")
+
+
+def test_job_status_of_a_failed_slice_hides_agent_paths(jh):
+    detail = (
+        r"Studio failed: C:\Users\owner\AppData\Local\bambu-mcp\profiles\x.json missing, "
+        r"log in <sliced>\.work-lamp-arm-1-p1\log.txt and /home/owner/studio.log"
+    )
+
+    def agent(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "slice_failed", "detail": detail})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(agent))
+    jh.service._slicer = SliceClient("http://192.0.2.20:11436", "slice-token", http)
+    job_id = jh.add_job()
+    jh.call("slice_job", job_id=job_id)
+    jh.wait_status(job_id, "slice_failed")
+    asyncio.run(http.aclose())
+
+    status = jh.call("job_status", job_id=job_id)
+    assert status["error"] == "Studio failed: <path> missing, log in <sliced><path> and <path>"
+    assert status["sliced_file"] is None and status["plates"] == []
+    settings_values = set(_strings(status["settings"]))
+    for text in _strings(status):
+        if text not in settings_values:
+            assert not PATH_RUN.search(text), text
+
+
+def test_job_status_with_an_unreadable_manifest_has_no_nozzle(jh):
+    job_id = jh.add_job()
+    with jh.store.transaction() as conn:
+        conn.execute("UPDATE jobs SET manifest_json = '{' WHERE id = ?", (job_id,))
+    status = jh.call("job_status", job_id=job_id)
+    assert status["status"] == "new" and status["nozzle"] is None

@@ -21,6 +21,12 @@ DEFAULT_TIMEOUT_S = 300
 OUT_SUFFIX = ".gcode.3mf"
 PLATE_TYPES = ("Textured PEI Plate", "Cool Plate", "Engineering Plate", "High Temp Plate", "Smooth PEI Plate")
 LAYER_HEIGHTS = {"0.4": (0.12, 0.16, 0.20, 0.24, 0.28)}
+# Override whitelist values (global constraints); ranges are inclusive.
+DENSITY_RANGE = (0, 100)  # percent, sent as "<n>%"
+WALL_LOOPS_RANGE = (1, 10)
+WALL_GENERATORS = ("arachne", "classic")
+SUPPORT_TYPES = ("tree(auto)", "normal(auto)")
+BRIM_TYPES = ("no_brim", "auto_brim", "outer_only")
 _OUT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _RESERVED = re.compile(r"(con|prn|aux|nul|com[1-9]|lpt[1-9])", re.IGNORECASE)
 _LOG_TAIL_LINES = 20
@@ -37,6 +43,30 @@ def _choice(options: tuple[str, ...]):
     return lambda v: isinstance(v, str) and v in options
 
 
+def _in_range(bounds: tuple[int, int]):
+    return lambda v: _is_int(v) and bounds[0] <= v <= bounds[1]
+
+
+def _checks(nozzle: str) -> dict:
+    """The override whitelist: key -> validator. Its keys are ``OVERRIDE_KEYS``, in order."""
+    return {
+        "sparse_infill_density": _in_range(DENSITY_RANGE),
+        "sparse_infill_pattern": _choice(INFILL_PATTERNS),
+        "wall_loops": _in_range(WALL_LOOPS_RANGE),
+        "wall_generator": _choice(WALL_GENERATORS),
+        "enable_support": lambda v: isinstance(v, bool),
+        "support_type": _choice(SUPPORT_TYPES),
+        "brim_type": _choice(BRIM_TYPES),
+        "curr_bed_type": _choice(PLATE_TYPES),
+        "layer_height": lambda v: (
+            isinstance(v, (int, float)) and not isinstance(v, bool) and v in LAYER_HEIGHTS.get(nozzle, ())
+        ),
+    }
+
+
+OVERRIDE_KEYS = tuple(_checks(""))  # the keys do not depend on the nozzle
+
+
 @dataclass(frozen=True)
 class Overrides:
     """Validated whitelist of slicer settings: key -> value (python types)."""
@@ -45,19 +75,7 @@ class Overrides:
 
     @classmethod
     def parse(cls, raw: dict, nozzle: str) -> Overrides:
-        checks = {
-            "sparse_infill_density": lambda v: _is_int(v) and 0 <= v <= 100,
-            "sparse_infill_pattern": _choice(INFILL_PATTERNS),
-            "wall_loops": lambda v: _is_int(v) and 1 <= v <= 10,
-            "wall_generator": _choice(("arachne", "classic")),
-            "enable_support": lambda v: isinstance(v, bool),
-            "support_type": _choice(("tree(auto)", "normal(auto)")),
-            "brim_type": _choice(("no_brim", "auto_brim", "outer_only")),
-            "curr_bed_type": _choice(PLATE_TYPES),
-            "layer_height": lambda v: (
-                isinstance(v, (int, float)) and not isinstance(v, bool) and v in LAYER_HEIGHTS.get(nozzle, ())
-            ),
-        }
+        checks = _checks(nozzle)
         for key, value in raw.items():
             if key not in checks:
                 raise ValueError(f"unknown override: {key}")
