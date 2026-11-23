@@ -46,6 +46,8 @@ class Event:
         key = f"{name}|{task_id}|{start}|{self.kind}"
         if self.hms is not None:
             key += f"|{hms_code(self.hms)}"
+        if self.kind in (EventKind.PAUSED, EventKind.RESUMED):
+            key += f"|L{self.state.layer or 0}"
         return key
 
 

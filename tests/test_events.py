@@ -126,3 +126,33 @@ def test_unknown_state_yields_no_event():
     assert unknown.gcode_state == "UNKNOWN"
     assert run(EventDetector(FakeSeen()), [unknown]) == []
     assert EventDetector(FakeSeen()).feed(fx("running_layer1"), unknown, AT) == []
+
+
+@pytest.mark.synthetic
+def test_repeated_pause_resume_at_different_layers_emitted():
+    seen = FakeSeen()
+    l1, l5 = fx("running_layer1"), replace(fx("running_layer1"), layer=5)
+    seq = [
+        replace(l1, gcode_state="PAUSE"),
+        l1,
+        replace(l5, gcode_state="PAUSE"),
+        l5,
+    ]
+    all_events = run(EventDetector(seen), seq, start=l1)
+    events = [e for e in all_events if e.kind != EventKind.FIRST_LAYER_DONE]
+    assert kinds(events) == [EventKind.PAUSED, EventKind.RESUMED] * 2
+    assert events[0].dedupe_key.endswith("|paused|L1")
+    assert events[3].dedupe_key.endswith("|resumed|L5")
+    # Same layer after a restart (fresh detector, same store) stays deduped.
+    again = run(EventDetector(seen), seq[:2], start=l1)
+    assert again == []
+
+
+@pytest.mark.synthetic
+def test_reconnect_does_not_repeat_hms_error():
+    seen = FakeSeen()
+    running = fx("running_layer1")
+    with_hms = replace(running, hms=(FATAL,))
+    d = EventDetector(seen)
+    assert kinds(run(d, [running, with_hms])) == [EventKind.STARTED, EventKind.HMS_ERROR]
+    assert run(d, [PrinterState.empty(), with_hms], start=with_hms) == []
