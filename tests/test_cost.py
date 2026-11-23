@@ -140,3 +140,35 @@ def test_tariff_check_due():
     assert tariff_check_due(None, today) is True
     assert tariff_check_due(date(2026, 8, 24), today) is False  # 90 days
     assert tariff_check_due(date(2026, 8, 23), today) is True  # 91 days
+
+
+_EQUAL = Tariff(valid_from=date(2026, 1, 1), day_uah=1.0, night_uah=1.0)
+_WINDOWS = [
+    ((2026, 6, 1, 10, 0), (2026, 6, 1, 12, 0)),
+    ((2026, 6, 1, 6, 0), (2026, 6, 2, 8, 0)),
+    ((2026, 3, 28, 22, 0), (2026, 3, 29, 12, 0)),  # spring forward, 23:00 and 07:00 inside
+    ((2026, 10, 24, 22, 0), (2026, 10, 25, 12, 0)),  # fall back, 23:00 and 07:00 inside
+    ((2026, 3, 28, 6, 0), (2026, 3, 30, 8, 0)),
+    ((2026, 10, 24, 6, 0), (2026, 10, 26, 8, 0)),
+]
+
+
+@pytest.mark.parametrize(("a", "b"), _WINDOWS)
+def test_equal_rates_cost_is_kwh_times_rate(a, b):
+    s = Settings()
+    start = datetime(*a, tzinfo=KYIV)
+    end = datetime(*b, tzinfo=KYIV)
+    assert power_cost(start, end, 10.0, _EQUAL, s) == pytest.approx(10.0, abs=1e-9)
+    assert power_cost(start, end, 10.0, _EQUAL, Settings(heatup_kwh=0.0)) == pytest.approx(
+        10.0, abs=1e-9
+    )
+
+
+def test_dst_fall_back_two_boundaries_split():
+    # 22:00 -> 12:00 on the fall-back night: 15 real hours.
+    # day 22-23 (1h), night 23-07 (9h), day 07-12 (5h).
+    s = Settings(heatup_kwh=0.0)
+    start = datetime(2026, 10, 24, 22, 0, tzinfo=KYIV)
+    end = datetime(2026, 10, 25, 12, 0, tzinfo=KYIV)
+    expected = 15.0 * (1 * 4.32 + 9 * 2.16 + 5 * 4.32) / 15
+    assert power_cost(start, end, 15.0, TWO_ZONE, s) == pytest.approx(expected)

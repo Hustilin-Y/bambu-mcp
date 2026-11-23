@@ -43,6 +43,7 @@ def _boundaries(start: datetime, end: datetime, tz: ZoneInfo) -> list[datetime]:
     while day <= last:
         for t in (NIGHT_END, NIGHT_START):
             point = datetime.combine(day, t, tzinfo=tz)
+            point = point.astimezone(UTC)
             if start < point < end:
                 points.append(point)
         day += timedelta(days=1)
