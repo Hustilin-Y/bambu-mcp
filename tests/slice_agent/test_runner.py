@@ -1,5 +1,8 @@
 import json
+import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -91,58 +94,121 @@ def test_build_command_refuses_unknown_names(tmp_path):
             cmd(cfg, **kw)
 
 
-class Done:
-    def __init__(self, rc=0, stdout=b"", stderr=b""):
-        self.returncode, self.stdout, self.stderr = rc, stdout, stderr
+class FakePopen:
+    """Popen stand-in: writes result.json and files into out_dir, log text to the stdout sink."""
+
+    def __init__(self, out_dir: Path, result=None, rc=0, log=b"a\nb\nlast line\n", hang=False, files=()):
+        self.out_dir, self.result, self.rc, self.log, self.hang, self.files = out_dir, result, rc, log, hang, files
+        self.calls = {}
+        self.killed = False
+        self.pid = 1
+
+    def __call__(self, argv, **kw):
+        self.calls["argv"], self.calls["kw"] = argv, kw
+        kw["stdout"].write(self.log)
+        if self.result is not None:
+            text = self.result if isinstance(self.result, str) else json.dumps(self.result)
+            (self.out_dir / "result.json").write_text(text)
+        for name in self.files:
+            (self.out_dir / name).write_bytes(b"zip")
+        self.returncode = self.rc
+        return self
+
+    def wait(self, timeout=None):
+        if self.hang and not self.killed:
+            raise subprocess.TimeoutExpired("x", timeout)
+        return self.rc
+
+    def kill(self):
+        self.killed = True
 
 
-def fake_runner(out_dir: Path, result: dict | None, rc=0):
-    calls = {}
-
-    def run(argv, **kw):
-        calls["argv"], calls["kw"] = argv, kw
-        if result is not None:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            (out_dir / "result.json").write_text(json.dumps(result))
-        return Done(rc, stdout=b"a\nb\nlast line\n")
-
-    return run, calls
+def mark_killed(proc):
+    proc.killed = True
 
 
 def test_run_slice_ok(tmp_path):
     out = tmp_path / "o"
-    run, calls = fake_runner(out, {"return_code": 0, "error_string": "success"})
-    r = run_slice(["x"], out, runner=run)
+    fake = FakePopen(out, {"return_code": 0, "error_string": "success"})
+    out.mkdir()
+    r = run_slice(["x"], out, popen=fake)
     assert isinstance(r, SliceRun) and r.return_code == 0 and r.error_string == "success"
     assert not r.timed_out and "last line" in r.log_tail
-    kw = calls["kw"]
-    assert kw["timeout"] == 300 and not kw.get("shell")
+    kw = fake.calls["kw"]
+    assert not kw["shell"] and kw["stdout"] is not subprocess.PIPE and kw["stdin"] is subprocess.DEVNULL
+    assert kw.get("creationflags") or kw.get("start_new_session")
 
 
 def test_nonzero_return_reads_error_string(tmp_path):
     out = tmp_path / "o"
-    run, _ = fake_runner(out, {"return_code": -50, "error_string": "object outside the plate"})
-    r = run_slice(["x"], out, runner=run)
+    r = run_slice(["x"], out, popen=FakePopen(out, {"return_code": -50, "error_string": "object outside the plate"}))
     assert r.return_code == -50 and "outside" in r.error_string
+
+
+def test_nonzero_exit_wins_over_result_json_zero(tmp_path):
+    out = tmp_path / "o"
+    r = run_slice(["x"], out, popen=FakePopen(out, {"return_code": 0, "error_string": "success"}, rc=3))
+    assert r.return_code == 3
 
 
 def test_stale_result_json_is_ignored(tmp_path):
     out = tmp_path / "o"
     out.mkdir()
     (out / "result.json").write_text(json.dumps({"return_code": 0, "error_string": "old"}))
-    run, _ = fake_runner(out, None, rc=-17)
-    r = run_slice(["x"], out, runner=run)
+    r = run_slice(["x"], out, popen=FakePopen(out, None, rc=-17))
     assert r.return_code == -17 and r.error_string == ""
 
 
-def test_run_slice_timeout_kills_and_reports(tmp_path):
-    def run(argv, **kw):
-        raise subprocess.TimeoutExpired(argv, kw["timeout"], output=b"line1\nline2\n")
+@pytest.mark.parametrize("bad", ["[1, 2]", "42", "not json", '{"return_code": "x"}', '{"return_code": 1e999}', "{}"])
+def test_untrusted_result_json_never_raises(tmp_path, bad):
+    out = tmp_path / "o"
+    r = run_slice(["x"], out, popen=FakePopen(out, bad, rc=-5))
+    assert r.return_code == -5
 
-    r = run_slice(["x"], tmp_path / "o", timeout_s=7, runner=run)
+
+def test_run_slice_timeout_kills_tree_and_reports(tmp_path):
+    out = tmp_path / "o"
+    fake = FakePopen(out, None, hang=True)
+    killed = []
+    r = run_slice(["x"], out, timeout_s=7, popen=fake, killer=lambda p: (killed.append(p), mark_killed(p)))
     assert r.timed_out is True and r.return_code != 0
-    assert "timed out after 7" in r.error_string
-    assert "line2" in r.log_tail
+    assert "timed out after 7" in r.error_string and "last line" in r.log_tail
+    assert killed == [fake]
+
+
+CHILD = """
+import subprocess, sys, time
+hb = sys.argv[1]
+grand = (
+    "import sys, time\\n"
+    "while True:\\n"
+    "    open(sys.argv[1], 'a').write('x')\\n"
+    "    time.sleep(0.1)\\n"
+)
+subprocess.Popen([sys.executable, '-I', '-c', grand, hb + '.grand'])
+while True:
+    open(hb + '.child', 'a').write('x')
+    time.sleep(0.1)
+"""
+
+
+def test_run_slice_timeout_real_process_tree(tmp_path):
+    """A child that spawns a sleeping grandchild: after the timeout both are gone, quickly."""
+    script = tmp_path / "child.py"
+    script.write_text(CHILD, encoding="utf-8")
+    hb = tmp_path / "hb"
+    out = tmp_path / "o"
+    t0 = time.monotonic()
+    r = run_slice([sys.executable, "-I", str(script), str(hb)], out, timeout_s=3)
+    assert time.monotonic() - t0 < 15
+    assert r.timed_out
+    grand, child = tmp_path / "hb.grand", tmp_path / "hb.child"
+    assert grand.exists() and child.exists()
+    time.sleep(0.5)
+    sizes = (grand.stat().st_size, child.stat().st_size)
+    time.sleep(0.8)
+    assert sizes == (grand.stat().st_size, child.stat().st_size)  # nobody writes any more
+    shutil.rmtree(out)  # log files released: the work dir can be removed
 
 
 def iso_kwargs():
@@ -153,32 +219,65 @@ def iso_kwargs():
     )
 
 
-def isolated_runner(write_output=True, result=None, raise_timeout=False):
-    def run(argv, **kw):
-        out = Path(argv[argv.index("--outputdir") + 1])
-        assert out.name == ".work-part-j1-p1" and argv[argv.index("--export-3mf") + 1] == "part-j1-p1.gcode.3mf"
-        (out / "plate_1.gcode").write_text("G1")
-        (out / "result.json").write_text(json.dumps(result or {"return_code": 0, "error_string": "success"}))
-        if write_output:
-            (out / "part-j1-p1.gcode.3mf").write_bytes(b"zip")
-        if raise_timeout:
-            raise subprocess.TimeoutExpired(argv, 1)
-        return Done(0)
+def isolated(tmp_path, **kw):
+    cfg = make_cfg(tmp_path)
+    return cfg, FakePopen(cfg.sliced_dir / ".work-part-j1-p1", **kw)
 
-    return run
+
+def go(cfg, fake):
+    return slice_isolated(cfg, out_name="part-j1-p1", popen=fake, killer=mark_killed, **iso_kwargs())
 
 
 def test_slice_isolated_success_leaves_only_output(tmp_path):
-    cfg = make_cfg(tmp_path)
-    run, final = slice_isolated(cfg, out_name="part-j1-p1", runner=isolated_runner(), **iso_kwargs())
+    cfg, fake = isolated(
+        tmp_path, result={"return_code": 0, "error_string": "success"},
+        files=("part-j1-p1.gcode.3mf", "plate_1.gcode"),
+    )
+    run, final = go(cfg, fake)
+    argv = fake.calls["argv"]
+    assert argv[argv.index("--export-3mf") + 1] == "part-j1-p1.gcode.3mf"
+    assert argv[argv.index("--outputdir") + 1].endswith(".work-part-j1-p1")
     assert run.return_code == 0 and final == cfg.sliced_dir / "part-j1-p1.gcode.3mf"
     assert [p.name for p in cfg.sliced_dir.iterdir()] == ["part-j1-p1.gcode.3mf"]
 
 
 def test_slice_isolated_failure_and_timeout_clean_up(tmp_path):
-    cfg = make_cfg(tmp_path)
-    bad = {"return_code": -50, "error_string": "outside"}
-    run, final = slice_isolated(cfg, out_name="part-j1-p1", runner=isolated_runner(False, bad), **iso_kwargs())
+    cfg, fake = isolated(tmp_path, result={"return_code": -50, "error_string": "outside"}, files=("plate_1.gcode",))
+    run, final = go(cfg, fake)
     assert final is None and run.error_string == "outside" and list(cfg.sliced_dir.iterdir()) == []
-    run, final = slice_isolated(cfg, out_name="part-j1-p1", runner=isolated_runner(raise_timeout=True), **iso_kwargs())
+    cfg, fake = isolated(tmp_path, hang=True)
+    run, final = go(cfg, fake)
     assert final is None and run.timed_out and list(cfg.sliced_dir.iterdir()) == []
+
+
+def test_slice_isolated_nonzero_exit_is_failure_even_with_output(tmp_path):
+    cfg, fake = isolated(
+        tmp_path, result={"return_code": 0, "error_string": "success"}, rc=1, files=("part-j1-p1.gcode.3mf",)
+    )
+    run, final = go(cfg, fake)
+    assert final is None and run.return_code == 1 and list(cfg.sliced_dir.iterdir()) == []
+
+
+def test_slice_isolated_removes_leftover_work_dir(tmp_path):
+    cfg, fake = isolated(
+        tmp_path, result={"return_code": 0, "error_string": "success"}, files=("part-j1-p1.gcode.3mf",)
+    )
+    stale = cfg.sliced_dir / ".work-part-j1-p1"
+    stale.mkdir(parents=True)
+    (stale / "old.gcode").write_text("old")
+    run, final = go(cfg, fake)
+    assert final is not None and [p.name for p in cfg.sliced_dir.iterdir()] == ["part-j1-p1.gcode.3mf"]
+
+
+def test_slice_isolated_leftover_that_cannot_be_removed_fails_cleanly(tmp_path, monkeypatch):
+    cfg, fake = isolated(tmp_path)
+    (cfg.sliced_dir / ".work-part-j1-p1").mkdir(parents=True)
+
+    def locked(path, *a, **kw):
+        if not kw.get("ignore_errors"):
+            raise PermissionError("locked")
+
+    monkeypatch.setattr("slice_agent.runner.shutil.rmtree", locked)
+    with pytest.raises(OSError):
+        go(cfg, fake)
+    assert "argv" not in fake.calls  # never started

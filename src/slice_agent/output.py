@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
@@ -53,10 +54,14 @@ def _read(z: zipfile.ZipFile, name: str, limit: int = MAX_MEMBER_BYTES) -> bytes
 
 def _bed(area: object) -> tuple[int, int]:
     try:
-        pts = [tuple(float(c) for c in str(p).split("x")) for p in area]  # type: ignore[union-attr]
+        if not isinstance(area, list) or not area:
+            raise ValueError("not a list")
+        pts = [tuple(float(c) for c in str(p).split("x")) for p in area]
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        if not all(math.isfinite(v) for v in xs + ys):
+            raise ValueError("not finite")
         return round(max(xs) - min(xs)), round(max(ys) - min(ys))
-    except (TypeError, ValueError, IndexError):
+    except (TypeError, ValueError, IndexError, OverflowError):
         raise OutputError("project_settings.config: bad printable_area") from None
 
 
@@ -71,6 +76,8 @@ def _plates(xml: bytes) -> list[tuple[int, float, dict[str, float]]]:
         try:
             idx = int(meta["index"])
             seconds = float(meta["prediction"])
+            if not math.isfinite(seconds) or seconds < 0:
+                raise ValueError("bad prediction")
             grams = {f.get("id", str(i + 1)): float(f.get("used_g", 0)) for i, f in enumerate(el.findall("filament"))}
         except (KeyError, TypeError, ValueError):
             raise OutputError(f"{SLICE_INFO}: plate without index or prediction") from None
@@ -97,12 +104,16 @@ def read_output(path: Path, plate: int) -> SliceResult:
             settings = json.loads(settings_raw)
         except ValueError:
             raise OutputError(f"{PROJECT_SETTINGS}: not valid JSON") from None
+        if not isinstance(settings, dict):
+            raise OutputError(f"{PROJECT_SETTINGS}: not a JSON object")
         parsed = _plates(info)
         names = set(z.namelist())
         wanted = {i for i, _, _ in parsed} | {plate}
         missing = tuple(sorted(i for i in wanted if f"Metadata/plate_{i}.gcode" not in names))
         plates = [PlateResult(i, mins, g, _read(z, f"Metadata/plate_{i}.png")) for i, mins, g in parsed]
-    nozzles = settings.get("nozzle_diameter") or [""]
+    nozzles = settings.get("nozzle_diameter")
+    if not isinstance(nozzles, list) or not nozzles:
+        raise OutputError(f"{PROJECT_SETTINGS}: nozzle_diameter is not a list")
     return SliceResult(
         plates=plates,
         printer_model=str(settings.get("printer_model", "")),

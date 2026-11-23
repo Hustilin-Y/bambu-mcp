@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +23,8 @@ LAYER_HEIGHTS = {"0.4": (0.12, 0.16, 0.20, 0.24, 0.28)}
 _OUT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _RESERVED = re.compile(r"(con|prn|aux|nul|com[1-9]|lpt[1-9])", re.IGNORECASE)
 _LOG_TAIL_LINES = 20
+_LOG_TAIL_BYTES = 8192
+_KILL_WAIT_S = 10
 
 
 def _is_int(v: object) -> bool:
@@ -129,26 +134,84 @@ class SliceRun:
     timed_out: bool = False
 
 
-def _tail(*chunks: bytes | str | None) -> str:
-    text = "".join(c.decode("utf-8", "replace") if isinstance(c, bytes) else (c or "") for c in chunks)
+def _tail_file(path: Path) -> str:
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - _LOG_TAIL_BYTES))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
     return "\n".join(text.splitlines()[-_LOG_TAIL_LINES:])
 
 
-def run_slice(cmd: list[str], out_dir: Path, timeout_s: int = DEFAULT_TIMEOUT_S, runner=subprocess.run) -> SliceRun:
-    """Run the CLI (no shell) and read result.json. subprocess kills the child on timeout."""
+def _popen_flags() -> dict:
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def kill_tree(proc) -> None:
+    """Kill the process and everything it spawned. Fixed argv, no shell."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True, timeout=_KILL_WAIT_S, shell=False, check=False,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()  # fallback for the direct child
+    except OSError:
+        pass
+
+
+def _result_json(path: Path) -> tuple[int | None, str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None, ""
+        return int(data["return_code"]), str(data.get("error_string", ""))
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        return None, ""
+
+
+def run_slice(
+    cmd: list[str],
+    out_dir: Path,
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+    popen=subprocess.Popen,
+    killer=kill_tree,
+) -> SliceRun:
+    """Run the CLI (no shell, no pipes) and read result.json.
+
+    Output goes to log files in out_dir so a surviving grandchild cannot block us on a pipe.
+    On timeout the whole process tree is killed and the wait is bounded.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
     result_file = out_dir / "result.json"
     result_file.unlink(missing_ok=True)  # a stale file must not pass for this run
-    try:
-        proc = runner(cmd, capture_output=True, timeout=timeout_s, shell=False)
-    except subprocess.TimeoutExpired as e:
-        return SliceRun(-1, f"slice timed out after {timeout_s} s", _tail(e.stdout, e.stderr), timed_out=True)
-    code, err = proc.returncode, ""
-    try:
-        data = json.loads(result_file.read_text(encoding="utf-8"))
-        code, err = int(data.get("return_code", code)), str(data.get("error_string", ""))
-    except (OSError, ValueError, TypeError):
-        pass
-    return SliceRun(code, err, _tail(proc.stdout, proc.stderr))
+    log = out_dir / "studio.log"
+    with log.open("wb") as sink:
+        proc = popen(cmd, stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT, shell=False, **_popen_flags())
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            killer(proc)
+            try:
+                proc.wait(timeout=_KILL_WAIT_S)
+            except subprocess.TimeoutExpired:
+                pass
+            sink.flush()
+            return SliceRun(-1, f"slice timed out after {timeout_s} s", _tail_file(log), timed_out=True)
+    code, err = _result_json(result_file)
+    exit_code = proc.returncode
+    if code is None or code == 0:
+        code = exit_code if exit_code else (code or 0)  # nonzero exit wins over a result.json saying 0
+    return SliceRun(code, err, _tail_file(log))
 
 
 def slice_isolated(
@@ -156,19 +219,21 @@ def slice_isolated(
     *,
     out_name: str,
     timeout_s: int = DEFAULT_TIMEOUT_S,
-    runner=subprocess.run,
+    popen=subprocess.Popen,
+    killer=kill_tree,
     **build_kwargs,
 ) -> tuple[SliceRun, Path | None]:
     """Slice in a temporary work dir under sliced_dir, move only the .gcode.3mf out on success.
 
-    Returns (run, final_path). The work dir (plate gcode, result.json) is always removed.
+    Returns (run, final_path). The work dir (plate gcode, result.json, log) is always removed.
     """
     work = cfg.sliced_dir / f".work-{out_name}"
     cmd = build_command(cfg, out_name=out_name, out_dir=work, **build_kwargs)  # validates out_name first
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True)
     try:
-        run = run_slice(cmd, work, timeout_s, runner)
+        if work.exists():
+            shutil.rmtree(work)  # a leftover from a crashed run; failure propagates (OSError)
+        work.mkdir(parents=True)
+        run = run_slice(cmd, work, timeout_s, popen, killer)
         produced = work / f"{out_name}{OUT_SUFFIX}"
         if run.return_code != 0 or not produced.is_file():
             return run, None

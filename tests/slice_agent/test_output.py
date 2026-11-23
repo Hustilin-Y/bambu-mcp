@@ -121,3 +121,40 @@ def test_bad_zip_and_missing_members(tmp_path):
         z.writestr("x", "y")
     with pytest.raises(OutputError, match="slice_info"):
         read_output(q, plate=1)
+
+
+def _with_settings(tmp_path, settings_text):
+    path = tmp_path / "u.gcode.3mf"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("Metadata/slice_info.config", slice_info())
+        z.writestr("Metadata/project_settings.config", settings_text)
+        z.writestr("Metadata/plate_1.gcode", "G1")
+    return path
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        "[1, 2]",
+        "42",
+        '{"printable_area": ["0x0", "infx0"], "nozzle_diameter": ["0.4"]}',
+        '{"printable_area": ["0x0", "nanx5"], "nozzle_diameter": ["0.4"]}',
+        '{"printable_area": "0x0", "nozzle_diameter": ["0.4"]}',
+        '{"printable_area": [], "nozzle_diameter": ["0.4"]}',
+        '{"printable_area": ["0x0", "256x256"], "nozzle_diameter": "0.4"}',
+        '{"printable_area": ["0x0", "256x256"], "nozzle_diameter": []}',
+        '{"printable_area": ["0x0", "256x256"]}',
+    ],
+)
+def test_untrusted_project_settings_raise_output_error(tmp_path, settings):
+    with pytest.raises(OutputError):
+        read_output(_with_settings(tmp_path, settings), plate=1)
+
+
+def test_non_finite_prediction_refused(tmp_path):
+    path = tmp_path / "p.gcode.3mf"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("Metadata/slice_info.config", slice_info(plates=((1, "inf", "1.0"),)))
+        z.writestr("Metadata/project_settings.config", "{}")
+    with pytest.raises(OutputError):
+        read_output(path, plate=1)
