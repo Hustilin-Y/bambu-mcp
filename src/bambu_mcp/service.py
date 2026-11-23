@@ -20,6 +20,7 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from bambu_mcp import camera as camera_module
+from bambu_mcp import mcp_server
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.cost import tariff_check_due
 from bambu_mcp.events import Event, EventDetector, EventKind
@@ -326,11 +327,8 @@ def build_notifier(secrets: Secrets, settings: Settings) -> Notifier:
 def extra_coroutines(
     service: Service, secrets: Secrets, settings: Settings, store: Store
 ) -> list[Coroutine[Any, Any, None]]:
-    """Coroutines that share the service's event loop.
-
-    Task 12: the MCP server is added here (for example ``[mcp_server.serve(...)]``).
-    """
-    return []
+    """Coroutines that share the service's event loop: the MCP server."""
+    return [mcp_server.serve(service, store, secrets, settings)]
 
 
 async def _amain(secrets: Secrets, settings: Settings) -> None:

@@ -308,6 +308,10 @@ class Store:
         )
         return _print(row) if row else None
 
+    def print_by_id(self, id: int) -> PrintRow | None:
+        row = self._conn().execute("SELECT * FROM prints WHERE id = ?", (id,)).fetchone()
+        return _print(row) if row else None
+
     def history(self, part: str | None, limit: int) -> list[PrintRow]:
         """Newest first. `part` is a case-insensitive substring of the job name."""
         sql = "SELECT * FROM prints"
