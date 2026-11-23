@@ -159,3 +159,19 @@ def test_unsafe_file_rejected(tmp_path, file):
 def test_safe_name_with_space_and_dots_ok(tmp_path):
     m = load_manifest(_raw(tmp_path, json.dumps(_part(name="lamp arm v1.2_b-3"))))
     assert m.name == "lamp arm v1.2_b-3"
+
+
+def test_kit_plate_hint_conflicts_kept():
+    m = load_manifest(FIX / "kit.print.json")
+    p1, p2 = m.plates
+    assert p1.hint_conflicts == () and p2.hint_conflicts == ("walls",)
+
+
+@pytest.mark.parametrize("conflicts", ["walls", ["colour"], [1], [["walls"]]])
+def test_bad_hint_conflicts_rejected(tmp_path, conflicts):
+    data = json.loads((FIX / "kit.print.json").read_text(encoding="utf-8"))
+    data["plates"][1]["hint_conflicts"] = conflicts
+    path = tmp_path / "kit.print.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ManifestError, match="hint_conflicts"):
+        load_manifest(path)

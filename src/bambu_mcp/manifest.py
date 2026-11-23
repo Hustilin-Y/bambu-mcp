@@ -63,6 +63,7 @@ class PlateInfo:
     checks: dict
     hints: dict
     estimate_g: float
+    hint_conflicts: tuple[str, ...] = ()  # hint keys the kit plate's parts disagree on
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,14 @@ def _checks(value: object, where: str) -> dict:
     return dict(checks)
 
 
+def _hint_conflicts(value: object, where: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(k, str) and k in HINT_VALIDATORS for k in value):
+        raise ManifestError(
+            f"{where}: hint_conflicts must be a list of hint names ({', '.join(HINT_VALIDATORS)})"
+        )
+    return tuple(dict.fromkeys(value))
+
+
 def _grams(value: object, where: str) -> float:
     if not _is_num(value) or value < 0:  # type: ignore[operator]
         raise ManifestError(f"{where}: estimate grams must be a non-negative number")
@@ -153,7 +162,8 @@ def _plate(
         if not single or top_grams is None:
             raise ManifestError(f"{where}: missing estimate grams")
         grams = top_grams
-    return PlateInfo(index, tuple(dict(o) for o in objects), checks, hints, grams)
+    conflicts = _hint_conflicts(data["hint_conflicts"], where) if "hint_conflicts" in data else ()
+    return PlateInfo(index, tuple(dict(o) for o in objects), checks, hints, grams, conflicts)
 
 
 def _merge_checks(plates: list) -> dict:
