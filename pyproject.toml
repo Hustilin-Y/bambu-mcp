@@ -21,6 +21,7 @@ dependencies = [
 
 [project.scripts]
 bambu-service = "bambu_mcp.service:main"
+slice-agent = "slice_agent.app:main"
 
 [dependency-groups]
 dev = [
@@ -29,7 +30,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/bambu_mcp"]
+packages = ["src/bambu_mcp", "src/slice_agent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
