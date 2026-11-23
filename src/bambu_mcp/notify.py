@@ -223,17 +223,25 @@ class ServiceNotifyClient:
                     raise httpx.HTTPStatusError(
                         f"status {resp.status_code}", request=resp.request, response=resp
                     )
-                items = resp.json().get("presses", [])
+                items = list(resp.json().get("presses", []))
             except (httpx.HTTPError, ValueError, AttributeError) as exc:
                 failures += 1
                 log.warning("notify presses poll failed: %s", self._safe(repr(exc)))
                 await self._sleep(min(BACKOFF_BASE_S * 2 ** (failures - 1), BACKOFF_MAX_S))
                 continue
             failures = 0
-            for item in sorted(items, key=lambda i: i["seq"]):
-                yield Press(
-                    seq=int(item["seq"]),
-                    message_id=str(item["message_id"]),
-                    button_id=str(item["button_id"]),
-                    at=datetime.fromtimestamp(float(item["at"]), UTC),
-                )
+            parsed: list[Press] = []
+            for item in items:
+                try:
+                    parsed.append(
+                        Press(
+                            seq=int(item["seq"]),
+                            message_id=str(item["message_id"]),
+                            button_id=str(item["button_id"]),
+                            at=datetime.fromtimestamp(float(item["at"]), UTC),
+                        )
+                    )
+                except (KeyError, TypeError, ValueError, OverflowError, OSError):
+                    log.warning("malformed press skipped")
+            for press in sorted(parsed, key=lambda p: p.seq):
+                yield press

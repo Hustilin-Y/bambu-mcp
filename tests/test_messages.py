@@ -80,3 +80,24 @@ def test_spool_buttons_ids():
     assert ids == ["spool:12:3", "spool:12:4", "spool:12:5", "spool:12:none"]
     assert all(len(row) <= 8 for row in rows)
     assert all(len(b.text) <= 64 for row in rows for b in row)
+
+
+def test_render_duration_hours_padded():
+    for kind in (EventKind.FINISHED, EventKind.FAILED, EventKind.CANCELLED):
+        text = render_event(event(kind), HmsTexts(), None, duration_min=65)
+        assert "Длительность: 1 ч 05 мин" in text
+
+
+def test_render_duration_under_hour():
+    text = render_event(event(EventKind.FINISHED), HmsTexts(), None, duration_min=28)
+    assert "Длительность: 28 мин" in text
+
+
+def test_render_duration_full_hours_and_omitted():
+    assert "Длительность: 2 ч 00 мин" in render_event(
+        event(EventKind.FINISHED), HmsTexts(), None, duration_min=120
+    )
+    assert "Длительность" not in render_event(event(EventKind.FINISHED), HmsTexts(), None)
+    assert "Длительность" not in render_event(
+        event(EventKind.STARTED), HmsTexts(), None, duration_min=65
+    )

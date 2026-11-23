@@ -211,3 +211,30 @@ async def test_log_notifier(caplog):
     assert mid is None
     assert "secret-ish text" not in caplog.text
     assert [p async for p in notifier.presses()] == []
+
+
+async def test_presses_skips_malformed_items(caplog):
+    good = {"message_id": "m", "button_id": "b", "label": "L", "by": "o", "at": 1700000000}
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "presses": [
+                    {**good, "seq": 1},
+                    {"seq": 2, "message_id": "m", "button_id": "b", "at": None},
+                    {"message_id": "m", "button_id": "b", "at": 1700000000},
+                    "garbage",
+                    {**good, "seq": 3},
+                ]
+            },
+        )
+
+    got = []
+    with caplog.at_level("WARNING"):
+        async for press in make(handler).presses():
+            got.append(press.seq)
+            if len(got) == 2:
+                break
+    assert got == [1, 3]
+    assert "malformed press skipped" in caplog.text

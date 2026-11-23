@@ -46,7 +46,14 @@ def _cost_lines(cost: CostLine) -> list[str]:
     return [costs, f"({cost.kwh:.2f} кВт·ч, тариф {rate} с {t.valid_from:%d.%m.%Y})"]
 
 
-def render_event(event: Event, texts: HmsTexts, cost: CostLine | None) -> str:
+def _duration(minutes: int) -> str:
+    hours, mins = divmod(max(minutes, 0), 60)
+    return f"{hours} ч {mins:02d} мин" if hours else f"{mins} мин"
+
+
+def render_event(
+    event: Event, texts: HmsTexts, cost: CostLine | None, duration_min: int | None = None
+) -> str:
     state = event.state
     name = state.subtask_name or "без названия"
     when = event.at.astimezone(TIMEZONE).strftime("%H:%M")
@@ -64,6 +71,12 @@ def render_event(event: Event, texts: HmsTexts, cost: CostLine | None) -> str:
     if event.kind in (EventKind.PAUSED, EventKind.RESUMED, EventKind.FIRST_LAYER_DONE):
         if state.layer is not None and state.total_layers:
             lines.append(f"Слой {state.layer} из {state.total_layers}")
+    if duration_min is not None and event.kind in (
+        EventKind.FINISHED,
+        EventKind.FAILED,
+        EventKind.CANCELLED,
+    ):
+        lines.append(f"Длительность: {_duration(duration_min)}")
     if event.kind is EventKind.FINISHED and cost is not None:
         lines.extend(_cost_lines(cost))
     return "\n".join(lines)
