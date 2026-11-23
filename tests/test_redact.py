@@ -48,6 +48,8 @@ def _secrets():
         host="10.0.0.2",
         notify_token="ntok",
         client_tokens={"pc": "ctok"},
+        gateway_key="gwkey",
+        slice_agent_token="sltok",
     )
 
 
@@ -68,8 +70,9 @@ def test_filter_redacts_msg_and_args(captured):
     logger = logging.getLogger("bambu_mcp.test")
     logger.info("code %s serial %s", "12345678", "SERIAL123")
     logger.info("token ctok and %(t)s", {"t": "ntok"})
+    logger.info("gateway gwkey slice %s", "sltok")
     out = captured.getvalue()
-    for secret in ("12345678", "SERIAL123", "ctok", "ntok"):
+    for secret in ("12345678", "SERIAL123", "ctok", "ntok", "gwkey", "sltok"):
         assert secret not in out
 
 

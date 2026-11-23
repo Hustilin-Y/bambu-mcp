@@ -10,10 +10,18 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from bambu_mcp.store.models import OutboxRow, Plate, PrintRow, Spool, Tariff
+from bambu_mcp.store.models import (
+    JOB_STATUSES,
+    Job,
+    OutboxRow,
+    Plate,
+    PrintRow,
+    Spool,
+    Tariff,
+)
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 # schema.sql is the version-1 schema; each later version is one migration script.
 _MIGRATIONS = {
     2: "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
@@ -31,6 +39,22 @@ _MIGRATIONS = {
     "    attempts INTEGER NOT NULL DEFAULT 0,\n"
     "    next_attempt_at REAL NOT NULL\n"
     ");",
+    # Print jobs from CAD Workshop manifests. Their files live in data_dir/jobs/<id>/.
+    4: "CREATE TABLE jobs (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    name TEXT NOT NULL,\n"
+    "    kind TEXT NOT NULL CHECK (kind IN ('part', 'kit')),\n"
+    "    manifest_json TEXT NOT NULL,\n"
+    "    file_sha256 TEXT NOT NULL,\n"
+    "    created_at TEXT NOT NULL,\n"
+    "    status TEXT NOT NULL DEFAULT 'new'"
+    " CHECK (status IN ('new', 'slicing', 'sliced', 'slice_failed')),\n"
+    "    settings_json TEXT,\n"
+    "    result_json TEXT,\n"
+    "    sliced_file TEXT,\n"
+    "    error TEXT\n"
+    ");\n"
+    "CREATE INDEX jobs_name ON jobs (name);",
 }
 _SEEN_TTL_S = 30 * 24 * 3600
 _DEFAULT_TARIFF = (date(2024, 6, 1), 4.32, None)
@@ -49,6 +73,7 @@ _SPOOL_FIELDS = frozenset(
     }
 )
 _PRINT_FIELDS = frozenset({"spool_id", "grams", "kwh", "cost_filament_uah", "cost_power_uah", "fit"})
+_JOB_FIELDS = frozenset({"status", "settings_json", "result_json", "sliced_file", "error"})
 
 
 def _norm(identity: tuple) -> tuple[str, str, str]:
@@ -89,6 +114,22 @@ def _print(row: sqlite3.Row) -> PrintRow:
         fit=row["fit"],
         deducted_spool_id=row["deducted_spool_id"],
         deducted_g=row["deducted_g"],
+    )
+
+
+def _job(row: sqlite3.Row) -> Job:
+    return Job(
+        id=row["id"],
+        name=row["name"],
+        kind=row["kind"],
+        manifest_json=row["manifest_json"],
+        file_sha256=row["file_sha256"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        status=row["status"],
+        settings_json=row["settings_json"],
+        result_json=row["result_json"],
+        sliced_file=row["sliced_file"],
+        error=row["error"],
     )
 
 
@@ -497,3 +538,40 @@ class Store:
 
     def outbox_count(self) -> int:
         return int(self._conn().execute("SELECT COUNT(*) FROM outbox").fetchone()[0])
+
+    # -- jobs ------------------------------------------------------------
+
+    def add_job(
+        self, name: str, kind: str, manifest_json: str, file_sha256: str, created_at: datetime
+    ) -> int:
+        """A new job in status ``new``. Its files are handled by ``bambu_mcp.jobs``."""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO jobs (name, kind, manifest_json, file_sha256, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (name, kind, manifest_json, file_sha256, created_at.isoformat()),
+            )
+            return int(cur.lastrowid)
+
+    def job(self, id: int) -> Job | None:
+        row = self._conn().execute("SELECT * FROM jobs WHERE id = ?", (id,)).fetchone()
+        return _job(row) if row else None
+
+    def jobs(self, limit: int) -> list[Job]:
+        """Newest first."""
+        rows = self._conn().execute("SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,))
+        return [_job(r) for r in rows]
+
+    def update_job(self, id: int, **fields: Any) -> None:
+        unknown = set(fields) - _JOB_FIELDS
+        if unknown:
+            raise ValueError(f"unknown job fields: {sorted(unknown)}")
+        if "status" in fields and fields["status"] not in JOB_STATUSES:
+            raise ValueError(f"job status must be one of {', '.join(JOB_STATUSES)}")
+        if not fields:
+            return
+        assignments = ", ".join(f"{name} = ?" for name in fields)
+        with self._tx() as conn:
+            cur = conn.execute(f"UPDATE jobs SET {assignments} WHERE id = ?", (*fields.values(), id))
+            if cur.rowcount == 0:
+                raise KeyError(f"no job {id}")

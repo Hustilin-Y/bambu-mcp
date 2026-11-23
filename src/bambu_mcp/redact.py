@@ -75,6 +75,8 @@ def install_redaction(secrets) -> None:
         secrets.access_code,
         secrets.serial,
         secrets.notify_token,
+        secrets.gateway_key,
+        secrets.slice_agent_token,
         *secrets.client_tokens.values(),
     ]
     flt = RedactingFilter(v for v in values if v)

@@ -23,6 +23,22 @@ tls_mode = "ca"
 # Without notify_url and NOTIFY_TOKEN notifications go to the log only.
 # notify_url = "http://127.0.0.1:8790"
 
+# -- phase 2: print jobs -------------------------------------------------------
+# Folder on this machine that MCP create_job(manifest_path) may read from. Both the
+# manifest and its 3MF must resolve inside it (links included). Unset: path intake
+# is off and jobs arrive only through POST /jobs (`bambu-mcp upload`).
+# jobs_root_allowed = "/srv/cad-workshop/out"
+
+# orchestra-gateway, used to wake the PC (key in .env as GATEWAY_KEY).
+# gateway_url = "http://<gateway host>:<port>"
+
+# slice-agent on the PC, port 11436 (token in .env as SLICE_AGENT_TOKEN).
+# slice_agent_url = "http://<PC address>:11436"
+
+# Default --url of `bambu-mcp upload` when this file is named by BAMBU_CONFIG
+# (the token comes from the BAMBU_MCP_TOKEN environment variable, never from here).
+# service_url = "http://192.168.88.11:8765"
+
 camera_backend = "pyav"
 heatup_kwh = 0.05
 timezone = "Europe/Kyiv"

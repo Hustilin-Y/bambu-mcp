@@ -24,6 +24,7 @@ dependencies = [
 [project.scripts]
 bambu-service = "bambu_mcp.service:main"
 slice-agent = "slice_agent.app:main"
+bambu-mcp = "bambu_mcp.upload:main"
 
 [dependency-groups]
 dev = [

@@ -30,7 +30,7 @@ def test_migrate_is_idempotent_and_seeds_tariff(tmp_path: Path):
     assert t.day_uah == 4.32
     assert t.night_uah is None
     assert t.valid_from == date(2024, 6, 1)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 3
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 4
     assert s._conn().execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     s.close()
 
@@ -215,7 +215,7 @@ def test_migrate_v1_database_adds_deduction_columns(tmp_path: Path):
     (row,) = s.history(None, 10)
     assert row.identity[0] == "old"
     assert (row.deducted_spool_id, row.deducted_g) == (None, None)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 3
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 4
     s.close()
 
 
@@ -271,7 +271,7 @@ def test_migrate_v2_database_adds_outbox(tmp_path: Path):
         + "ALTER TABLE prints ADD COLUMN deducted_g REAL;\nPRAGMA user_version = 2;"
     )
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 3
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 4
     assert s.outbox_head() is None
     s.close()
 
@@ -343,3 +343,42 @@ def test_open_prints_and_close_without_minutes(store: Store):
     store.close_print(a, "failed", datetime(2026, 1, 3, tzinfo=timezone.utc), None)
     assert [r.id for r in store.open_prints()] == [b]
     assert store.print_by_id(a).actual_min is None
+
+
+def test_migrate_v3_to_v4(tmp_path: Path):
+    path = tmp_path / "v3.db"
+    conn = sqlite3.connect(path)
+    v1 = (Path(__file__).parents[2] / "src/bambu_mcp/store/schema.sql").read_text(encoding="utf-8")
+    conn.executescript(
+        v1
+        + "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
+        + "ALTER TABLE prints ADD COLUMN deducted_g REAL;\n"
+        + "CREATE TABLE outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,"
+        " text TEXT NOT NULL, buttons TEXT, snapshot INTEGER NOT NULL DEFAULT 0,"
+        " dedupe TEXT NOT NULL UNIQUE, created_at REAL NOT NULL,"
+        " attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at REAL NOT NULL);\n"
+        + "PRAGMA user_version = 3;"
+    )
+    conn.execute(
+        "INSERT INTO prints (name, source, started_at) VALUES ('kept', 'external', '2026-01-01T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO outbox (kind, text, dedupe, created_at, next_attempt_at)"
+        " VALUES ('finished', 'done', 'k1', 1.0, 1.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    s = Store(path)
+    s.migrate()
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 4
+    (row,) = s.history(None, 10)
+    assert row.identity[0] == "kept"
+    assert s.outbox_head().dedupe == "k1"
+    assert s.jobs(10) == []
+    job_id = s.add_job("lamp-arm", "part", "{}", "a" * 64, datetime(2026, 11, 23, tzinfo=timezone.utc))
+    job = s.job(job_id)
+    assert (job.name, job.kind, job.status, job.created_at.year) == ("lamp-arm", "part", "new", 2026)
+    with pytest.raises(sqlite3.IntegrityError):
+        s._conn().execute("UPDATE jobs SET status = 'bogus' WHERE id = ?", (job_id,))
+    s.close()

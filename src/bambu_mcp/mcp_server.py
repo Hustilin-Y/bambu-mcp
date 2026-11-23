@@ -5,6 +5,9 @@ Every request needs ``Authorization: Bearer <token>`` matching one of the
 before the MCP app sees it and records the client name (never the token) for
 logs. No tool accepts or returns the access code, serial, host or any token.
 
+``POST /jobs`` (same middleware) takes a CAD Workshop manifest and its 3MF as
+multipart parts ``manifest`` and ``file`` and creates a job; see ``bambu_mcp.jobs``.
+
 All tools are ``async`` on purpose: the SDK runs sync tools in worker threads,
 and the store keeps one SQLite connection per thread.
 """
@@ -27,13 +30,25 @@ from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import ToolAnnotations
+from python_multipart.multipart import parse_options_header
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from bambu_mcp import camera as camera_module
 from bambu_mcp.config import Secrets, Settings
+from bambu_mcp.jobs import (
+    MAX_FILE_BYTES,
+    JobError,
+    JobTooLarge,
+    JobUpload,
+    create_job_from_bytes,
+    incoming_dir,
+)
 from bambu_mcp.journal import FIT_VALUES, rebook_grams
+from bambu_mcp.manifest import MAX_MANIFEST_BYTES
 from bambu_mcp.printer.hms import hms_code, severity
 from bambu_mcp.printer.link import LinkStatus
 from bambu_mcp.printer.state import PrinterState
@@ -43,6 +58,8 @@ from bambu_mcp.store.models import Plate, PrintRow, Spool, Tariff
 log = logging.getLogger(__name__)
 
 MCP_PATH = "/mcp"
+JOBS_PATH = "/jobs"
+_BODY_SLACK = 64 * 1024  # multipart boundaries and part headers
 SERVER_NAME = "bambu-mcp"
 GRACEFUL_SHUTDOWN_S = 5
 HISTORY_MAX = 200
@@ -407,8 +424,9 @@ def build_app(
     settings: Settings,
     *,
     camera: Camera | None = None,
+    max_job_file_bytes: int = MAX_FILE_BYTES,
 ) -> Starlette:
-    """The MCP Streamable HTTP app at ``/mcp`` behind the bearer-token middleware."""
+    """The MCP Streamable HTTP app at ``/mcp`` and ``POST /jobs``, behind the bearer-token middleware."""
     if camera is None:
         # Fail fast when another snapshot is running instead of queueing behind it.
         camera = functools.partial(camera_module.snapshot, secrets, settings, wait=False)
@@ -419,8 +437,68 @@ def build_app(
         json_response=True,
         transport_security=_allowed(settings.listen),
     )
+    app.router.routes.append(
+        Route(JOBS_PATH, _jobs_endpoint(store, settings, max_job_file_bytes), methods=["POST"])
+    )
     app.add_middleware(BearerTokenMiddleware, tokens=secrets.client_tokens)
     return app
+
+
+# -- job upload ----------------------------------------------------------------------
+
+
+def _jobs_endpoint(
+    store: Store, settings: Settings, max_file: int
+) -> Callable[[Request], Awaitable[Response]]:
+    """``POST /jobs``: multipart ``manifest`` + ``file`` -> 201 ``{"job_id", ...}``.
+
+    The body is streamed: the declared length and a running total are checked
+    against the caps, and the 3MF goes to a temp file, never fully into memory
+    before the caps hold.
+    """
+    limit = max_file + MAX_MANIFEST_BYTES + _BODY_SLACK
+
+    def refuse(exc: JobError) -> JSONResponse:
+        too_large = isinstance(exc, JobTooLarge)
+        log.info("job upload refused: %s", exc)
+        return JSONResponse(
+            {"error": "too_large" if too_large else "bad_request", "detail": str(exc)},
+            status_code=413 if too_large else 422,
+        )
+
+    async def endpoint(request: Request) -> Response:
+        upload: JobUpload | None = None
+        try:
+            kind, options = parse_options_header(request.headers.get("content-type", ""))
+            boundary = options.get(b"boundary")
+            if kind != b"multipart/form-data" or not boundary:
+                raise JobError("expected multipart/form-data")
+            declared = request.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > limit:
+                raise JobTooLarge("request is too large")
+            upload = JobUpload(boundary, incoming_dir(settings), max_file, MAX_MANIFEST_BYTES)
+            total = 0
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > limit:
+                    raise JobTooLarge("request is too large")
+                upload.write(chunk)
+            manifest_bytes, path = upload.finish()
+            job = create_job_from_bytes(store, settings, manifest_bytes, path.read_bytes())
+        except JobError as exc:
+            return refuse(exc)
+        except Exception:
+            log.exception("job upload failed unexpectedly")
+            return JSONResponse({"error": "internal", "detail": "internal error"}, status_code=500)
+        finally:
+            if upload is not None:
+                upload.discard()
+        return JSONResponse(
+            {"job_id": job.id, "name": job.name, "kind": job.kind, "status": job.status},
+            status_code=201,
+        )
+
+    return endpoint
 
 
 # -- serving -----------------------------------------------------------------------

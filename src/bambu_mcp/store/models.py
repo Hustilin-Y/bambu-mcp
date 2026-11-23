@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 
+JOB_STATUSES = ("new", "slicing", "sliced", "slice_failed")
+
 
 @dataclass(frozen=True)
 class Spool:
@@ -67,3 +69,18 @@ class OutboxRow:
     created_at: float  # epoch seconds
     attempts: int
     next_attempt_at: float
+
+
+@dataclass(frozen=True)
+class Job:
+    id: int
+    name: str  # the manifest name, unchanged
+    kind: str  # "part" or "kit"
+    manifest_json: str  # the manifest exactly as received
+    file_sha256: str
+    created_at: datetime
+    status: str  # one of JOB_STATUSES
+    settings_json: str | None
+    result_json: str | None
+    sliced_file: str | None  # a file name, never a path
+    error: str | None
