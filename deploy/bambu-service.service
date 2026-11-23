@@ -1,0 +1,18 @@
+[Unit]
+Description=bambu-mcp: Bambu Lab P2S monitor and MCP server
+# The MCP listener binds 192.168.88.11 and does not retry a failed bind.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shiba-srv
+WorkingDirectory=/srv/bambu/app
+Environment=BAMBU_ENV=/srv/bambu/.env
+ExecStart=/srv/bambu/app/.venv/bin/bambu-service
+MemoryMax=150M
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
