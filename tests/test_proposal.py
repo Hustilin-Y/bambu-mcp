@@ -397,3 +397,79 @@ def test_estimate_cost_uses_spool_price_and_tariff():
 def test_estimate_cost_without_spool_has_no_filament_cost():
     line = estimate_cost(60, 14.0, None, "PETG", TARIFF, Settings(), NOW)
     assert line.filament_uah is None
+
+
+# -- fix round 1 --------------------------------------------------------------------
+
+
+def _kit_render(raw: dict, settings: dict) -> str:
+    choice = SlotChoice(0, 0, 1, None, tray_type="PLA", color_name="белый", remaining_g=800.0)
+    return _unescape(render_proposal(_job("kit", raw), settings, choice, "Textured PEI Plate", None))
+
+
+def test_kit_note_names_a_plate_supports_wish_the_kit_drops():
+    raw = _raw("kit")
+    raw["checks"]["supports_suggested"] = False
+    for plate in raw["plates"]:
+        plate["checks"]["supports_suggested"] = False
+    raw["plates"][0]["hints"] = {"walls": 3, "supports": "tree"}
+    m = parse_manifest(raw)
+    settings = resolve_settings({}, None, job_hints(m), "standard", checks=m.checks)
+    assert settings == {"enable_support": False}
+    text = _kit_render(raw, settings)
+    assert "Пластина 1: в CAD поддержки tree, в настройках без поддержек" in text
+    assert "Пластина 2: в CAD" not in text  # no supports hint, its checks agree with the kit
+
+
+def test_kit_note_names_a_plate_that_gets_supports_against_its_none():
+    raw = _raw("kit")
+    raw["plates"][0]["hints"] = {"walls": 3, "supports": "none"}  # plate 2's checks suggest supports
+    m = parse_manifest(raw)
+    settings = resolve_settings({}, None, job_hints(m), "standard", checks=m.checks)
+    assert settings["enable_support"] is True
+    text = _kit_render(raw, settings)
+    assert "Пластина 1: в CAD без поддержек, в настройках с поддержками" in text
+
+
+def test_kit_note_names_a_plate_whose_checks_want_supports_the_kit_turns_off():
+    raw = _raw("kit")
+    text = _kit_render(raw, {"enable_support": False})
+    assert "Пластина 2: в CAD с поддержками, в настройках без поддержек" in text
+    assert "Пластина 1: в CAD без" not in text
+
+
+def test_kit_note_names_a_different_support_type():
+    raw = _raw("kit")
+    raw["plates"][1]["hints"] = {"supports": "normal"}
+    text = _kit_render(raw, {"enable_support": True, "support_type": "tree(auto)"})
+    assert "Пластина 2: в CAD поддержки normal, в настройках поддержки tree" in text
+
+
+def test_kit_root_hint_does_not_override_a_plate_own_hint():
+    raw = _raw("kit")
+    raw["hints"] = {"walls": 4, "brim": "auto"}
+    raw["plates"][0]["hints"] = {"walls": 2}  # its own walls, no brim
+    del raw["plates"][1]["hints"]  # inherits the root hints
+    m = parse_manifest(raw)
+    assert job_hints(m) == {"brim": "auto"}
+    settings = resolve_settings({}, None, job_hints(m), "standard", checks=m.checks)
+    text = _kit_render(raw, settings)
+    assert "Пластина 1: в CAD 2 стенки, в настройках по профилю" in text
+    assert "Пластина 2: в CAD 4 стенки, в настройках по профилю" in text
+
+
+def test_pick_slot_skips_non_string_tray_types():
+    trays = (_tray(0, 0, 123), _tray(0, 1, "PLA"))
+    choice = pick_slot(trays, {}, "PLA", None)
+    assert (choice.slot, choice.warning) == (1, None)
+    nothing = pick_slot((_tray(0, 0, 5),), {}, "PLA", None)
+    assert nothing.slot is None
+
+
+def test_named_set_value_refused_for_nozzle_names_set_and_key():
+    with pytest.raises(ValueError, match=r"named set 'draft'.*layer_height"):
+        resolve_settings({}, None, {}, "draft", nozzle="0.6")
+    # A set without a nozzle-specific value works on any nozzle.
+    assert resolve_settings({}, None, {}, "strong", nozzle="0.6") == {
+        "wall_loops": 4, "sparse_infill_density": 25, "enable_support": False,
+    }

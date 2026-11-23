@@ -91,12 +91,17 @@ def resolve_settings(
     Overrides.parse(explicit, nozzle)
     if "support_type" in explicit and "enable_support" not in explicit:
         explicit["enable_support"] = True  # asking for a support type means wanting supports
-    merged = {
-        **NAMED_SETS[named_set],
-        **hint_overrides(hints, checks),
-        **_valid_entries(last_job, nozzle),
-        **explicit,
-    }
+    above = {**hint_overrides(hints, checks), **_valid_entries(last_job, nozzle), **explicit}
+    for key, value in NAMED_SETS[named_set].items():
+        if key in above:
+            continue
+        try:
+            Overrides.parse({key: value}, nozzle)
+        except ValueError:
+            raise ValueError(
+                f"named set {named_set!r}: {key}={value!r} is not valid for nozzle {nozzle}"
+            ) from None
+    merged = {**NAMED_SETS[named_set], **above}
     return dict(Overrides.parse(merged, nozzle).values)
 
 
@@ -118,13 +123,18 @@ def job_hints(manifest: Manifest) -> dict:
     """Hints for the whole job: a part's own, for a kit those every plate agrees on.
 
     A kit is sliced with one set of overrides, so a hint only one plate states is not
-    applied. ``messages.render_proposal`` lists such plate hints for the owner.
+    applied, and a root hint applies only when no plate's own hint says otherwise.
+    ``messages.render_proposal`` lists the plate hints the job does not follow.
     """
     if manifest.kind != "kit":
         return dict(manifest.plates[0].hints)
     first, *rest = manifest.plates
     agreed = {k: v for k, v in first.hints.items() if all(p.hints.get(k, object()) == v for p in rest)}
-    return {**manifest.hints, **agreed}
+    root = {
+        k: v for k, v in manifest.hints.items()
+        if all(p.hints.get(k, v) == v for p in manifest.plates)
+    }
+    return {**root, **agreed}
 
 
 def job_material(manifest: Manifest) -> tuple[str, str | None]:
@@ -185,7 +195,11 @@ def pick_slot(
     """
     from bambu_mcp.messages import md_literal  # messages imports this module
 
-    loaded = sorted((t for t in trays if t.tray_type), key=lambda t: (t.ams, t.slot))
+    # A tray type that is not a string (raw MQTT data) counts as not loaded.
+    loaded = sorted(
+        (t for t in trays if isinstance(t.tray_type, str) and t.tray_type.strip()),
+        key=lambda t: (t.ams, t.slot),
+    )
     if not loaded:
         return SlotChoice(None, None, None, f"⚠️ В AMS нет заправленных слотов, а нужен {md_literal(material)}")
     matching = [t for t in loaded if _norm(t.tray_type) == _norm(material)]

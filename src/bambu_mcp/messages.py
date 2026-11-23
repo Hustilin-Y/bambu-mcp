@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from bambu_mcp.cost import CostLine
 from bambu_mcp.events import Event, EventKind
-from bambu_mcp.manifest import Manifest, parse_manifest
+from bambu_mcp.manifest import Manifest, PlateInfo, parse_manifest
 from bambu_mcp.notify import Button
 from bambu_mcp.printer.hms import HmsTexts, describe, hms_code
 from bambu_mcp.proposal import SlotChoice, hint_overrides, job_material, slot_number
@@ -235,6 +235,32 @@ def _job_head(manifest: Manifest, settings: Mapping, choice: SlotChoice, plate_t
     return f"{job_name(manifest.name)}, {where}: {body}."
 
 
+def _support_words(settings: Mapping) -> str:
+    keys = ("enable_support", "support_type") if settings.get("enable_support") else ("enable_support",)
+    return ", ".join(_setting_parts({k: settings[k] for k in keys if k in settings}))
+
+
+def _plate_support_note(plate: PlateInfo, settings: Mapping) -> str | None:
+    """A plate's supports wish the kit's one setting does not follow, in words.
+
+    A stated ``none``/``tree``/``normal`` hint is compared as is. Without one (or with
+    ``auto``) only a plate whose checks suggest supports is noted when the kit has none:
+    the kit's auto supports add nothing where a plate does not need them.
+    """
+    hint = plate.hints.get("supports", "auto")
+    wish = hint_overrides({"supports": hint}, plate.checks)
+    enabled = bool(settings.get("enable_support"))
+    if hint == "auto":
+        if not wish["enable_support"] or enabled:
+            return None
+    elif wish["enable_support"] == enabled and (
+        not enabled or "support_type" not in wish or wish["support_type"] == settings.get("support_type")
+    ):
+        return None
+    have = _support_words(settings) or "по профилю"
+    return f"в CAD {_support_words(wish)}, в настройках {have}"
+
+
 def _plate_notes(manifest: Manifest, settings: Mapping) -> list[str]:
     """Kit plates: hints their parts disagree on, and plate hints the job settings differ from.
 
@@ -251,10 +277,13 @@ def _plate_notes(manifest: Manifest, settings: Mapping) -> list[str]:
         hinted = {k: v for k, v in plate.hints.items() if k in ("walls", "infill_pct", "infill_pattern", "brim")}
         for key, value in hint_overrides(hinted).items():
             if key == "enable_support" or settings.get(key) == value:
-                continue  # supports follow the kit's checks and are shown in the head
+                continue  # supports are compared below
             have = ", ".join(_setting_parts({key: settings[key]})) if key in settings else "по профилю"
             want = ", ".join(_setting_parts({key: value}))
             notes.append(f"Пластина {plate.index}: в CAD {want}, в настройках {have}")
+        support_note = _plate_support_note(plate, settings)
+        if support_note:
+            notes.append(f"Пластина {plate.index}: {support_note}")
         plate_material = plate.hints.get("material")
         if plate_material and plate_material.casefold() != material.casefold():
             notes.append(
