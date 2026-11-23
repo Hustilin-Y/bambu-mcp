@@ -43,7 +43,7 @@ CLIENT_TOKEN_ASSISTANT=<random token for the multiclaude assistant>
 # NOTIFY_TOKEN=<from `assistant service key bambu`, step 5>
 ```
 
-`BAMBU_ACCESS_CODE` and `BAMBU_SERIAL` are required. Each `CLIENT_TOKEN_<NAME>` defines one MCP client (the name is only used in logs). Without any, the MCP server does not start. Generate a token with `openssl rand -hex 32`.
+`BAMBU_ACCESS_CODE` and `BAMBU_SERIAL` are required. `BAMBU_HOST` is also needed for the printer link: it defaults to empty, so without it the service starts but cannot connect. Each `CLIENT_TOKEN_<NAME>` defines one MCP client (the name is only used in logs). Without any, the MCP server does not start. Generate a token with `openssl rand -hex 32`.
 
 ## 3. Settings: `/srv/bambu/config.toml`
 
@@ -71,11 +71,11 @@ curl -fL -o /srv/bambu/data/bambu.cert \
 
 ### HMS texts
 
-The service reads `/srv/bambu/data/hms_en_22E.json` (fixed name). Without it HMS messages show codes only. Build it from a local Bambu Studio install, then copy:
+The service reads `/srv/bambu/data/hms_en_22E.json` (fixed name). Without it HMS messages show codes only. Build it from a local Bambu Studio install, then copy (PowerShell, output outside the repo so the next `tar` cannot ship it):
 
 ```
-uv run python scripts/extract_hms.py "%APPDATA%\BambuStudio" -o hms.json
-scp hms.json workshop:/srv/bambu/data/hms_en_22E.json
+uv run python scripts/extract_hms.py "$env:APPDATA\BambuStudio" -o "$env:TEMP\hms_en_22E.json"
+scp "$env:TEMP\hms_en_22E.json" workshop:/srv/bambu/data/hms_en_22E.json
 ```
 
 Options: `-o/--out` (required), `--prefix` (default `22E`, the P2S). Never commit the output.
@@ -117,6 +117,11 @@ claude mcp add --transport http bambu http://127.0.0.1:8765/mcp --header "Author
 
 Register it for the owner's assistant only, no other assistant or project.
 
+Token hygiene, the owner types these commands:
+
+- The token ends up in the shell history and in `ps` argv while the command runs. In bash start the line with a space (needs `HISTCONTROL=ignorespace`) or run `set +o history` first. In PowerShell run `Clear-History` afterwards and remove the line from the PSReadLine history file (`(Get-PSReadLineOption).HistorySavePath`).
+- `claude mcp add` stores the token in plaintext in `~/.claude.json`. Keep that file private.
+
 ## Checks after deploy
 
 ```
@@ -127,11 +132,11 @@ cat /sys/fs/cgroup/system.slice/bambu-service.service/memory.current
 
 - Status is `active (running)`, the journal shows the MCP server listening on both addresses and no tracebacks.
 - `memory.current` is under 120 MB (125829120 bytes). The hard limit is 150M.
-- MCP call with the token (typed by the owner):
+- MCP call with the token. Keep it out of argv and history: the owner creates a mode-600 header file once, typing the token (`install -m 600 /dev/null /srv/bambu/.curl-auth`, then `nano` it to one line `Authorization: Bearer <CLIENT_TOKEN_ASSISTANT>`), and deletes it afterwards:
 
 ```
 curl -s http://127.0.0.1:8765/mcp \
-  -H "Authorization: Bearer <CLIENT_TOKEN_ASSISTANT>" \
+  -H @/srv/bambu/.curl-auth \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
