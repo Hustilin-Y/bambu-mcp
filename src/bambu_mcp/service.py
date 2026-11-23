@@ -364,6 +364,8 @@ def main() -> None:
     secrets = Secrets.load(env_path)
     install_redaction(secrets)  # before anything logs
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # The SDK logs "Terminating session" at INFO for every stateless request.
+    logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
     config_path = Path(os.environ.get("BAMBU_CONFIG", env_path.parent / "config.toml"))
     settings = Settings.load(config_path)
     with contextlib.suppress(KeyboardInterrupt):

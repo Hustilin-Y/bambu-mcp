@@ -52,3 +52,5 @@ class PrintRow:
     cost_filament_uah: float | None
     cost_power_uah: float | None
     fit: str | None
+    deducted_spool_id: int | None = None  # spool the recorded grams were removed from
+    deducted_g: float | None = None  # grams actually removed (after the floor at 0)

@@ -11,7 +11,7 @@ and verifying it against the Bambu CA through ffmpeg is out of scope.
 
 PyAV is blocking, so it runs in a worker thread under ``asyncio.wait_for``. A
 timed-out worker cannot be cancelled and may keep running until PyAV's own
-timeout fires. It cannot leak the URL: it catches and redacts everything itself
+timeout fires. Until it ends the camera counts as busy, so grabs never stack. It cannot leak the URL: it catches and redacts everything itself
 and only returns plain data, so nothing raised there reaches a caller or the
 event loop's exception handler.
 """
@@ -19,8 +19,10 @@ event loop's exception handler.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import logging
+import threading
 
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.redact import redact
@@ -47,6 +49,17 @@ def _grab_jpeg(url: str) -> bytes | None:
     return None
 
 
+class CameraBusy(Exception):
+    """Another snapshot is still running (``wait=False`` callers only)."""
+
+
+# Held from the start of a grab until its worker thread returns, even after the
+# caller timed out: a hung PyAV decoder (~20 MB) is never joined by a second one.
+# A threading lock, not an asyncio one: the worker thread releases it.
+_busy = threading.Lock()
+_BUSY_POLL_S = 0.1
+
+
 def _worker(url: str, secrets: tuple[str, ...]) -> tuple[bytes | None, str | None]:
     """Run ``_grab_jpeg`` and turn any failure into redacted text (never raises)."""
     try:
@@ -55,15 +68,66 @@ def _worker(url: str, secrets: tuple[str, ...]) -> tuple[bytes | None, str | Non
         return None, redact(f"{type(exc).__name__}: {exc}", secrets)
 
 
-async def snapshot(secrets: Secrets, settings: Settings, timeout_s: float = 15) -> bytes | None:
-    """Return one JPEG frame from the camera, or None on failure or timeout."""
+def _start_grab(url: str, mask: tuple[str, ...]) -> asyncio.Future:
+    """Run the worker in its own daemon thread; it releases ``_busy`` when it ends.
+
+    The caller holds ``_busy``. Once ``start()`` returns, the release is guaranteed
+    whatever happens to the awaiting task.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+
+    def deliver(result: tuple[bytes | None, str | None]) -> None:
+        if not future.done():
+            future.set_result(result)
+
+    def run() -> None:
+        try:
+            result = _worker(url, mask)
+        finally:
+            _busy.release()
+        with contextlib.suppress(RuntimeError):  # loop closed after a timeout
+            loop.call_soon_threadsafe(deliver, result)
+
+    threading.Thread(target=run, name="bambu-camera", daemon=True).start()
+    return future
+
+
+async def _acquire(wait: bool, deadline: float) -> bool:
+    loop = asyncio.get_running_loop()
+    while not _busy.acquire(blocking=False):
+        if not wait:
+            raise CameraBusy
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(_BUSY_POLL_S)
+    return True
+
+
+async def snapshot(
+    secrets: Secrets, settings: Settings, timeout_s: float = 15, *, wait: bool = True
+) -> bytes | None:
+    """Return one JPEG frame from the camera, or None on failure or timeout.
+
+    Only one grab runs at a time. While one is running, ``wait=True`` (the
+    service) waits for it within ``timeout_s``, ``wait=False`` (the MCP tool)
+    raises ``CameraBusy`` at once.
+    """
     del settings  # only the "pyav" backend exists, nothing to select
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    if not await _acquire(wait, deadline):
+        log.warning("camera snapshot skipped: camera busy for %.1f s", timeout_s)
+        return None
     url = f"rtsps://bblp:{secrets.access_code}@{secrets.host}:322/streaming/live/1"
     mask = (secrets.access_code, url)
     try:
-        data, error = await asyncio.wait_for(
-            asyncio.to_thread(_worker, url, mask), timeout=timeout_s
-        )
+        grab = _start_grab(url, mask)
+    except BaseException:
+        _busy.release()
+        raise
+    try:
+        data, error = await asyncio.wait_for(grab, timeout=max(deadline - loop.time(), 0))
     except TimeoutError:
         log.warning("camera snapshot timed out after %.1f s", timeout_s)
         return None

@@ -8,10 +8,12 @@ from zoneinfo import ZoneInfo
 import pytest
 from starlette.testclient import TestClient
 
+from bambu_mcp.camera import CameraBusy
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.events import Event, EventKind
 from bambu_mcp.journal import Journal
 from bambu_mcp.mcp_server import build_app
+from bambu_mcp.notify import Press
 from bambu_mcp.printer.link import LinkStatus
 from bambu_mcp.printer.state import Hms, PrinterState, Tray
 from bambu_mcp.store.db import Store
@@ -301,6 +303,68 @@ def test_update_print_deducts_and_moves_grams(h):
     assert h.call_raw("update_print", print_id=print_id, spool_id=999)["isError"] is True
 
 
+def _spools_ab(h):
+    a = h.call("add_spool", brand="A", material="PLA", color_name="White",
+               color_hex="#FFFFFF", price_uah=600, net_g=1000)
+    b = h.call("add_spool", brand="B", material="PLA", color_name="Grey",
+               color_hex="#888888", price_uah=500, net_g=1000)
+    return a["id"], b["id"]
+
+
+def _remaining(h) -> dict[int, float]:
+    return {s["id"]: s["remaining_g"] for s in h.call("spools")["spools"]}
+
+
+def _press(journal: Journal, print_id: int, value: str) -> str | None:
+    return journal.on_press(Press(1, "m1", f"spool:{print_id}:{value}", datetime.now(KYIV)))
+
+
+def test_telegram_spool_press_then_correction_refunds_debited_spool(h):
+    start = datetime(2027, 1, 2, 10, 0, tzinfo=KYIV)
+    print_id = _run_print(h.store, h.settings, "gear", start, start.replace(hour=11))
+    a, b = _spools_ab(h)
+    h.call("update_print", print_id=print_id, grams=14, spool_id=a)
+    assert _remaining(h) == {a: 986, b: 1000}
+
+    journal = Journal(h.store, h.settings)
+    assert _press(journal, print_id, str(b)) == "Катушка: B PLA Grey"
+    assert _remaining(h) == {a: 1000, b: 986}  # the press moved the deduction
+
+    row = h.call("update_print", print_id=print_id, grams=20)
+    assert _remaining(h) == {a: 1000, b: 980}
+    assert (row["spool_id"], row["cost_filament_uah"]) == (b, 10.0)
+
+    assert _press(journal, print_id, "none") == "Катушка: не списывать"
+    assert _remaining(h) == {a: 1000, b: 1000}
+    assert h.call("print_history")["prints"][0]["cost_filament_uah"] is None
+
+
+def test_correction_after_floored_deduction_refunds_only_removed_grams(h):
+    start = datetime(2027, 1, 2, 10, 0, tzinfo=KYIV)
+    print_id = _run_print(h.store, h.settings, "gear", start, start.replace(hour=11))
+    a, _ = _spools_ab(h)
+    h.call("set_spool_weight", spool_id=a, remaining_g=5)
+    h.call("update_print", print_id=print_id, grams=14, spool_id=a)
+    assert _remaining(h)[a] == 0
+    h.call("update_print", print_id=print_id, grams=3)
+    assert _remaining(h)[a] == 2
+
+
+async def test_camera_busy_is_fast_tool_error(tmp_path):
+    harness = Harness(tmp_path)
+
+    async def busy():
+        raise CameraBusy
+
+    harness.app = build_app(harness.service, harness.store, SECRETS, harness.settings, camera=busy)
+    harness.client = TestClient(harness.app, base_url=BASE_URL)
+    with harness.client:
+        result = harness.call_raw("camera_snapshot")
+    harness.store.close()
+    assert result["isError"] is True
+    assert "camera busy" in result["content"][0]["text"]
+
+
 # -- serving -----------------------------------------------------------------------
 
 
@@ -326,3 +390,31 @@ def test_service_runs_mcp_server_in_its_loop(tmp_path):
     assert coro.cr_code is service_module.mcp_server.serve.__code__
     coro.close()
     store.close()
+
+
+class _FakeSocket:
+    closed = False
+
+    def getsockname(self):
+        return ("127.0.0.1", 8765)
+
+    def close(self):
+        self.closed = True
+
+
+async def test_serve_logs_uvicorn_crash(tmp_path, monkeypatch, caplog):
+    from bambu_mcp import mcp_server
+
+    sock = _FakeSocket()
+    monkeypatch.setattr(mcp_server, "_bind", lambda listen: [sock])
+
+    async def crash(self, sockets=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(mcp_server._Server, "serve", crash)
+    store = Store(tmp_path / "bambu.db")
+    with pytest.raises(RuntimeError):
+        await mcp_server.serve(FakeService(), store, SECRETS, Settings(data_dir=tmp_path))
+    store.close()
+    assert "MCP server crashed" in caplog.text
+    assert sock.closed

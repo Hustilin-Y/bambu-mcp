@@ -33,8 +33,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from bambu_mcp import camera as camera_module
 from bambu_mcp.config import Secrets, Settings
-from bambu_mcp.cost import filament_cost
-from bambu_mcp.journal import FIT_VALUES
+from bambu_mcp.journal import FIT_VALUES, rebook_grams
 from bambu_mcp.printer.hms import hms_code, severity
 from bambu_mcp.printer.link import LinkStatus
 from bambu_mcp.printer.state import PrinterState
@@ -248,7 +247,10 @@ def build_mcp(
     @mcp.tool(annotations=READ)
     async def camera_snapshot() -> Image:
         """One JPEG frame from the printer camera."""
-        data = await camera()
+        try:
+            data = await camera()
+        except camera_module.CameraBusy as exc:
+            raise ToolError("camera busy with another snapshot, try again in a few seconds") from exc
         if not data:
             raise ToolError("camera snapshot failed, see the service log")
         return Image(data=data, format="jpeg")
@@ -385,25 +387,12 @@ def build_mcp(
         new_grams = row.grams if grams is None else grams
         spool = _spool_by_id(store, new_spool_id) if new_spool_id is not None else None
 
-        fields: dict[str, Any] = {}
-        if fit is not None:
-            fields["fit"] = fit
-        if spool_id is not None:
-            fields["spool_id"] = spool_id
-        if grams is not None:
-            fields["grams"] = grams
         if spool_id is not None or grams is not None:
-            # Refund what was deducted before, then deduct the new amount.
-            if row.spool_id is not None and row.grams:
-                store.adjust_spool(row.spool_id, -row.grams)
-            if spool is not None and new_grams:
-                store.adjust_spool(spool.id, new_grams)
-            fields["cost_filament_uah"] = (
-                filament_cost(new_grams, spool, {}, spool.material)
-                if spool is not None and new_grams is not None
-                else None
-            )
-        store.set_print_fields(print_id, **fields)
+            # One transaction: refund the recorded deduction, deduct anew, record it.
+            with _tool_errors():
+                rebook_grams(store, print_id, spool, new_grams)
+        if fit is not None:
+            store.set_print_fields(print_id, fit=fit)
         updated = store.print_by_id(print_id)
         assert updated is not None
         return _print(updated, tz)
@@ -421,7 +410,8 @@ def build_app(
 ) -> Starlette:
     """The MCP Streamable HTTP app at ``/mcp`` behind the bearer-token middleware."""
     if camera is None:
-        camera = functools.partial(camera_module.snapshot, secrets, settings)
+        # Fail fast when another snapshot is running instead of queueing behind it.
+        camera = functools.partial(camera_module.snapshot, secrets, settings, wait=False)
     mcp = build_mcp(service, store, settings, camera)
     app = mcp.streamable_http_app(
         streamable_http_path=MCP_PATH,
@@ -486,6 +476,12 @@ async def serve(
         server.should_exit = True
         with contextlib.suppress(Exception):
             await task
+        raise
+    except SystemExit:
+        # uvicorn exits on a failed app startup; keep the monitoring service alive.
+        log.error("MCP server failed to start, the service keeps running without it")
+    except Exception:
+        log.exception("MCP server crashed, the service keeps running without it")
         raise
     finally:
         for sock in sockets:

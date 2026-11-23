@@ -7,12 +7,12 @@ from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from bambu_mcp.config import Settings
-from bambu_mcp.cost import CostLine, power_cost, print_kwh
+from bambu_mcp.cost import CostLine, filament_cost, power_cost, print_kwh
 from bambu_mcp.events import Event, EventKind
 from bambu_mcp.messages import post_print_buttons
 from bambu_mcp.notify import Press
 from bambu_mcp.store.db import Store
-from bambu_mcp.store.models import PrintRow
+from bambu_mcp.store.models import PrintRow, Spool
 
 log = logging.getLogger(__name__)
 
@@ -128,12 +128,12 @@ class Journal:
         return f"Посадка: {labels[f'fit:{print_id}:{value}']}"
 
     def _spool(self, print_id: int, value: str) -> str | None:
+        row = self._store.print_by_id(print_id)
+        if row is None:
+            log.warning("spool press for unknown print %d ignored", print_id)
+            return None
         if value == NO_SPOOL:
-            try:
-                self._store.set_print_fields(print_id, spool_id=None)
-            except KeyError:
-                log.warning("spool press for unknown print %d ignored", print_id)
-                return None
+            rebook_grams(self._store, print_id, None, row.grams)
             return "Катушка: не списывать"
         try:
             spool_id = int(value)
@@ -143,9 +143,11 @@ class Journal:
         if spool is None:
             log.warning("spool press for unknown spool %d ignored", spool_id)
             return None
-        try:
-            self._store.set_print_fields(print_id, spool_id=spool_id)
-        except KeyError:
-            log.warning("spool press for unknown print %d ignored", print_id)
-            return None
+        rebook_grams(self._store, print_id, spool, row.grams)
         return f"Катушка: {spool_label(spool.brand, spool.material, spool.color_name)}"
+
+
+def rebook_grams(store: Store, print_id: int, spool: Spool | None, grams: float | None) -> None:
+    """Point a print at ``spool`` with ``grams`` and move its spool deduction to match."""
+    cost = filament_cost(grams, spool, {}, spool.material) if spool and grams is not None else None
+    store.rebook_print_grams(print_id, spool.id if spool else None, grams, cost)

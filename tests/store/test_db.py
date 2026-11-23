@@ -30,7 +30,7 @@ def test_migrate_is_idempotent_and_seeds_tariff(tmp_path: Path):
     assert t.day_uah == 4.32
     assert t.night_uah is None
     assert t.valid_from == date(2024, 6, 1)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 1
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 2
     assert s._conn().execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     s.close()
 
@@ -187,3 +187,75 @@ def test_schema_tables_exist(tmp_path: Path):
     tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     con.close()
     assert {"seen", "meta", "spools", "slots", "plates", "tariffs", "prints"} <= tables
+
+
+def _closed_print(store: Store) -> int:
+    pid = store.open_print(("part", "1", "s"), datetime(2026, 11, 22, 8, tzinfo=timezone.utc), "external")
+    store.close_print(pid, "finished", datetime(2026, 11, 22, 9, tzinfo=timezone.utc), 60)
+    return pid
+
+
+def _remaining(store: Store) -> dict[int, float]:
+    return {s.id: s.remaining_g for s in store.spools(active_only=False)}
+
+
+def test_migrate_v1_database_adds_deduction_columns(tmp_path: Path):
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    # schema.sql is the frozen version-1 schema, later versions are ALTER steps.
+    v1 = (Path(__file__).parents[2] / "src/bambu_mcp/store/schema.sql").read_text(encoding="utf-8")
+    conn.executescript(v1 + "PRAGMA user_version = 1;")
+    conn.execute(
+        "INSERT INTO prints (name, source, started_at) VALUES ('old', 'external', '2026-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+    s = Store(path)
+    s.migrate()
+    (row,) = s.history(None, 10)
+    assert row.identity[0] == "old"
+    assert (row.deducted_spool_id, row.deducted_g) == (None, None)
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 2
+    s.close()
+
+
+def test_rebook_moves_the_recorded_deduction(store: Store):
+    a, b = _spool(store), _spool(store)
+    pid = _closed_print(store)
+    store.rebook_print_grams(pid, a, 14, 9.8)
+    row = store.print_by_id(pid)
+    assert (row.spool_id, row.grams, row.deducted_spool_id, row.deducted_g) == (a, 14, a, 14)
+    assert row.cost_filament_uah == 9.8
+    assert _remaining(store) == {a: 986, b: 1000}
+
+    # Someone changes the spool without moving grams (old behaviour): the refund
+    # still goes to the spool that was actually debited.
+    store.set_print_fields(pid, spool_id=b)
+    store.rebook_print_grams(pid, b, 20, None)
+    assert _remaining(store) == {a: 1000, b: 980}
+
+    store.rebook_print_grams(pid, None, 20, None)  # "do not deduct"
+    assert _remaining(store) == {a: 1000, b: 1000}
+    row = store.print_by_id(pid)
+    assert (row.spool_id, row.grams, row.deducted_spool_id, row.deducted_g) == (None, 20, None, None)
+
+
+def test_rebook_records_floored_deduction(store: Store):
+    a = _spool(store)
+    store.set_spool_weight(a, 5)
+    pid = _closed_print(store)
+    store.rebook_print_grams(pid, a, 14, None)
+    assert store.print_by_id(pid).deducted_g == 5
+    assert _remaining(store) == {a: 0}
+    store.rebook_print_grams(pid, a, 3, None)  # correction refunds only the 5 g removed
+    assert _remaining(store) == {a: 2}
+
+
+def test_rebook_unknown_ids(store: Store):
+    a = _spool(store)
+    with pytest.raises(KeyError):
+        store.rebook_print_grams(999, a, 1, None)
+    pid = _closed_print(store)
+    with pytest.raises(KeyError):
+        store.rebook_print_grams(pid, 999, 1, None)
+    assert _remaining(store) == {a: 1000}

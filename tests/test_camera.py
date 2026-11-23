@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import threading
 
@@ -68,3 +69,52 @@ async def test_no_frame_returns_none(monkeypatch, secrets, settings, caplog):
     with caplog.at_level(logging.WARNING, logger="bambu_mcp.camera"):
         assert await camera.snapshot(secrets, settings) is None
     assert "no video frame" in caplog.text
+
+
+async def test_concurrent_snapshots_run_one_grab(monkeypatch, secrets, settings):
+    started = threading.Event()
+    release = threading.Event()
+    grabs = []
+
+    def blocking_grab(url):
+        grabs.append(url)
+        started.set()
+        release.wait(5)
+        return b"jpeg"
+
+    monkeypatch.setattr(camera, "_grab_jpeg", blocking_grab)
+    first = asyncio.ensure_future(camera.snapshot(secrets, settings))
+    await asyncio.to_thread(started.wait, 5)
+    with pytest.raises(camera.CameraBusy):  # the MCP tool: fail fast
+        await camera.snapshot(secrets, settings, wait=False)
+    waiting = asyncio.ensure_future(camera.snapshot(secrets, settings))  # the service: wait
+    await asyncio.sleep(0.2)
+    assert len(grabs) == 1
+    release.set()
+    assert await first == b"jpeg"
+    assert await waiting == b"jpeg"
+    assert len(grabs) == 2
+
+
+async def test_timed_out_grab_keeps_camera_busy(monkeypatch, secrets, settings, caplog):
+    release = threading.Event()
+    grabs = []
+
+    def hung_grab(url):
+        grabs.append(url)
+        release.wait(5)
+        return b"late"
+
+    monkeypatch.setattr(camera, "_grab_jpeg", hung_grab)
+    try:
+        assert await camera.snapshot(secrets, settings, timeout_s=0.1) is None
+        with pytest.raises(camera.CameraBusy):
+            await camera.snapshot(secrets, settings, wait=False)
+        with caplog.at_level(logging.WARNING, logger="bambu_mcp.camera"):
+            assert await camera.snapshot(secrets, settings, timeout_s=0.2) is None
+        assert "busy" in caplog.text
+        assert len(grabs) == 1
+    finally:
+        release.set()
+    monkeypatch.setattr(camera, "_grab_jpeg", lambda url: b"ok")
+    assert await camera.snapshot(secrets, settings) == b"ok"  # freed once the thread ends

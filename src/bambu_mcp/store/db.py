@@ -10,7 +10,12 @@ from typing import Any, Literal
 from bambu_mcp.store.models import Plate, PrintRow, Spool, Tariff
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+# schema.sql is the version-1 schema; each later version is one ALTER script.
+_MIGRATIONS = {
+    2: "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
+    "ALTER TABLE prints ADD COLUMN deducted_g REAL;",
+}
 _SEEN_TTL_S = 30 * 24 * 3600
 _DEFAULT_TARIFF = (date(2024, 6, 1), 4.32, None)
 
@@ -66,6 +71,8 @@ def _print(row: sqlite3.Row) -> PrintRow:
         cost_filament_uah=row["cost_filament_uah"],
         cost_power_uah=row["cost_power_uah"],
         fit=row["fit"],
+        deducted_spool_id=row["deducted_spool_id"],
+        deducted_g=row["deducted_g"],
     )
 
 
@@ -108,9 +115,12 @@ class Store:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version < 1:
             conn.executescript(
-                "BEGIN;\n"
-                + _SCHEMA.read_text(encoding="utf-8")
-                + f"\nPRAGMA user_version = {_SCHEMA_VERSION};\nCOMMIT;"
+                "BEGIN;\n" + _SCHEMA.read_text(encoding="utf-8") + "\nPRAGMA user_version = 1;\nCOMMIT;"
+            )
+            version = 1
+        for target in range(version + 1, _SCHEMA_VERSION + 1):
+            conn.executescript(
+                f"BEGIN;\n{_MIGRATIONS[target]}\nPRAGMA user_version = {target};\nCOMMIT;"
             )
         with conn:
             conn.execute(
@@ -307,6 +317,50 @@ class Store:
             .fetchone()
         )
         return _print(row) if row else None
+
+    def rebook_print_grams(
+        self,
+        id: int,
+        spool_id: int | None,
+        grams: float | None,
+        cost_filament_uah: float | None,
+    ) -> None:
+        """Set a print's spool and grams and move its spool deduction, in one transaction.
+
+        The grams removed earlier (``deducted_g``, after the floor at 0) go back to
+        the spool they were removed from (``deducted_spool_id``). Then ``grams`` are
+        removed from ``spool_id`` (at most its remaining weight) and recorded.
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT deducted_spool_id, deducted_g FROM prints WHERE id = ?", (id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"no print {id}")
+            if row["deducted_spool_id"] is not None and row["deducted_g"]:
+                conn.execute(
+                    "UPDATE spools SET remaining_g = remaining_g + ? WHERE id = ?",
+                    (row["deducted_g"], row["deducted_spool_id"]),
+                )
+            deducted_spool, deducted = None, None
+            if spool_id is not None:
+                spool = conn.execute(
+                    "SELECT remaining_g FROM spools WHERE id = ?", (spool_id,)
+                ).fetchone()
+                if spool is None:
+                    raise KeyError(f"no spool {spool_id}")  # rolls the refund back
+                if grams:
+                    deducted_spool = spool_id
+                    deducted = min(grams, max(spool["remaining_g"], 0.0))
+                    conn.execute(
+                        "UPDATE spools SET remaining_g = remaining_g - ? WHERE id = ?",
+                        (deducted, spool_id),
+                    )
+            conn.execute(
+                "UPDATE prints SET spool_id = ?, grams = ?, cost_filament_uah = ?,"
+                " deducted_spool_id = ?, deducted_g = ? WHERE id = ?",
+                (spool_id, grams, cost_filament_uah, deducted_spool, deducted, id),
+            )
 
     def print_by_id(self, id: int) -> PrintRow | None:
         row = self._conn().execute("SELECT * FROM prints WHERE id = ?", (id,)).fetchone()
