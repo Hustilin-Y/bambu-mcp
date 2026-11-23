@@ -382,3 +382,20 @@ def test_migrate_v3_to_v4(tmp_path: Path):
     with pytest.raises(sqlite3.IntegrityError):
         s._conn().execute("UPDATE jobs SET status = 'bogus' WHERE id = ?", (job_id,))
     s.close()
+
+
+def test_transition_job_is_a_check_and_set(store):
+    at = datetime(2026, 11, 23, tzinfo=timezone.utc)
+    a = store.add_job("a", "part", "{}", "a" * 64, at)
+    b = store.add_job("b", "part", "{}", "b" * 64, at)
+    assert store.transition_job(a, ("new", "sliced"), status="slicing", error=None) is True
+    assert store.transition_job(a, ("new", "sliced"), status="slicing") is False  # already slicing
+    assert store.transition_job(999, ("new",), status="slicing") is False
+    assert store.job(a).status == "slicing" and store.job(b).status == "new"
+    assert [j.id for j in store.jobs_with_status("slicing")] == [a]
+    with pytest.raises(ValueError):
+        store.transition_job(a, ("slicing",), status="bogus")
+    with pytest.raises(ValueError):
+        store.transition_job(a, ("slicing",), name="x")
+    with pytest.raises(ValueError):
+        store.transition_job(a, ())

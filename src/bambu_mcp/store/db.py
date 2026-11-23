@@ -562,16 +562,41 @@ class Store:
         rows = self._conn().execute("SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,))
         return [_job(r) for r in rows]
 
-    def update_job(self, id: int, **fields: Any) -> None:
+    def jobs_with_status(self, status: str) -> list[Job]:
+        """Oldest first."""
+        rows = self._conn().execute("SELECT * FROM jobs WHERE status = ? ORDER BY id", (status,))
+        return [_job(r) for r in rows]
+
+    @staticmethod
+    def _job_assignments(fields: dict[str, Any]) -> str:
         unknown = set(fields) - _JOB_FIELDS
         if unknown:
             raise ValueError(f"unknown job fields: {sorted(unknown)}")
         if "status" in fields and fields["status"] not in JOB_STATUSES:
             raise ValueError(f"job status must be one of {', '.join(JOB_STATUSES)}")
+        return ", ".join(f"{name} = ?" for name in fields)
+
+    def update_job(self, id: int, **fields: Any) -> None:
+        assignments = self._job_assignments(fields)
         if not fields:
             return
-        assignments = ", ".join(f"{name} = ?" for name in fields)
         with self._tx() as conn:
             cur = conn.execute(f"UPDATE jobs SET {assignments} WHERE id = ?", (*fields.values(), id))
             if cur.rowcount == 0:
                 raise KeyError(f"no job {id}")
+
+    def transition_job(self, id: int, from_statuses: tuple[str, ...], **fields: Any) -> bool:
+        """Update the job only while its status is one of ``from_statuses``, in one statement.
+
+        False when the job is in another status (or does not exist): nothing changed.
+        """
+        if not fields or not from_statuses:
+            raise ValueError("transition_job needs fields and from_statuses")
+        assignments = self._job_assignments(fields)
+        marks = ", ".join("?" for _ in from_statuses)
+        with self._tx() as conn:
+            cur = conn.execute(
+                f"UPDATE jobs SET {assignments} WHERE id = ? AND status IN ({marks})",
+                (*fields.values(), id, *from_statuses),
+            )
+            return cur.rowcount == 1

@@ -1,21 +1,31 @@
 import asyncio
+import hashlib
 import json
 import logging
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 
+from bambu_mcp import jobs as jobs_module
 from bambu_mcp.config import Secrets, Settings
+from bambu_mcp.messages import render_proposal, render_sliced
 from bambu_mcp.notify import LogNotifier, Press, SendError, ServiceNotifyClient
 from bambu_mcp.printer.link import LinkStatus
+from bambu_mcp.printer.state import PrinterState, Tray
+from bambu_mcp.proposal import SlotChoice, estimate_cost
 from bambu_mcp.service import (
     AUTH_FAILED_TEXT,
+    CHANGE_TEXT,
     TARIFF_META_KEY,
+    JobBusy,
     Service,
     build_notifier,
     notify_dedupe,
 )
+from bambu_mcp.slicer import SliceOutcome
 from bambu_mcp.store.db import Store
 
 FIXTURES = Path(__file__).parent / "fixtures" / "p2s"
@@ -95,6 +105,8 @@ class Harness:
         self.service: Service | None = None
         self.task: asyncio.Task | None = None
         self.sleep = asyncio.sleep
+        self.slicer = None
+        self.waker = None
 
     def _factory(self, on_report, on_status) -> FakeLink:
         link = FakeLink(on_report, on_status)
@@ -114,6 +126,8 @@ class Harness:
             camera,
             clock=self.clock,
             sleep=self.sleep,
+            slicer=self.slicer,
+            waker=self.waker,
         )
         count = len(self.links)
         self.task = asyncio.create_task(self.service.run())
@@ -724,3 +738,459 @@ async def test_job_name_is_escaped_in_questions(harness):
         await harness.feed_report(payload)
     fit = next(m for m in harness.notifier.sent if m["text"].startswith("Как села"))
     assert fit["text"] == r"Как села деталь «cube\_v2»?"
+
+
+# -- jobs: proposal, slicing, presses ----------------------------------------------------
+
+MANIFESTS = Path(__file__).parent / "fixtures" / "manifest"
+THREE_MF = b"PK\x03\x04fake-3mf-body" + bytes(range(256))
+PNG = b"\x89PNG\r\n\x1a\nplate-1"
+PRESET = "Generic PETG @BBL P2S"
+TRAYS = (
+    Tray(0, 0, "PETG", "FFFFFFFF", None),
+    Tray(0, 1, "PETG", "057748FF", None),
+    Tray(0, 2, "PETG", "161616FF", None),
+    Tray(0, 3, None, None, None),
+)
+PLATES = ({"index": 1, "minutes": 100.0, "grams": {"PETG": 14.0}},)
+OVERRIDES = {"wall_loops": 4, "sparse_infill_density": 25, "sparse_infill_pattern": "gyroid", "enable_support": False}
+
+
+def ok(file: str = "lamp-arm-1-p1.gcode.3mf", plates=PLATES) -> SliceOutcome:
+    return SliceOutcome("ok", file=file, plates=plates, slicer_version="02.08.02.61")
+
+
+class FakeSlicer:
+    def __init__(self, *outcomes: SliceOutcome, png: bytes | None = PNG, gate: asyncio.Event | None = None):
+        self.outcomes = list(outcomes) or [ok()]
+        self.png, self.gate = png, gate
+        self.requests: list = []
+        self.files: list[bytes] = []
+        self.png_requests: list[tuple[str, int]] = []
+
+    async def health(self) -> bool:
+        return True
+
+    async def slice(self, job, file_bytes):
+        self.requests.append(job)
+        self.files.append(file_bytes)
+        if self.gate is not None:
+            await self.gate.wait()
+        return self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
+
+    async def fetch_png(self, name, plate):
+        self.png_requests.append((name, plate))
+        return self.png
+
+
+class FakeWaker:
+    def __init__(self, result: bool = True) -> None:
+        self.result = result
+        self.budgets: list[float] = []
+
+    async def wake_and_wait(self, budget_s: float = 120) -> bool:
+        self.budgets.append(budget_s)
+        return self.result
+
+
+class Sleeps:
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+
+def manifest_for(body: bytes = THREE_MF, kind: str = "part", **changes) -> bytes:
+    data = json.loads((MANIFESTS / f"{kind}.print.json").read_text(encoding="utf-8"))
+    data["file_sha256"] = hashlib.sha256(body).hexdigest()
+    data.update(changes)
+    return json.dumps(data).encode("utf-8")
+
+
+def add_job(store: Store, settings: Settings, **changes):
+    return jobs_module.create_job_from_bytes(store, settings, manifest_for(**changes), THREE_MF)
+
+
+def add_spool(store: Store, *, material="petg", preset: str | None = PRESET, slot=(0, 0)) -> int:
+    spool = store.add_spool("Elegoo", material, "белый", "#FFFFFF", preset, 550.0, 1000.0)
+    store.map_slot(*slot, spool)
+    return spool
+
+
+def job_settings(tmp_path: Path) -> Settings:
+    return Settings(data_dir=tmp_path, power_w={"PLA": 200.0, "PETG": 230.0})
+
+
+def job_service(tmp_path, slicer=None, waker=None, *, configured=True, sleep=None):
+    store = Store(tmp_path / "bambu.db")
+    store.migrate()
+    notifier = RecordingNotifier()
+    service = Service(
+        SECRETS,
+        job_settings(tmp_path),
+        store,
+        notifier,
+        FakeLink,
+        Camera(),
+        clock=Clock(T0),
+        sleep=sleep or Sleeps(),
+        slicer=(slicer or FakeSlicer()) if configured else None,
+        waker=(waker or FakeWaker()) if configured else None,
+    )
+    service._state = replace(PrinterState.empty(), trays=TRAYS)
+    return service, store, notifier
+
+
+async def test_propose_sends_the_summary_with_slice_and_change_buttons(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    spool = add_spool(store)
+    job = add_job(store, service._settings)
+    await service.propose(job.id)
+    await drain(service)
+    choice = SlotChoice(0, 0, spool, None, tray_type="PETG", color_name="белый", remaining_g=1000.0)
+    assert notifier.sent[0]["text"] == render_proposal(job, OVERRIDES, choice, "Textured PEI Plate", None)
+    assert notifier.button_ids(0) == [f"job:{job.id}:slice", f"job:{job.id}:change"]
+    assert store.job(job.id).status == "new"
+    store.close()
+
+
+async def test_propose_warns_when_the_spool_has_no_filament_preset(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store, preset=None)
+    job = add_job(store, service._settings)
+    await service.propose(job.id)
+    await drain(service)
+    assert "пресет" in notifier.sent[0]["text"].splitlines()[-1]
+    store.close()
+
+
+async def test_slice_job_happy_path_stores_result_and_enqueues_summary(tmp_path):
+    slicer, waker = FakeSlicer(), FakeWaker()
+    service, store, notifier = job_service(tmp_path, slicer, waker)
+    spool_id = add_spool(store)
+    job = add_job(store, service._settings)
+
+    done = await service.slice_job(job.id)
+
+    assert waker.budgets == [120]
+    req = slicer.requests[0]
+    assert (req.job_id, req.name, req.kit, req.plates) == (job.id, "lamp-arm", False, (1,))
+    assert (req.nozzle, req.process_set, req.filament, req.plate_type) == (
+        "0.4", "standard", PRESET, "Textured PEI Plate"
+    )
+    assert dict(req.overrides) == OVERRIDES
+    assert slicer.files == [THREE_MF]
+    assert slicer.png_requests == [("lamp-arm-1-p1.gcode.3mf", 1)]
+
+    assert done.status == "sliced" and done.error is None
+    assert done.sliced_file == "lamp-arm-1-p1.gcode.3mf"
+    assert json.loads(done.settings_json) == OVERRIDES
+    result = json.loads(done.result_json)
+    spool = next(s for s in store.spools() if s.id == spool_id)
+    # Canonical material: the spool says "petg", the power table has "PETG".
+    cost = estimate_cost(100.0, 14.0, spool, "PETG", store.tariff_on(T0.date()), service._settings, T0)
+    assert result["plates"] == list(PLATES)
+    assert result["costs"] == [{
+        "index": 1, "filament_uah": cost.filament_uah, "power_uah": cost.power_uah,
+        "kwh": cost.kwh, "total_uah": cost.total_uah,
+    }]
+    assert result["slot"]["spool_id"] == spool_id and (result["slot"]["ams"], result["slot"]["slot"]) == (0, 0)
+    assert result["slot"]["color"] == "белый"
+    assert (result["plate_type"], result["nozzle"], result["process_set"], result["filament"]) == (
+        "Textured PEI Plate", "0.4", "standard", PRESET
+    )
+    assert result["material"] == "PETG" and result["slicer_version"] == "02.08.02.61"
+
+    await drain(service)
+    choice = SlotChoice(0, 0, spool_id, None, tray_type="PETG", color_name="белый", remaining_g=1000.0)
+    expected = render_sliced(
+        done, list(PLATES), [cost], settings=OVERRIDES, slot_choice=choice, plate_type="Textured PEI Plate"
+    )
+    assert notifier.sent[0]["text"] == expected
+    assert notifier.sent[0]["files"] == [("plate-1.png", PNG)]
+    assert store.outbox_count() == 0
+    assert not any((tmp_path / "outbox-files").glob("*"))  # the picture goes once it is sent
+    store.close()
+
+
+async def test_sliced_summary_picture_survives_a_failed_attempt(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    await service.slice_job(job.id)
+    notifier.fail = True
+    await service.send_next()
+    service._clock.advance(seconds=60)
+    notifier.fail = False
+    await drain(service)
+    assert notifier.sent[0]["files"] == [("plate-1.png", PNG)]
+    store.close()
+
+
+async def test_missing_png_sends_the_text_alone(tmp_path):
+    service, store, notifier = job_service(tmp_path, FakeSlicer(png=None))
+    add_spool(store)
+    job = add_job(store, service._settings)
+    await service.slice_job(job.id)
+    await drain(service)
+    assert notifier.sent[0]["files"] == []
+    assert notifier.sent[0]["text"].startswith("lamp-arm, пластина 1:")
+    store.close()
+
+
+async def test_kit_sends_every_plate(tmp_path):
+    raw = json.loads((MANIFESTS / "kit.print.json").read_text(encoding="utf-8"))
+    indexes = tuple(p["index"] for p in raw["plates"])
+    plates = tuple({"index": i, "minutes": 30.0 * i, "grams": {"PETG": 2.5 * i}} for i in indexes)
+    slicer = FakeSlicer(ok(f"{raw['name']}-1-kit.gcode.3mf", plates))
+    service, store, _ = job_service(tmp_path, slicer)
+    add_spool(store)
+    job = add_job(store, service._settings, kind="kit")
+    done = await service.slice_job(job.id)
+    req = slicer.requests[0]
+    assert req.kit is True and req.plates == indexes
+    assert done.status == "sliced"
+    assert [c["index"] for c in json.loads(done.result_json)["costs"]] == list(indexes)
+    store.close()
+
+
+async def test_name_sent_to_the_agent_is_the_slug(tmp_path):
+    slicer = FakeSlicer(ok("lamp-arm-v2-1-p1.gcode.3mf"))
+    service, store, _ = job_service(tmp_path, slicer)
+    add_spool(store)
+    job = add_job(store, service._settings, name="Lamp Arm v2")
+    await service.slice_job(job.id)
+    assert slicer.requests[0].name == "lamp-arm-v2"
+    store.close()
+
+
+async def test_pc_not_woken_marks_failed_and_tells_owner(tmp_path):
+    slicer = FakeSlicer()
+    service, store, notifier = job_service(tmp_path, slicer, FakeWaker(False))
+    add_spool(store)
+    job = add_job(store, service._settings)
+    done = await service.slice_job(job.id)
+    assert done.status == "slice_failed"
+    assert done.error == "the PC did not wake within 2 minutes"
+    assert slicer.requests == []
+    await drain(service)
+    assert len(notifier.sent) == 1
+    assert "ПК не проснулся" in notifier.sent[0]["text"] and "lamp-arm" in notifier.sent[0]["text"]
+    store.close()
+
+
+async def test_slice_agent_busy_retries_once_after_30s(tmp_path):
+    sleeps = Sleeps()
+    slicer = FakeSlicer(SliceOutcome("busy"), ok())
+    service, store, _ = job_service(tmp_path, slicer, sleep=sleeps)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    done = await service.slice_job(job.id)
+    assert sleeps.calls == [30.0]
+    assert len(slicer.requests) == 2
+    assert done.status == "sliced"
+    store.close()
+
+
+async def test_slice_agent_busy_twice_fails(tmp_path):
+    sleeps = Sleeps()
+    slicer = FakeSlicer(SliceOutcome("busy"))
+    service, store, notifier = job_service(tmp_path, slicer, sleep=sleeps)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    done = await service.slice_job(job.id)
+    assert sleeps.calls == [30.0] and len(slicer.requests) == 2
+    assert done.status == "slice_failed" and done.error == "slice-agent is busy with another slice"
+    await drain(service)
+    assert "занят" in notifier.sent[0]["text"]
+    store.close()
+
+
+async def test_slice_failure_detail_in_message(tmp_path):
+    detail = "plate 2 is not in the sliced file (bad_plate)"
+    slicer = FakeSlicer(SliceOutcome("failed", detail=detail))
+    service, store, notifier = job_service(tmp_path, slicer)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    done = await service.slice_job(job.id)
+    assert done.status == "slice_failed" and done.error == detail
+    assert done.sliced_file is None and done.result_json is None
+    await drain(service)
+    text = notifier.sent[0]["text"]
+    assert text.startswith("❌ Нарезка «lamp-arm» не удалась")
+    assert r"plate 2 is not in the sliced file (bad\_plate)" in text
+    store.close()
+
+
+async def test_unreachable_slice_agent_fails_without_retry(tmp_path):
+    slicer = FakeSlicer(SliceOutcome("unreachable", detail="ConnectError"))
+    sleeps = Sleeps()
+    service, store, notifier = job_service(tmp_path, slicer, sleep=sleeps)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    done = await service.slice_job(job.id)
+    assert done.status == "slice_failed" and len(slicer.requests) == 1 and sleeps.calls == []
+    await drain(service)
+    assert "не ответил" in notifier.sent[0]["text"]
+    store.close()
+
+
+async def test_damaged_stored_file_is_never_sliced(tmp_path):
+    slicer, waker = FakeSlicer(), FakeWaker()
+    service, store, notifier = job_service(tmp_path, slicer, waker)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    stored = jobs_module.job_dir(service._settings, job.id) / "lamp-arm.3mf"
+    stored.write_bytes(THREE_MF[:-1])
+    done = await service.slice_job(job.id)
+    assert done.status == "slice_failed" and done.error == "stored file is damaged, upload again"
+    assert waker.budgets == [] and slicer.requests == []
+    await drain(service)
+    assert "загрузи" in notifier.sent[0]["text"]
+    store.close()
+
+
+async def test_no_filament_preset_fails_before_waking(tmp_path):
+    waker = FakeWaker()
+    service, store, notifier = job_service(tmp_path, waker=waker)
+    add_spool(store, preset=None)
+    job = add_job(store, service._settings)
+    done = await service.slice_job(job.id)
+    assert done.status == "slice_failed" and "filament preset" in done.error
+    assert waker.budgets == []
+    await drain(service)
+    assert "пресет" in notifier.sent[0]["text"]
+    store.close()
+
+
+async def test_slicer_not_configured_fails(tmp_path):
+    service, store, _ = job_service(tmp_path, configured=False)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    done = await service.slice_job(job.id)
+    assert done.status == "slice_failed" and done.error == "slice-agent is not configured"
+    store.close()
+
+
+async def test_slice_job_refusals_leave_the_job_alone(tmp_path):
+    service, store, _ = job_service(tmp_path)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    with pytest.raises(KeyError):
+        await service.slice_job(999)
+    with pytest.raises(ValueError, match="wall_loops"):
+        await service.slice_job(job.id, {"wall_loops": 99})
+    assert store.job(job.id).status == "new"
+    store.update_job(job.id, status="slicing")
+    with pytest.raises(JobBusy):
+        await service.slice_job(job.id)
+    assert store.outbox_count() == 0
+    store.close()
+
+
+async def test_explicit_settings_win_and_are_stored(tmp_path):
+    slicer = FakeSlicer()
+    service, store, _ = job_service(tmp_path, slicer)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    done = await service.slice_job(job.id, {"wall_loops": 6, "curr_bed_type": "Cool Plate"})
+    req = slicer.requests[0]
+    assert req.overrides["wall_loops"] == 6 and req.plate_type == "Cool Plate"
+    assert json.loads(done.settings_json)["wall_loops"] == 6
+    assert json.loads(done.result_json)["plate_type"] == "Cool Plate"
+    store.close()
+
+
+async def test_default_plate_from_the_store(tmp_path):
+    slicer = FakeSlicer()
+    service, store, _ = job_service(tmp_path, slicer)
+    add_spool(store)
+    store.set_default_plate(store.add_plate("smooth", "Smooth PEI Plate"))
+    job = add_job(store, service._settings)
+    await service.slice_job(job.id)
+    assert slicer.requests[0].plate_type == "Smooth PEI Plate"
+    store.close()
+
+
+async def test_slice_press_starts_job_once(harness):
+    gate = asyncio.Event()
+    harness.slicer, harness.waker = FakeSlicer(gate=gate), FakeWaker()
+    harness.settings = job_settings(harness.settings.data_dir)
+    service = await harness.start()
+    service._state = replace(PrinterState.empty(), trays=TRAYS)
+    add_spool(harness.store)
+    job = add_job(harness.store, harness.settings)
+    queue = harness.notifier.press_queue
+
+    await queue.put(Press(1, "m7", f"job:{job.id}:slice", T0))
+    await until(lambda: len(harness.notifier.edits) == 1 and harness.slicer.requests)
+    assert harness.notifier.edits[0] == ("m7", "✂️ Режу «lamp-arm», пришлю результат")
+    assert harness.store.job(job.id).status == "slicing"
+
+    await queue.put(Press(2, "m7", f"job:{job.id}:slice", T0))
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert harness.notifier.edits[1] == ("m7", "Уже режу «lamp-arm»")
+    assert len(harness.slicer.requests) == 1
+
+    gate.set()
+    await until(lambda: harness.store.job(job.id).status == "sliced")
+    await until(lambda: harness.store.outbox_count() == 0)
+    assert harness.notifier.sent[-1]["text"].startswith("lamp-arm, пластина 1:")
+    assert len(harness.slicer.requests) == 1
+
+
+async def test_change_press_edits_the_message(harness):
+    await harness.start()
+    job = add_job(harness.store, harness.settings)
+    queue = harness.notifier.press_queue
+    for seq, button in enumerate(("job:999:change", "job:x:slice", f"job:{job.id}:print", "job:999:slice"), 1):
+        await queue.put(Press(seq, "m1", button, T0))
+    await queue.put(Press(9, "m3", f"job:{job.id}:change", T0))
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits == [("m3", CHANGE_TEXT)]
+    assert CHANGE_TEXT == "Скажи ассистенту, что поменять: стенки, заполнение, поддержки, пластину"
+    assert harness.store.job(job.id).status == "new"
+
+
+async def test_stuck_slicing_job_failed_at_startup(harness):
+    job = add_job(harness.store, harness.settings)
+    other = add_job(harness.store, harness.settings)
+    harness.store.update_job(job.id, status="slicing")
+    await harness.start()
+    await until(lambda: harness.store.outbox_count() == 0 and harness.notifier.sent)
+    stuck = harness.store.job(job.id)
+    assert stuck.status == "slice_failed" and stuck.error == "interrupted by a service restart"
+    assert harness.store.job(other.id).status == "new"
+    assert len(harness.notifier.sent) == 1
+    assert "прервано перезапуском" in harness.notifier.sent[0]["text"]
+
+
+async def test_stop_while_slicing_marks_the_job_failed(harness):
+    harness.slicer, harness.waker = FakeSlicer(gate=asyncio.Event()), FakeWaker()
+    service = await harness.start()
+    service._state = replace(PrinterState.empty(), trays=TRAYS)
+    add_spool(harness.store)
+    job = add_job(harness.store, harness.settings)
+    await harness.notifier.press_queue.put(Press(1, "m7", f"job:{job.id}:slice", T0))
+    await until(lambda: harness.slicer.requests)
+    await harness.stop()
+    stopped = harness.store.job(job.id)
+    assert stopped.status == "slice_failed" and stopped.error == "interrupted by a service stop"
+
+
+async def test_build_slicer(tmp_path, caplog):
+    from bambu_mcp.service import build_slicer
+    from bambu_mcp.slicer import GatewayWaker, SliceClient
+
+    async with httpx.AsyncClient() as http:
+        with caplog.at_level(logging.WARNING, logger="bambu_mcp.service"):
+            assert build_slicer(SECRETS, Settings(data_dir=tmp_path), http) == (None, None)
+        full = Secrets(**{**SECRETS.__dict__, "gateway_key": "gw-key", "slice_agent_token": "agent-token"})
+        settings = Settings(
+            data_dir=tmp_path, gateway_url="http://192.168.88.11:8780", slice_agent_url="http://192.168.88.20:11436"
+        )
+        client, waker = build_slicer(full, settings, http)
+        assert isinstance(client, SliceClient) and isinstance(waker, GatewayWaker)
+    assert "jobs cannot be sliced" in caplog.text
+    assert "agent-token" not in caplog.text
