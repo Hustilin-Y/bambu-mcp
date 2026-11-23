@@ -13,7 +13,9 @@ EXPECTED_MODEL = "Bambu Lab P2S"
 EXPECTED_BED = (256, 256)
 MAX_XML_BYTES = 1024 * 1024
 MAX_MEMBER_BYTES = 50 * 1024 * 1024
+MAX_PNG_BYTES = 10 * 1024 * 1024
 SLICE_INFO = "Metadata/slice_info.config"
+VERSION_KEY = "X-BBL-Client-Version"
 PROJECT_SETTINGS = "Metadata/project_settings.config"
 
 
@@ -36,6 +38,7 @@ class SliceResult:
     nozzle: str
     bed_xy: tuple[int, int]
     gcode_missing: tuple[int, ...] = field(default_factory=tuple)
+    slicer_version: str = ""
 
 
 def _read(z: zipfile.ZipFile, name: str, limit: int = MAX_MEMBER_BYTES) -> bytes | None:
@@ -65,11 +68,21 @@ def _bed(area: object) -> tuple[int, int]:
         raise OutputError("project_settings.config: bad printable_area") from None
 
 
-def _plates(xml: bytes) -> list[tuple[int, float, dict[str, float]]]:
-    try:
-        root = ET.fromstring(xml)
-    except ET.ParseError as e:
-        raise OutputError(f"{SLICE_INFO}: not valid XML ({e})") from None
+def _grams(value: object) -> float:
+    grams = float(value)  # type: ignore[arg-type]
+    if not math.isfinite(grams) or grams < 0:
+        raise ValueError("bad used_g")
+    return grams
+
+
+def _version(root: ET.Element) -> str:
+    for item in root.iter("header_item"):
+        if item.get("key") == VERSION_KEY:
+            return str(item.get("value", ""))[:64]
+    return ""
+
+
+def _plates(root: ET.Element) -> list[tuple[int, float, dict[str, float]]]:
     out = []
     for el in root.iter("plate"):
         meta = {m.get("key"): m.get("value") for m in el.findall("metadata")}
@@ -78,9 +91,9 @@ def _plates(xml: bytes) -> list[tuple[int, float, dict[str, float]]]:
             seconds = float(meta["prediction"])
             if not math.isfinite(seconds) or seconds < 0:
                 raise ValueError("bad prediction")
-            grams = {f.get("id", str(i + 1)): float(f.get("used_g", 0)) for i, f in enumerate(el.findall("filament"))}
-        except (KeyError, TypeError, ValueError):
-            raise OutputError(f"{SLICE_INFO}: plate without index or prediction") from None
+            grams = {f.get("id", str(i + 1)): _grams(f.get("used_g", 0)) for i, f in enumerate(el.findall("filament"))}
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise OutputError(f"{SLICE_INFO}: plate without index or prediction, or bad used_g") from None
         out.append((idx, seconds / 60, grams))
     if not out:
         raise OutputError(f"{SLICE_INFO}: no plates")
@@ -102,11 +115,15 @@ def read_output(path: Path, plate: int) -> SliceResult:
             raise OutputError(f"{PROJECT_SETTINGS} missing")
         try:
             settings = json.loads(settings_raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             raise OutputError(f"{PROJECT_SETTINGS}: not valid JSON") from None
         if not isinstance(settings, dict):
             raise OutputError(f"{PROJECT_SETTINGS}: not a JSON object")
-        parsed = _plates(info)
+        try:
+            root = ET.fromstring(info)
+        except ET.ParseError as e:
+            raise OutputError(f"{SLICE_INFO}: not valid XML ({e})") from None
+        parsed = _plates(root)
         names = set(z.namelist())
         wanted = {i for i, _, _ in parsed} | {plate}
         missing = tuple(sorted(i for i in wanted if f"Metadata/plate_{i}.gcode" not in names))
@@ -120,7 +137,21 @@ def read_output(path: Path, plate: int) -> SliceResult:
         nozzle=str(nozzles[0]),
         bed_xy=_bed(settings.get("printable_area")),
         gcode_missing=missing,
+        slicer_version=_version(root),
     )
+
+
+def read_plate_png(path: Path, plate: int) -> bytes | None:
+    """The plate preview PNG inside a sliced file, or None if the file has none for that plate."""
+    try:
+        z = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError) as e:
+        raise OutputError(f"cannot open sliced file: {e}") from None
+    with z:
+        try:
+            return _read(z, f"Metadata/plate_{int(plate)}.png", MAX_PNG_BYTES)
+        except (zipfile.BadZipFile, OSError, RuntimeError, EOFError) as e:
+            raise OutputError(f"cannot read plate {plate} preview: {type(e).__name__}") from None
 
 
 def check_output(result: SliceResult, nozzle: str) -> None:

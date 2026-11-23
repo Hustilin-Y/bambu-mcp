@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,7 +80,7 @@ class Overrides:
         return out
 
 
-def _check_out_name(name: str) -> None:
+def check_out_name(name: str) -> None:
     if not _OUT_NAME_RE.fullmatch(name) or name[-1] in ". ":
         raise ValueError(f"invalid out_name: {name!r}")
     if _RESERVED.fullmatch(name.split(".", 1)[0]):
@@ -100,7 +101,7 @@ def build_command(
     out_dir: Path | None = None,
 ) -> list[str]:
     """argv for the Studio CLI. Names are checked against the config before they reach a path."""
-    _check_out_name(out_name)
+    check_out_name(out_name)
     if nozzle not in cfg.machine:
         raise ValueError(f"unknown nozzle: {nozzle!r}")
     if process_set not in cfg.process_sets:
@@ -151,12 +152,19 @@ def _popen_flags() -> dict:
     return {"start_new_session": True}
 
 
+def taskkill_exe(env: Mapping[str, str] | None = None) -> str:
+    """taskkill by absolute path so a planted taskkill.exe on PATH or in the cwd is never run."""
+    env = os.environ if env is None else env
+    root = env.get("SystemRoot")
+    return str(Path(root) / "System32" / "taskkill.exe") if root else "taskkill"
+
+
 def kill_tree(proc) -> None:
     """Kill the process and everything it spawned. Fixed argv, no shell."""
     try:
         if sys.platform == "win32":
             subprocess.run(
-                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                [taskkill_exe(), "/T", "/F", "/PID", str(proc.pid)],
                 capture_output=True, timeout=_KILL_WAIT_S, shell=False, check=False,
             )
         else:
@@ -175,7 +183,7 @@ def _result_json(path: Path) -> tuple[int | None, str]:
         if not isinstance(data, dict):
             return None, ""
         return int(data["return_code"]), str(data.get("error_string", ""))
-    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+    except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
         return None, ""
 
 
@@ -209,9 +217,9 @@ def run_slice(
             return SliceRun(-1, f"slice timed out after {timeout_s} s", _tail_file(log), timed_out=True)
     code, err = _result_json(result_file)
     exit_code = proc.returncode
-    if code is None or code == 0:
-        code = exit_code if exit_code else (code or 0)  # nonzero exit wins over a result.json saying 0
-    return SliceRun(code, err, _tail_file(log))
+    if exit_code and not code:  # nonzero exit wins over a missing result.json or one saying 0
+        code, err = exit_code, f"exit code {exit_code}"
+    return SliceRun(code or 0, err, _tail_file(log))
 
 
 def slice_isolated(

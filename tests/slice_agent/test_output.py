@@ -158,3 +158,28 @@ def test_non_finite_prediction_refused(tmp_path):
         z.writestr("Metadata/project_settings.config", "{}")
     with pytest.raises(OutputError):
         read_output(path, plate=1)
+
+
+def test_deeply_nested_project_settings_refused(tmp_path):
+    with pytest.raises(OutputError):
+        read_output(_with_settings(tmp_path, "[" * 100000 + "]" * 100000), plate=1)
+
+
+@pytest.mark.parametrize("grams", ["nan", "inf", "-inf", "-1"])
+def test_non_finite_or_negative_used_g_refused(tmp_path, grams):
+    path = make_3mf(tmp_path / "g.gcode.3mf", plates=((1, 600, grams),))
+    with pytest.raises(OutputError):
+        read_output(path, plate=1)
+
+
+def test_slicer_version_from_header(tmp_path):
+    assert read_output(make_3mf(tmp_path / "a.gcode.3mf"), plate=1).slicer_version == ""
+    path = tmp_path / "v.gcode.3mf"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(
+            "Metadata/slice_info.config",
+            slice_info().replace('key="X" value="y"', 'key="X-BBL-Client-Version" value="02.08.02.61"'),
+        )
+        z.writestr("Metadata/project_settings.config", json.dumps({"nozzle_diameter": ["0.4"], "printable_area": ["0x0"]}))
+        z.writestr("Metadata/plate_1.gcode", "G1")
+    assert read_output(path, plate=1).slicer_version == "02.08.02.61"

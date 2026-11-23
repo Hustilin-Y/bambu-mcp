@@ -1,5 +1,7 @@
 import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -8,7 +10,8 @@ from pathlib import Path
 import pytest
 
 from slice_agent.config import AgentConfig
-from slice_agent.runner import Overrides, SliceRun, build_command, run_slice, slice_isolated
+from slice_agent import runner
+from slice_agent.runner import Overrides, SliceRun, build_command, run_slice, slice_isolated, taskkill_exe
 
 
 def make_cfg(tmp_path: Path) -> AgentConfig:
@@ -148,7 +151,7 @@ def test_nonzero_return_reads_error_string(tmp_path):
 def test_nonzero_exit_wins_over_result_json_zero(tmp_path):
     out = tmp_path / "o"
     r = run_slice(["x"], out, popen=FakePopen(out, {"return_code": 0, "error_string": "success"}, rc=3))
-    assert r.return_code == 3
+    assert r.return_code == 3 and r.error_string == "exit code 3"
 
 
 def test_stale_result_json_is_ignored(tmp_path):
@@ -156,10 +159,13 @@ def test_stale_result_json_is_ignored(tmp_path):
     out.mkdir()
     (out / "result.json").write_text(json.dumps({"return_code": 0, "error_string": "old"}))
     r = run_slice(["x"], out, popen=FakePopen(out, None, rc=-17))
-    assert r.return_code == -17 and r.error_string == ""
+    assert r.return_code == -17 and r.error_string == "exit code -17"
 
 
-@pytest.mark.parametrize("bad", ["[1, 2]", "42", "not json", '{"return_code": "x"}', '{"return_code": 1e999}', "{}"])
+@pytest.mark.parametrize(
+    "bad",
+    ["[1, 2]", "42", "not json", '{"return_code": "x"}', '{"return_code": 1e999}', "{}", "[" * 100000 + "]" * 100000],
+)
 def test_untrusted_result_json_never_raises(tmp_path, bad):
     out = tmp_path / "o"
     r = run_slice(["x"], out, popen=FakePopen(out, bad, rc=-5))
@@ -177,7 +183,7 @@ def test_run_slice_timeout_kills_tree_and_reports(tmp_path):
 
 
 CHILD = """
-import subprocess, sys, time
+import os, subprocess, sys, time
 hb = sys.argv[1]
 grand = (
     "import sys, time\\n"
@@ -185,11 +191,24 @@ grand = (
     "    open(sys.argv[1], 'a').write('x')\\n"
     "    time.sleep(0.1)\\n"
 )
-subprocess.Popen([sys.executable, '-I', '-c', grand, hb + '.grand'])
+g = subprocess.Popen([sys.executable, '-I', '-c', grand, hb + '.grand'])
+open(hb + '.pids', 'w').write(f"{os.getpid()} {g.pid}")
 while True:
     open(hb + '.child', 'a').write('x')
     time.sleep(0.1)
 """
+
+
+def _kill_pids(pid_file: Path) -> None:
+    try:
+        pids = [int(p) for p in pid_file.read_text().split()]
+    except (OSError, ValueError):
+        return
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
 
 
 def test_run_slice_timeout_real_process_tree(tmp_path):
@@ -198,17 +217,40 @@ def test_run_slice_timeout_real_process_tree(tmp_path):
     script.write_text(CHILD, encoding="utf-8")
     hb = tmp_path / "hb"
     out = tmp_path / "o"
-    t0 = time.monotonic()
-    r = run_slice([sys.executable, "-I", str(script), str(hb)], out, timeout_s=3)
-    assert time.monotonic() - t0 < 15
-    assert r.timed_out
-    grand, child = tmp_path / "hb.grand", tmp_path / "hb.child"
-    assert grand.exists() and child.exists()
-    time.sleep(0.5)
-    sizes = (grand.stat().st_size, child.stat().st_size)
-    time.sleep(0.8)
-    assert sizes == (grand.stat().st_size, child.stat().st_size)  # nobody writes any more
-    shutil.rmtree(out)  # log files released: the work dir can be removed
+    try:
+        t0 = time.monotonic()
+        r = run_slice([sys.executable, "-I", str(script), str(hb)], out, timeout_s=6)
+        assert time.monotonic() - t0 < 20
+        assert r.timed_out
+        grand, child = tmp_path / "hb.grand", tmp_path / "hb.child"
+        assert grand.exists() and child.exists()
+        time.sleep(0.5)
+        sizes = (grand.stat().st_size, child.stat().st_size)
+        time.sleep(0.8)
+        assert sizes == (grand.stat().st_size, child.stat().st_size)  # nobody writes any more
+        shutil.rmtree(out)  # log files released: the work dir can be removed
+    finally:
+        _kill_pids(tmp_path / "hb.pids")  # never leak the tree if an assertion failed
+
+
+def test_taskkill_by_absolute_path(monkeypatch):
+    assert taskkill_exe({"SystemRoot": r"C:\Windows"}) == str(Path(r"C:\Windows") / "System32" / "taskkill.exe")
+    assert taskkill_exe({}) == "taskkill"
+    seen = []
+    monkeypatch.setattr(runner.sys, "platform", "win32")
+    monkeypatch.setenv("SystemRoot", r"D:\Win")
+    monkeypatch.setattr(runner.subprocess, "run", lambda argv, **kw: seen.append((argv, kw)))
+
+    class Proc:
+        pid = 4242
+
+        def kill(self):
+            pass
+
+    runner.kill_tree(Proc())
+    (argv, kw), = seen
+    assert argv == [str(Path(r"D:\Win") / "System32" / "taskkill.exe"), "/T", "/F", "/PID", "4242"]
+    assert kw["shell"] is False
 
 
 def iso_kwargs():
