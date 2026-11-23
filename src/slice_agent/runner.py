@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ from slice_agent.config import AgentConfig
 from slice_agent.profiles import _slug
 
 DEFAULT_TIMEOUT_S = 300
+OUT_SUFFIX = ".gcode.3mf"
 PLATE_TYPES = ("Textured PEI Plate", "Cool Plate", "Engineering Plate", "High Temp Plate", "Smooth PEI Plate")
 LAYER_HEIGHTS = {"0.4": (0.12, 0.16, 0.20, 0.24, 0.28)}
 _OUT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -90,6 +92,7 @@ def build_command(
     plate_type: str,
     kit: bool,
     overrides: Overrides,
+    out_dir: Path | None = None,
 ) -> list[str]:
     """argv for the Studio CLI. Names are checked against the config before they reach a path."""
     _check_out_name(out_name)
@@ -112,8 +115,8 @@ def build_command(
         "--load-settings", f"{prof / f'machine-{nozzle}.json'};{prof / f'process-{process_set}.json'}",
         "--load-filaments", str(prof / f"filament-{_slug(filament)}.json"),
         *overrides.args(),
-        "--export-3mf", out_name,
-        "--outputdir", str(cfg.sliced_dir),
+        "--export-3mf", f"{out_name}{OUT_SUFFIX}",  # the CLI adds no extension
+        "--outputdir", str(out_dir or cfg.sliced_dir),
         str(input_3mf),
     ]
 
@@ -146,3 +149,31 @@ def run_slice(cmd: list[str], out_dir: Path, timeout_s: int = DEFAULT_TIMEOUT_S,
     except (OSError, ValueError, TypeError):
         pass
     return SliceRun(code, err, _tail(proc.stdout, proc.stderr))
+
+
+def slice_isolated(
+    cfg: AgentConfig,
+    *,
+    out_name: str,
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+    runner=subprocess.run,
+    **build_kwargs,
+) -> tuple[SliceRun, Path | None]:
+    """Slice in a temporary work dir under sliced_dir, move only the .gcode.3mf out on success.
+
+    Returns (run, final_path). The work dir (plate gcode, result.json) is always removed.
+    """
+    work = cfg.sliced_dir / f".work-{out_name}"
+    cmd = build_command(cfg, out_name=out_name, out_dir=work, **build_kwargs)  # validates out_name first
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    try:
+        run = run_slice(cmd, work, timeout_s, runner)
+        produced = work / f"{out_name}{OUT_SUFFIX}"
+        if run.return_code != 0 or not produced.is_file():
+            return run, None
+        final = cfg.sliced_dir / produced.name
+        produced.replace(final)
+        return run, final
+    finally:
+        shutil.rmtree(work, ignore_errors=True)

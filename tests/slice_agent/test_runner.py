@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from slice_agent.config import AgentConfig
-from slice_agent.runner import Overrides, SliceRun, build_command, run_slice
+from slice_agent.runner import Overrides, SliceRun, build_command, run_slice, slice_isolated
 
 
 def make_cfg(tmp_path: Path) -> AgentConfig:
@@ -68,7 +68,7 @@ def test_build_command_matches_recipe(tmp_path):
         "--curr-bed-type", "Textured PEI Plate",
         "--load-settings", f"{prof / 'machine-0.4.json'};{prof / 'process-standard.json'}",
         "--load-filaments", str(prof / "filament-generic-petg-bbl-p2s.json"),
-        "--export-3mf", "part-j1-p1", "--outputdir", str(cfg.sliced_dir), str(Path("C:/in/part.3mf")),
+        "--export-3mf", "part-j1-p1.gcode.3mf", "--outputdir", str(cfg.sliced_dir), str(Path("C:/in/part.3mf")),
     ]
     kit = cmd(cfg, kit=True, out_name="k-j1-kit", overrides=Overrides.parse({"wall_loops": 4}, "0.4"))
     assert kit[kit.index("--arrange") + 1] == "0"
@@ -143,3 +143,42 @@ def test_run_slice_timeout_kills_and_reports(tmp_path):
     assert r.timed_out is True and r.return_code != 0
     assert "timed out after 7" in r.error_string
     assert "line2" in r.log_tail
+
+
+def iso_kwargs():
+    return dict(
+        input_3mf=Path("C:/in/part.3mf"), nozzle="0.4", process_set="standard",
+        filament="Generic PETG @BBL P2S", plate_type="Textured PEI Plate", kit=False,
+        overrides=Overrides.parse({}, "0.4"),
+    )
+
+
+def isolated_runner(write_output=True, result=None, raise_timeout=False):
+    def run(argv, **kw):
+        out = Path(argv[argv.index("--outputdir") + 1])
+        assert out.name == ".work-part-j1-p1" and argv[argv.index("--export-3mf") + 1] == "part-j1-p1.gcode.3mf"
+        (out / "plate_1.gcode").write_text("G1")
+        (out / "result.json").write_text(json.dumps(result or {"return_code": 0, "error_string": "success"}))
+        if write_output:
+            (out / "part-j1-p1.gcode.3mf").write_bytes(b"zip")
+        if raise_timeout:
+            raise subprocess.TimeoutExpired(argv, 1)
+        return Done(0)
+
+    return run
+
+
+def test_slice_isolated_success_leaves_only_output(tmp_path):
+    cfg = make_cfg(tmp_path)
+    run, final = slice_isolated(cfg, out_name="part-j1-p1", runner=isolated_runner(), **iso_kwargs())
+    assert run.return_code == 0 and final == cfg.sliced_dir / "part-j1-p1.gcode.3mf"
+    assert [p.name for p in cfg.sliced_dir.iterdir()] == ["part-j1-p1.gcode.3mf"]
+
+
+def test_slice_isolated_failure_and_timeout_clean_up(tmp_path):
+    cfg = make_cfg(tmp_path)
+    bad = {"return_code": -50, "error_string": "outside"}
+    run, final = slice_isolated(cfg, out_name="part-j1-p1", runner=isolated_runner(False, bad), **iso_kwargs())
+    assert final is None and run.error_string == "outside" and list(cfg.sliced_dir.iterdir()) == []
+    run, final = slice_isolated(cfg, out_name="part-j1-p1", runner=isolated_runner(raise_timeout=True), **iso_kwargs())
+    assert final is None and run.timed_out and list(cfg.sliced_dir.iterdir()) == []
