@@ -445,6 +445,19 @@ def _bind(listen: list[tuple[str, int]]) -> list[socket.socket]:
     return sockets
 
 
+class _StartupFailed(RuntimeError):
+    """uvicorn called sys.exit() (failed lifespan startup or bind)."""
+
+
+async def _run(server: uvicorn.Server, sockets: list[socket.socket]) -> None:
+    # SystemExit must not leave this task: asyncio re-raises it out of the event
+    # loop, which would stop the whole service, not just the MCP server.
+    try:
+        await server.serve(sockets=sockets)
+    except SystemExit as exc:
+        raise _StartupFailed(f"uvicorn exited with status {exc.code}") from exc
+
+
 async def serve(
     service: StatusSource, store: Store, secrets: Secrets, settings: Settings
 ) -> None:
@@ -469,7 +482,7 @@ async def serve(
         ", ".join(str(s.getsockname()[:2]) for s in sockets),
         ", ".join(sorted(secrets.client_tokens)),
     )
-    task = asyncio.ensure_future(server.serve(sockets=sockets))
+    task = asyncio.ensure_future(_run(server, sockets))
     try:
         await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -477,8 +490,7 @@ async def serve(
         with contextlib.suppress(Exception):
             await task
         raise
-    except SystemExit:
-        # uvicorn exits on a failed app startup; keep the monitoring service alive.
+    except _StartupFailed:
         log.error("MCP server failed to start, the service keeps running without it")
     except Exception:
         log.exception("MCP server crashed, the service keeps running without it")

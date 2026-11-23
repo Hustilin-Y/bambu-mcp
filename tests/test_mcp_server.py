@@ -418,3 +418,37 @@ async def test_serve_logs_uvicorn_crash(tmp_path, monkeypatch, caplog):
     store.close()
     assert "MCP server crashed" in caplog.text
     assert sock.closed
+
+
+async def test_serve_startup_exit_does_not_stop_the_loop(tmp_path, monkeypatch, caplog):
+    import asyncio
+    import sys
+
+    from bambu_mcp import mcp_server
+
+    sock = _FakeSocket()
+    monkeypatch.setattr(mcp_server, "_bind", lambda listen: [sock])
+
+    async def exit_on_startup(self, sockets=None):
+        await asyncio.sleep(0)
+        sys.exit(3)  # what uvicorn does when the lifespan or a bind fails
+
+    monkeypatch.setattr(mcp_server._Server, "serve", exit_on_startup)
+    ticks = 0
+
+    async def other_task():
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    other = asyncio.ensure_future(other_task())
+    store = Store(tmp_path / "bambu.db")
+    await mcp_server.serve(FakeService(), store, SECRETS, Settings(data_dir=tmp_path))
+    before = ticks
+    await asyncio.sleep(0.05)
+    assert ticks > before and not other.done()  # the loop and its other tasks survive
+    other.cancel()
+    store.close()
+    assert "MCP server failed to start" in caplog.text
+    assert sock.closed
