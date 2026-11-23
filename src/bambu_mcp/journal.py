@@ -1,0 +1,151 @@
+"""Print journal: one row per print, opened and closed from events, updated from presses."""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
+
+from bambu_mcp.config import Settings
+from bambu_mcp.cost import CostLine, power_cost, print_kwh
+from bambu_mcp.events import Event, EventKind
+from bambu_mcp.messages import post_print_buttons
+from bambu_mcp.notify import Press
+from bambu_mcp.store.db import Store
+from bambu_mcp.store.models import PrintRow
+
+log = logging.getLogger(__name__)
+
+TERMINAL_KINDS = frozenset({EventKind.FINISHED, EventKind.FAILED, EventKind.CANCELLED})
+FIT_VALUES = frozenset({"ok", "tight", "loose", "failed"})
+DEFAULT_MATERIAL = "PLA"
+NO_SPOOL = "none"
+
+Slot = tuple[int, int]  # (AMS unit, slot in the unit)
+
+
+def _utc(at: datetime) -> datetime:
+    if at.tzinfo is None:
+        raise ValueError("journal timestamps must be timezone-aware")
+    return at.astimezone(UTC)
+
+
+def spool_label(brand: str, material: str, color_name: str) -> str:
+    return f"{brand} {material} {color_name}"
+
+
+class Journal:
+    def __init__(self, store: Store, settings: Settings) -> None:
+        self._store = store
+        self._settings = settings
+        self._tz = ZoneInfo(settings.timezone)
+
+    # -- events --------------------------------------------------------------
+
+    def on_event(self, event: Event, slot: Slot | None = None) -> int | None:
+        """Open a row on ``started``, close it on a terminal event. Returns the row id.
+
+        ``slot`` is the AMS slot the print fed from, if known: its mapped spool is
+        recorded on the row and its material picks the average power.
+        """
+        if event.kind is EventKind.STARTED:
+            return self._open(event)
+        if event.kind in TERMINAL_KINDS:
+            return self._close(event, slot)
+        return None
+
+    def _open(self, event: Event) -> int:
+        row = self._store.print_by_identity(event.identity)
+        if row is not None and row.ended_at is None:
+            return row.id  # already open (dedupe key expired, or a repeated start)
+        return self._store.open_print(event.identity, _utc(event.at), "external")
+
+    def _close(self, event: Event, slot: Slot | None) -> int | None:
+        row = self._store.print_by_identity(event.identity)
+        if row is None:
+            log.warning("no journal row for a %s print, not recorded", event.kind)
+            return None
+        if row.ended_at is not None:
+            return row.id
+        ended = _utc(event.at)
+        started = _utc(row.started_at)
+        minutes = max((ended - started).total_seconds() / 60, 0.0)
+        self._store.close_print(row.id, str(event.kind), ended, minutes)
+
+        spool = self._store.slot_spool(*slot) if slot is not None else None
+        material = DEFAULT_MATERIAL
+        if spool is not None:
+            material = spool.material
+        elif slot is not None:
+            tray = next((t for t in event.state.trays if (t.ams, t.slot) == slot), None)
+            if tray is not None and tray.tray_type:
+                material = tray.tray_type
+        kwh = print_kwh(minutes, material, self._settings)
+        tariff = self._store.tariff_on(started.astimezone(self._tz).date())
+        fields: dict = {
+            "kwh": kwh,
+            "cost_power_uah": power_cost(started, max(ended, started), kwh, tariff, self._settings),
+        }
+        if spool is not None and row.spool_id is None:
+            fields["spool_id"] = spool.id
+        self._store.set_print_fields(row.id, **fields)
+        return row.id
+
+    def cost_line(self, row: PrintRow) -> CostLine | None:
+        """Power cost of a closed row as computed at close (filament unknown in phase 1)."""
+        if row.kwh is None or row.cost_power_uah is None:
+            return None
+        tariff = self._store.tariff_on(_utc(row.started_at).astimezone(self._tz).date())
+        return CostLine(filament_uah=None, power_uah=row.cost_power_uah, kwh=row.kwh, tariff=tariff)
+
+    # -- presses -------------------------------------------------------------
+
+    def on_press(self, press: Press) -> str | None:
+        """Apply a ``fit:`` or ``spool:`` press. Returns the new message text, or None."""
+        kind, sep, rest = press.button_id.partition(":")
+        raw_id, sep2, value = rest.partition(":")
+        if not sep or not sep2:
+            return None
+        try:
+            print_id = int(raw_id)
+        except ValueError:
+            return None
+        if kind == "fit":
+            return self._fit(print_id, value)
+        if kind == "spool":
+            return self._spool(print_id, value)
+        return None
+
+    def _fit(self, print_id: int, value: str) -> str | None:
+        if value not in FIT_VALUES:
+            return None
+        try:
+            self._store.set_print_fields(print_id, fit=value)
+        except KeyError:
+            log.warning("fit press for unknown print %d ignored", print_id)
+            return None
+        labels = {b.id: b.text for row in post_print_buttons(print_id) for b in row}
+        return f"Посадка: {labels[f'fit:{print_id}:{value}']}"
+
+    def _spool(self, print_id: int, value: str) -> str | None:
+        if value == NO_SPOOL:
+            try:
+                self._store.set_print_fields(print_id, spool_id=None)
+            except KeyError:
+                log.warning("spool press for unknown print %d ignored", print_id)
+                return None
+            return "Катушка: не списывать"
+        try:
+            spool_id = int(value)
+        except ValueError:
+            return None
+        spool = next((s for s in self._store.spools(active_only=False) if s.id == spool_id), None)
+        if spool is None:
+            log.warning("spool press for unknown spool %d ignored", spool_id)
+            return None
+        try:
+            self._store.set_print_fields(print_id, spool_id=spool_id)
+        except KeyError:
+            log.warning("spool press for unknown print %d ignored", print_id)
+            return None
+        return f"Катушка: {spool_label(spool.brand, spool.material, spool.color_name)}"
