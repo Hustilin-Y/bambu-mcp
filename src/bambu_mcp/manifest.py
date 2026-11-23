@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,11 @@ INFILL_PATTERNS = (
 )
 CHECK_BOOLS = ("failed", "overhang_warn", "base_warn", "supports_suggested")
 CHECK_INTS = ("islands", "bodies_above_bed")
+MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_PLATES = 50
+MAX_OBJECTS = 200
+MAX_NUMBER = 1e9
+NAME_RE = re.compile(r"[A-Za-z0-9._ -]{1,100}")
 
 
 class ManifestError(ValueError):
@@ -31,7 +37,12 @@ def _is_int(v: object) -> bool:
 
 
 def _is_num(v: object) -> bool:
-    return isinstance(v, int | float) and not isinstance(v, bool) and math.isfinite(v)
+    if not isinstance(v, int | float) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(v) and abs(v) <= MAX_NUMBER
+    except OverflowError:
+        return False
 
 
 HINT_VALIDATORS = {
@@ -133,6 +144,8 @@ def _plate(
     objects = _need(data, "objects", where)
     if not isinstance(objects, list) or not objects or not all(isinstance(o, dict) for o in objects):
         raise ManifestError(f"{where}: objects must be a non-empty list of objects")
+    if len(objects) > MAX_OBJECTS:
+        raise ManifestError(f"{where}: too many objects (max {MAX_OBJECTS})")
     checks = _checks(data["checks"], where) if "checks" in data else top_checks
     hints = _hints(data["hints"], where) if "hints" in data else top_hints
     grams = _estimate(data, where)
@@ -165,17 +178,11 @@ def parse_manifest(data: object) -> Manifest:
     if kind not in ("part", "kit"):
         raise ManifestError(f"manifest kind must be 'part' or 'kit', got {kind!r}")
     name = _need(root, "name")
-    if not isinstance(name, str) or not name.strip():
-        raise ManifestError("manifest name must be a non-empty string")
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name.startswith(".") or not name.strip():
+        raise ManifestError("manifest name must be 1..100 characters of A-Z a-z 0-9 . _ - space, not starting with a dot")
     file = _need(root, "file")
-    if (
-        not isinstance(file, str)
-        or file != Path(file).name
-        or "\\" in file
-        or "/" in file
-        or file.startswith(".")
-    ):
-        raise ManifestError("manifest file must be a bare file name")
+    if not isinstance(file, str) or not NAME_RE.fullmatch(file) or file.startswith("."):
+        raise ManifestError("manifest file must be a bare file name (1..100 characters of A-Z a-z 0-9 . _ - space)")
     sha = _need(root, "file_sha256")
     if not isinstance(sha, str) or len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha.lower()):
         raise ManifestError("manifest file_sha256 must be 64 hex characters")
@@ -195,6 +202,8 @@ def parse_manifest(data: object) -> Manifest:
     raw_plates = _need(root, "plates")
     if not isinstance(raw_plates, list) or not raw_plates:
         raise ManifestError("manifest plates must be a non-empty list")
+    if len(raw_plates) > MAX_PLATES:
+        raise ManifestError(f"manifest has too many plates (max {MAX_PLATES})")
     if kind == "part" and len(raw_plates) != 1:
         raise ManifestError("a part manifest must have exactly one plate")
 
@@ -228,12 +237,16 @@ def parse_manifest(data: object) -> Manifest:
 def load_manifest(path: Path) -> Manifest:
     p = Path(path)
     try:
-        text = p.read_text(encoding="utf-8")
+        with p.open("rb") as fh:
+            raw = fh.read(MAX_MANIFEST_BYTES + 1)
+        if len(raw) > MAX_MANIFEST_BYTES:
+            raise ManifestError(f"manifest {p.name} is too large (max {MAX_MANIFEST_BYTES} bytes)")
+        text = raw.decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise ManifestError(f"cannot read manifest {p.name}: {type(exc).__name__}") from None
     try:
         data = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise ManifestError(f"manifest {p.name} is not valid JSON") from None
     return parse_manifest(data)
 

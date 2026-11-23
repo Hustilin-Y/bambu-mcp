@@ -90,3 +90,72 @@ def test_unreadable_or_non_json(tmp_path):
 def test_file_name_must_be_bare(tmp_path):
     with pytest.raises(ManifestError, match="file"):
         load_manifest(_mutated(tmp_path, "part.print.json", file="../evil.3mf"))
+
+
+def _raw(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "raw.print.json"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _part(**changes) -> dict:
+    data = json.loads((FIX / "part.print.json").read_text(encoding="utf-8"))
+    data.update(changes)
+    return data
+
+
+def test_deeply_nested_json_is_manifest_error(tmp_path):
+    with pytest.raises(ManifestError):
+        load_manifest(_raw(tmp_path, "[" * 100000))
+
+
+def test_huge_numbers_are_manifest_error(tmp_path):
+    big = 10**400
+    bad_profile = {"material": "PETG", "nozzle_mm": big}
+    with pytest.raises(ManifestError):
+        load_manifest(_raw(tmp_path, json.dumps(_part(profile=bad_profile))))
+    with pytest.raises(ManifestError):
+        load_manifest(_raw(tmp_path, json.dumps(_part(estimate={"grams": big}))))
+
+
+def test_oversized_manifest_rejected(tmp_path):
+    with pytest.raises(ManifestError, match="large"):
+        load_manifest(_raw(tmp_path, json.dumps(_part(pad="x" * (1024 * 1024)))))
+
+
+def test_name_and_file_length_caps(tmp_path):
+    with pytest.raises(ManifestError, match="name"):
+        load_manifest(_raw(tmp_path, json.dumps(_part(name="a" * 101))))
+    with pytest.raises(ManifestError, match="file"):
+        load_manifest(_raw(tmp_path, json.dumps(_part(file="a" * 101 + ".3mf"))))
+
+
+def test_plate_and_object_count_caps(tmp_path):
+    obj = {"name": "o", "bbox_mm": [1, 1, 1], "volume_mm3": 1.0}
+    many_plates = [{"index": i + 1, "objects": [obj]} for i in range(51)]
+    kit = json.loads((FIX / "kit.print.json").read_text(encoding="utf-8"))
+    kit["plates"] = [dict(p, estimate={"grams": 1}) for p in many_plates]
+    with pytest.raises(ManifestError, match="plates"):
+        load_manifest(_raw(tmp_path, json.dumps(kit)))
+    kit["plates"] = [{"index": 1, "objects": [obj] * 201, "estimate": {"grams": 1}}]
+    with pytest.raises(ManifestError, match="objects"):
+        load_manifest(_raw(tmp_path, json.dumps(kit)))
+
+
+@pytest.mark.parametrize(
+    "name", ["../../evil", "a/b", "a\b", "a\x00b", ".hidden", "", "caf\u00e9", "a\nb"]
+)
+def test_unsafe_name_rejected(tmp_path, name):
+    with pytest.raises(ManifestError, match="name"):
+        load_manifest(_raw(tmp_path, json.dumps(_part(name=name))))
+
+
+@pytest.mark.parametrize("file", ["a\x00b.3mf", "a b/c.3mf", "x\n.3mf", ""])
+def test_unsafe_file_rejected(tmp_path, file):
+    with pytest.raises(ManifestError, match="file"):
+        load_manifest(_raw(tmp_path, json.dumps(_part(file=file))))
+
+
+def test_safe_name_with_space_and_dots_ok(tmp_path):
+    m = load_manifest(_raw(tmp_path, json.dumps(_part(name="lamp arm v1.2_b-3"))))
+    assert m.name == "lamp arm v1.2_b-3"
