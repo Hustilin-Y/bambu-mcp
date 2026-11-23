@@ -32,6 +32,9 @@ DEFAULT_TOKEN_ENV = "BAMBU_MCP_TOKEN"
 TIMEOUT_S = 120.0
 _DETAIL_MAX = 200
 _ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+_BAD_URL = "the service URL must look like http://<host>:<port>"
+# "argument command: invalid choice: '<value>' ..." -> keep the part before the value
+_INVALID = re.compile(r"(argument [^:]+: invalid [a-z ]+?)(?::|$)")
 
 
 class CliError(Exception):
@@ -40,9 +43,13 @@ class CliError(Exception):
 
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:
+        # Never echo argument values: one could be a token typed by mistake.
         if message.startswith("unrecognized arguments"):
-            # never echo them: one could be a token typed by mistake
             message = "unrecognized arguments (the token is read only from the environment, see --help)"
+        elif match := _INVALID.match(message):
+            message = f"{match.group(1)} (see --help)"
+        elif "'" in message or '"' in message:
+            message = "invalid arguments (see --help)"
         raise CliError(message)
 
 
@@ -84,6 +91,18 @@ def _read(path: Path, cap: int) -> bytes:
     return data
 
 
+def _check_url(url: str) -> None:
+    """Refuse a malformed URL with one line instead of an httpx traceback later."""
+    try:
+        parsed = httpx.URL(url)
+    except httpx.InvalidURL:
+        raise CliError(_BAD_URL) from None
+    if parsed.scheme not in ("http", "https") or not parsed.host:
+        raise CliError(_BAD_URL)
+    if parsed.port is not None and not 0 < parsed.port < 65536:
+        raise CliError(_BAD_URL)
+
+
 def _detail(response: httpx.Response) -> str:
     try:
         body = response.json()
@@ -103,6 +122,7 @@ def _upload(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> 
     url = args.url or _configured_url()
     if not url:
         raise CliError("--url is required (no service_url in the config named by BAMBU_CONFIG)")
+    _check_url(url)
 
     try:
         manifest = load_manifest(args.manifest)
@@ -126,6 +146,8 @@ def _upload(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> 
                 files=files,
                 headers={"Authorization": f"Bearer {token}"},
             )
+    except httpx.InvalidURL:  # not an HTTPError; e.g. a port out of range
+        raise CliError(_BAD_URL) from None
     except httpx.HTTPError as exc:
         raise CliError(f"cannot reach the service: {type(exc).__name__}") from None
     if response.status_code != 201:

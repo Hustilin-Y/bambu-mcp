@@ -104,6 +104,39 @@ def test_upload_cli_token_passed_as_env_name_is_not_echoed(manifest, capsys):
     assert TOKEN not in _one_line(capsys.readouterr().err)
 
 
+def test_upload_cli_token_as_subcommand_is_not_echoed(capsys):
+    code = upload.main([TOKEN])
+    assert code == 1
+    line = _one_line(capsys.readouterr().err)
+    assert TOKEN not in line and "invalid choice" in line
+
+
+def test_upload_cli_bad_option_value_is_not_echoed(capsys):
+    code = upload.main(["upload", TOKEN, "--url"])  # --url without its value
+    assert code == 1
+    assert TOKEN not in _one_line(capsys.readouterr().err)
+
+
+@pytest.mark.parametrize(
+    "url", ["http://[::1", "ftp://h:1", "http://", "not a url", "http://h:99999"]
+)
+def test_upload_cli_malformed_url_one_line(manifest, capsys, url):
+    rec = Recorder()
+    code = upload.main(["upload", str(manifest), "--url", url], transport=rec.transport)
+    assert code == 1
+    assert "URL" in _one_line(capsys.readouterr().err)
+    assert rec.requests == []
+
+
+def test_upload_cli_malformed_configured_url_one_line(manifest, tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config.toml"
+    config.write_text('service_url = "http://[::1"\n', encoding="utf-8")
+    monkeypatch.setenv("BAMBU_CONFIG", str(config))
+    code = upload.main(["upload", str(manifest)], transport=Recorder().transport)
+    assert code == 1
+    _one_line(capsys.readouterr().err)
+
+
 def test_upload_cli_url_required_without_config(manifest, capsys):
     rec = Recorder()
     code = upload.main(["upload", str(manifest)], transport=rec.transport)

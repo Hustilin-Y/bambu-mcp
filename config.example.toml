@@ -24,7 +24,8 @@ tls_mode = "ca"
 # notify_url = "http://127.0.0.1:8790"
 
 # -- phase 2: print jobs -------------------------------------------------------
-# Folder on this machine that MCP create_job(manifest_path) may read from. Both the
+# Absolute path of the folder on this machine that MCP create_job(manifest_path)
+# may read from (a relative path is refused). Both the
 # manifest and its 3MF must resolve inside it (links included). Unset: path intake
 # is off and jobs arrive only through POST /jobs (`bambu-mcp upload`).
 # jobs_root_allowed = "/srv/cad-workshop/out"

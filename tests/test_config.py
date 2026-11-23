@@ -82,17 +82,26 @@ def test_settings_defaults(tmp_path):
 
 def test_settings_phase2_keys(tmp_path):
     toml = tmp_path / "config.toml"
+    root = (tmp_path / "cad" / "out").as_posix()  # absolute on every OS
     toml.write_text(
-        'jobs_root_allowed = "/srv/cad/out"\n'
+        f'jobs_root_allowed = "{root}"\n'
         'gateway_url = "http://127.0.0.1:8800"\n'
         'slice_agent_url = "http://192.168.88.10:11436"\n'
         'service_url = "http://192.168.88.11:8765"\n'
     )
     s = Settings.load(toml)
-    assert s.jobs_root_allowed == Path("/srv/cad/out")
+    assert s.jobs_root_allowed == Path(root)
     assert s.gateway_url == "http://127.0.0.1:8800"
     assert s.slice_agent_url == "http://192.168.88.10:11436"
     assert s.service_url == "http://192.168.88.11:8765"
+
+
+@pytest.mark.parametrize("value", ["cad/out", "./out", "out"])
+def test_settings_jobs_root_must_be_absolute(tmp_path, value):
+    toml = tmp_path / "config.toml"
+    toml.write_text(f'jobs_root_allowed = "{value}"\n')
+    with pytest.raises(ValueError, match="jobs_root_allowed must be an absolute path"):
+        Settings.load(toml)
 
 
 def test_settings_overrides(tmp_path):

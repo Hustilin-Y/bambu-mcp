@@ -119,6 +119,8 @@ class Settings:
         jobs_root = raw.get("jobs_root_allowed")
         if jobs_root is not None and (not isinstance(jobs_root, str) or not jobs_root):
             raise ValueError("jobs_root_allowed must be a non-empty path string")
+        if jobs_root is not None and not Path(jobs_root).is_absolute():
+            raise ValueError("jobs_root_allowed must be an absolute path")
 
         ca_file = raw.get("ca_file")
         return cls(
