@@ -21,7 +21,7 @@ from bambu_mcp.store.models import (
 )
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 # schema.sql is the version-1 schema; each later version is one migration script.
 _MIGRATIONS = {
     2: "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
@@ -55,6 +55,9 @@ _MIGRATIONS = {
     "    error TEXT\n"
     ");\n"
     "CREATE INDEX jobs_name ON jobs (name);",
+    # The sliced job a print was matched to by its file name, and the plate printed.
+    5: "ALTER TABLE prints ADD COLUMN job_id INTEGER REFERENCES jobs(id);\n"
+    "ALTER TABLE prints ADD COLUMN plate INTEGER;",
 }
 _SEEN_TTL_S = 30 * 24 * 3600
 _DEFAULT_TARIFF = (date(2024, 6, 1), 4.32, None)
@@ -72,7 +75,9 @@ _SPOOL_FIELDS = frozenset(
         "active",
     }
 )
-_PRINT_FIELDS = frozenset({"spool_id", "grams", "kwh", "cost_filament_uah", "cost_power_uah", "fit"})
+_PRINT_FIELDS = frozenset(
+    {"spool_id", "grams", "kwh", "cost_filament_uah", "cost_power_uah", "fit", "source", "job_id", "plate"}
+)
 _JOB_FIELDS = frozenset({"status", "settings_json", "result_json", "sliced_file", "error"})
 
 
@@ -114,6 +119,8 @@ def _print(row: sqlite3.Row) -> PrintRow:
         fit=row["fit"],
         deducted_spool_id=row["deducted_spool_id"],
         deducted_g=row["deducted_g"],
+        job_id=row["job_id"],
+        plate=row["plate"],
     )
 
 

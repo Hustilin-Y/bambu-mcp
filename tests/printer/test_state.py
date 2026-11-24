@@ -85,6 +85,36 @@ def test_hms_and_error_parsed():
     assert state.print_error == 3
 
 
+def test_plate_from_running_fixture():
+    assert apply(PrinterState.empty(), load("running_layer0")).plate == 1
+    assert PrinterState.empty().plate is None
+
+
+@pytest.mark.synthetic
+@pytest.mark.parametrize(
+    ("fields", "plate"),
+    [
+        ({"plate_idx": 2, "plate_id": 3, "gcode_file": "/data/Metadata/plate_4.gcode"}, 2),
+        ({"plate_idx": 0, "plate_id": 3, "gcode_file": "/data/Metadata/plate_4.gcode"}, 3),
+        ({"plate_idx": "x", "gcode_file": "/data/Metadata/plate_4.gcode"}, 4),
+        ({"gcode_file": "/data/Metadata/plate_12.gcode"}, 12),
+        ({"plate_id": True, "gcode_file": "/sdcard/cube.gcode"}, None),
+        ({"plate_idx": -1}, None),
+    ],
+)
+def test_plate_order_of_fields(fields, plate):
+    assert apply(PrinterState.empty(), {"print": fields}).plate == plate
+
+
+@pytest.mark.synthetic
+def test_plate_kept_by_partial_reports_and_dropped_with_a_new_job():
+    base = apply(PrinterState.empty(), {"print": {"subtask_name": "a", "task_id": "1", "plate_idx": 2}})
+    assert apply(base, {"print": {"mc_percent": 5}}).plate == 2
+    assert apply(base, {"print": {"subtask_name": "a", "task_id": "1"}}).plate == 2  # same job
+    assert apply(base, {"print": {"subtask_name": "b", "task_id": "2"}}).plate is None
+    assert apply(base, {"print": {"subtask_name": "b", "plate_idx": 3}}).plate == 3
+
+
 @pytest.mark.synthetic
 def test_rfid_remain_percent():
     tray = {"id": "2", "tray_type": "PLA", "tray_color": "FF0000FF", "remain": 80}

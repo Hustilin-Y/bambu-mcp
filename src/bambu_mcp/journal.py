@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import math
+import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -10,9 +14,11 @@ from bambu_mcp.config import Settings
 from bambu_mcp.cost import CostLine, filament_cost, power_cost, print_kwh
 from bambu_mcp.events import Event, EventKind
 from bambu_mcp.messages import post_print_buttons
+from bambu_mcp.names import slug
 from bambu_mcp.notify import Press
+from bambu_mcp.printer.state import PrinterState
 from bambu_mcp.store.db import Store
-from bambu_mcp.store.models import PrintRow, Spool
+from bambu_mcp.store.models import Job, PrintRow, Spool
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +28,21 @@ DEFAULT_MATERIAL = "PLA"
 NO_SPOOL = "none"
 
 Slot = tuple[int, int]  # (AMS unit, slot in the unit)
+
+# Sliced files are ``<slug>-<job id>-p1`` (a part) or ``<slug>-<job id>-kit`` (ruling R2).
+# Parsed from the right: the slug has dashes of its own. 18 digits stay inside SQLite's int.
+_SLICED_NAME = re.compile(r"(?P<slug>.+)-(?P<job>[1-9][0-9]{0,17})-(?P<tag>p1|kit)", re.ASCII)
+_SLICED_SUFFIXES = (".gcode.3mf", ".3mf")  # Studio usually sends the name without either
+_KIND_TAGS = {"part": "p1", "kit": "kit"}
+_UNSLICED = frozenset({"new", "slicing", "slice_failed"})  # every later status has a result
+
+
+@dataclass(frozen=True)
+class JobMatch:
+    job_id: int
+    plate: int | None  # None: a kit whose plate the printer did not report (ruling R2)
+    grams: float  # the plate's predicted grams from the job's current result
+    spool_id: int | None  # the spool the job was sliced for
 
 
 def _utc(at: datetime) -> datetime:
@@ -61,14 +82,38 @@ class Journal:
         row = self._store.print_by_identity(event.identity)
         if row is not None and row.ended_at is None:
             return row.id  # already open (dedupe key expired, or a repeated start)
-        return self._store.open_print(event.identity, _utc(event.at), "external")
+        return self._open_row(event, event.at)
+
+    def _open_row(self, event: Event, started_at: datetime) -> int:
+        """A new row, matched to the sliced job its file name names (booked to the job's spool)."""
+        print_id = self._store.open_print(event.identity, _utc(started_at), "external")
+        try:
+            with self._store.transaction():
+                match = match_job(self._store, event.state)
+                if match is not None:
+                    self._book(print_id, match)
+        except Exception:
+            log.exception("matching a print to its sliced job failed, journalled as an external print")
+        return print_id
+
+    def _book(self, print_id: int, match: JobMatch) -> None:
+        self._store.set_print_fields(print_id, source="job", job_id=match.job_id, plate=match.plate)
+        spool = None
+        if match.spool_id is not None:
+            spool = next((s for s in self._store.spools(active_only=False) if s.id == match.spool_id), None)
+            if spool is None:
+                log.warning(
+                    "job %d: its spool %d is gone, asked after the print", match.job_id, match.spool_id
+                )
+        # Without the spool the grams wait for the slot's spool or the owner's answer (phase 1).
+        rebook_grams(self._store, print_id, spool, match.grams)
 
     def _close(self, event: Event, slot: Slot | None, first_seen: datetime | None) -> int | None:
         row = self._store.print_by_identity(event.identity)
         if row is None:
             # The start was missed (e.g. a stale job identity): record it from the first sight.
             log.warning("no journal row for a %s print, opening one now", event.kind)
-            self._store.open_print(event.identity, _utc(first_seen or event.at), "external")
+            self._open_row(event, first_seen or event.at)
             row = self._store.print_by_identity(event.identity)
             assert row is not None
         if row.ended_at is not None:
@@ -166,6 +211,64 @@ class Journal:
             return None
         rebook_grams(self._store, print_id, spool, row.grams)
         return f"Катушка: {spool_label(spool.brand, spool.material, spool.color_name)}"
+
+
+def match_job(store: Store, state: PrinterState) -> JobMatch | None:
+    """The sliced job and plate the print's file name names, or None (an external print).
+
+    ``subtask_name`` is the file name, with or without ``.gcode.3mf`` / ``.3mf``. A part is
+    plate 1; a kit's plate is the report's, and must be one the job's current result has.
+    """
+    name = state.subtask_name or ""
+    for suffix in _SLICED_SUFFIXES:
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    parsed = _SLICED_NAME.fullmatch(name)
+    if parsed is None:
+        return None
+    job = store.job(int(parsed["job"]))
+    if (
+        job is None
+        or job.status in _UNSLICED
+        or _KIND_TAGS.get(job.kind) != parsed["tag"]
+        or slug(job.name) != parsed["slug"]
+    ):
+        return None
+    plate = 1 if job.kind == "part" else state.plate
+    found = _result_plate(job, plate or 1)
+    if found is None:
+        return None
+    grams, spool_id = found
+    return JobMatch(job.id, plate, grams, spool_id)
+
+
+def _result_plate(job: Job, plate: int) -> tuple[float, int | None] | None:
+    """(predicted grams of ``plate``, the job's spool id) from its result, None if absent."""
+    try:
+        result = json.loads(job.result_json or "null")
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(result, dict) or not isinstance(result.get("plates"), list):
+        return None
+    entry = next(
+        (
+            p
+            for p in result["plates"]
+            if isinstance(p, dict) and type(p.get("index")) is int and p["index"] == plate
+        ),
+        None,
+    )
+    grams = entry.get("grams") if entry is not None else None
+    if not isinstance(grams, dict) or not all(_grams_ok(g) for g in grams.values()):
+        return None
+    slot = result.get("slot")
+    spool_id = slot.get("spool_id") if isinstance(slot, dict) else None
+    return float(sum(grams.values())), spool_id if type(spool_id) is int else None
+
+
+def _grams_ok(value: object) -> bool:
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
 def rebook_grams(store: Store, print_id: int, spool: Spool | None, grams: float | None) -> None:

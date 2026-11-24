@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from bambu_mcp.events import SeenStore
-from bambu_mcp.store.db import Store
+from bambu_mcp.store.db import _MIGRATIONS, Store
 
 
 @pytest.fixture
@@ -30,7 +30,7 @@ def test_migrate_is_idempotent_and_seeds_tariff(tmp_path: Path):
     assert t.day_uah == 4.32
     assert t.night_uah is None
     assert t.valid_from == date(2024, 6, 1)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 4
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 5
     assert s._conn().execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     s.close()
 
@@ -215,7 +215,7 @@ def test_migrate_v1_database_adds_deduction_columns(tmp_path: Path):
     (row,) = s.history(None, 10)
     assert row.identity[0] == "old"
     assert (row.deducted_spool_id, row.deducted_g) == (None, None)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 4
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 5
     s.close()
 
 
@@ -271,7 +271,7 @@ def test_migrate_v2_database_adds_outbox(tmp_path: Path):
         + "ALTER TABLE prints ADD COLUMN deducted_g REAL;\nPRAGMA user_version = 2;"
     )
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 4
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 5
     assert s.outbox_head() is None
     s.close()
 
@@ -371,7 +371,7 @@ def test_migrate_v3_to_v4(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 4
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 5
     (row,) = s.history(None, 10)
     assert row.identity[0] == "kept"
     assert s.outbox_head().dedupe == "k1"
@@ -381,6 +381,44 @@ def test_migrate_v3_to_v4(tmp_path: Path):
     assert (job.name, job.kind, job.status, job.created_at.year) == ("lamp-arm", "part", "new", 2026)
     with pytest.raises(sqlite3.IntegrityError):
         s._conn().execute("UPDATE jobs SET status = 'bogus' WHERE id = ?", (job_id,))
+    s.close()
+
+
+def test_migrate_v4_to_v5_adds_print_job_columns(tmp_path: Path):
+    path = tmp_path / "v4.db"
+    conn = sqlite3.connect(path)
+    v1 = (Path(__file__).parents[2] / "src/bambu_mcp/store/schema.sql").read_text(encoding="utf-8")
+    conn.executescript(v1 + "".join(f"\n{_MIGRATIONS[v]}" for v in (2, 3, 4)) + "\nPRAGMA user_version = 4;")
+    spool = conn.execute(
+        "INSERT INTO spools (brand, material, color_name, color_hex, price_uah, net_g, remaining_g)"
+        " VALUES ('Bambu', 'PLA', 'Black', '#000000', 700, 1000, 988)"
+    ).lastrowid
+    job_id = conn.execute(
+        "INSERT INTO jobs (name, kind, manifest_json, file_sha256, created_at, status)"
+        " VALUES ('lamp-arm', 'part', '{}', ?, '2026-11-23T00:00:00+00:00', 'sliced')",
+        ("a" * 64,),
+    ).lastrowid
+    print_id = conn.execute(
+        "INSERT INTO prints (name, task_id, source, started_at, spool_id, grams, deducted_spool_id,"
+        " deducted_g) VALUES ('lamp-arm-1-p1', '7', 'external', '2026-11-23T00:00:00+00:00', ?, 12, ?, 12)",
+        (spool, spool),
+    ).lastrowid
+    conn.commit()
+    assert "job_id" not in {r[1] for r in conn.execute("PRAGMA table_info(prints)")}
+    conn.close()
+
+    s = Store(path)
+    s.migrate()
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 5
+    row = s.print_by_id(print_id)
+    assert (row.identity[0], row.spool_id, row.grams, row.deducted_g) == ("lamp-arm-1-p1", spool, 12.0, 12.0)
+    assert (row.job_id, row.plate) == (None, None)
+    assert s.job(job_id).name == "lamp-arm"
+    s.set_print_fields(print_id, source="job", job_id=job_id, plate=1)
+    row = s.print_by_id(print_id)
+    assert (row.source, row.job_id, row.plate) == ("job", job_id, 1)
+    with pytest.raises(sqlite3.IntegrityError):
+        s.set_print_fields(print_id, job_id=job_id + 100)  # references jobs(id)
     s.close()
 
 

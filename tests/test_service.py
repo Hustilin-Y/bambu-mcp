@@ -671,6 +671,37 @@ async def test_new_job_after_downtime_closes_the_old_row(harness):
     assert [r.identity[0] for r in harness.store.open_prints()] == ["bracket"]
 
 
+async def test_print_of_a_sliced_job_books_its_spool_without_a_question(harness):
+    store = harness.store
+    spool = store.add_spool("Elegoo", "PETG", "Black", "#000000", None, 600.0, 1000.0)
+    job_id = store.add_job("Lamp Arm", "part", "{}", "a" * 64, T0)
+    plates = [{"index": 1, "minutes": 150.0, "grams": {"PETG": 12.5}}]
+    result = {"plates": plates, "slot": {"spool_id": spool}}
+    store.update_job(job_id, status="sliced", result_json=json.dumps(result))
+    name = f"lamp-arm-{job_id}-p1"
+
+    def renamed(fixture: str) -> dict:
+        payload = report(fixture)
+        payload["print"]["subtask_name"] = name
+        return payload
+
+    await harness.start()
+    await harness.feed_report(renamed("running_layer0"))
+    await harness.feed_report(renamed("running_layer2"))
+    await harness.stop()
+    await harness.start()  # a restart mid-print sees the start again
+    await harness.feed_report(renamed("running_layer2"))
+    await harness.feed_report(renamed("finish"), minutes=60)
+
+    heads = [m["text"].splitlines()[0] for m in harness.notifier.sent]
+    assert heads.count("▶️ Печать началась") == 1
+    assert heads[-2] == "✅ Печать завершена"
+    assert harness.notifier.button_ids(len(heads) - 1)[0].startswith("fit:")  # no spool question
+    (row,) = store.history(None, 10)
+    assert (row.source, row.job_id, row.plate, row.spool_id) == ("job", job_id, 1, spool)
+    assert store.spools()[0].remaining_g == pytest.approx(987.5)
+
+
 async def test_running_to_idle_is_reported_as_failed(harness):
     await harness.start()
     await harness.feed("running_layer0", "running_layer2")

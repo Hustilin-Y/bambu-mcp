@@ -56,6 +56,8 @@ class PrintRow:
     fit: str | None
     deducted_spool_id: int | None = None  # spool the recorded grams were removed from
     deducted_g: float | None = None  # grams actually removed (after the floor at 0)
+    job_id: int | None = None  # the sliced job the print's file name matched
+    plate: int | None = None  # its plate, None when the printer did not say
 
 
 @dataclass(frozen=True)
