@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python >= 3.12, uv, pytest, Starlette + uvicorn (slice-agent), httpx, existing bambu_mcp modules.
 
-**Spec:** `docs/superpowers/specs/2026-11-22-bambu-mcp-design.md` (sections 5, 7, 8, 11, 12 phase 2). Facts: `docs/phase0-report.md` ("CLI recipe (verified)"). Manifest contract: `E:\Projects\cad-workshop\docs\superpowers\plans\2026-11-23-print-manifest.md` (schema 1, executed separately in the CAD Workshop repo). Phase 1 notes: `docs/phase1-notes.md`.
+**Spec:** `docs/superpowers/specs/2026-11-22-bambu-mcp-design.md` (sections 5, 7, 8, 11, 12 phase 2). Facts: `docs/phase0-report.md` ("CLI recipe (verified)"). Manifest contract: cad-workshop `docs/superpowers/plans/2026-11-23-print-manifest.md` (schema 1, executed separately in the CAD Workshop repo). Phase 1 notes: `docs/phase1-notes.md`.
 
 ## Global Constraints
 
