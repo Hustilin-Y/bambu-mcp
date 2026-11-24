@@ -1,0 +1,38 @@
+# slice-agent settings on the PC. Copy to %LOCALAPPDATA%\bambu-mcp\slice-agent.toml.
+# Without the file every key takes the default shown or noted here.
+# Tokens are never here: the agent reads SLICE_AGENT_TOKEN and PC_AGENT_TOKEN from the
+# environment only (user environment variables, see README.md).
+# TOML does not expand %VARIABLES%: write absolute paths, in single quotes so that
+# backslashes stay literal.
+
+# The pinned Bambu Studio copy (README.md, "Pinned Bambu Studio"). Defaults: the installed
+# copy under C:\Program Files\Bambu Studio, which updates itself.
+# studio_exe = 'C:\Users\<you>\AppData\Local\bambu-mcp\studio-<version>\bambu-studio.exe'
+# studio_resources = 'C:\Users\<you>\AppData\Local\bambu-mcp\studio-<version>\resources\profiles\BBL'
+
+# Studio's own data folder: system presets downloaded by Studio and the user presets.
+# Default: %APPDATA%\BambuStudio.
+# studio_data = 'C:\Users\<you>\AppData\Roaming\BambuStudio'
+
+# Where `slice-agent flatten` writes and the slicer reads the flattened presets.
+# Default: %LOCALAPPDATA%\bambu-mcp\profiles. Never inside the repo (AGPL data).
+# profiles_dir = 'C:\Users\<you>\AppData\Local\bambu-mcp\profiles'
+
+# Sliced files, opened from here in Bambu Studio to print. Default: %USERPROFILE%\bambu-mcp\sliced.
+# sliced_dir = 'C:\Users\<you>\bambu-mcp\sliced'
+
+# [host, port]. The firewall rule from install.ps1 lets only workshop reach the port.
+listen = ["0.0.0.0", 11436]
+
+# Filament presets to flatten. A job's filament must be one of these names.
+# Bambu system preset names only: user presets are not supported.
+filaments = ["Generic PETG @BBL P2S"]
+
+# Nozzle diameter -> machine preset (system preset name).
+[machine]
+"0.4" = "Bambu Lab P2S 0.4 nozzle"
+
+# Process set name -> process preset (system preset name). The service always asks for
+# "standard": named sets travel as overrides, so this one entry is enough.
+[process_sets]
+standard = "0.20mm Standard @BBL P2S"
