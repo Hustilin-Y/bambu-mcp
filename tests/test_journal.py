@@ -91,9 +91,21 @@ KIT_PLATES = ((1, {"PLA": 10.0}), (2, {"PLA": 4.0, "PLA2": 1.5}))
 LATER = T0 + timedelta(hours=1)
 
 
-def job_ev(kind: EventKind, name: str, at: datetime = T0, plate: int | None = 1, **kw) -> Event:
+def job_ev(
+    kind: EventKind,
+    name: str,
+    at: datetime = T0,
+    plate: int | None = 1,
+    percent: int | None = None,
+    **kw,
+) -> Event:
     st = replace(
-        PrinterState.empty(), subtask_name=name, task_id="77", gcode_state="RUNNING", plate=plate
+        PrinterState.empty(),
+        subtask_name=name,
+        task_id="77",
+        gcode_state="RUNNING",
+        plate=plate,
+        percent=percent,
     )
     return Event(kind, (name, "77", ""), at, st, **kw)
 
@@ -312,6 +324,132 @@ def test_booking_failure_keeps_the_row_as_external(store, monkeypatch, caplog):
     assert (row.source, row.job_id, row.plate, row.spool_id) == ("external", None, None, None)
     assert remaining(store, spool) == pytest.approx(1000.0)
     assert "sliced job" in caplog.text
+
+
+@pytest.mark.parametrize("kind", [EventKind.FAILED, EventKind.CANCELLED])
+@pytest.mark.parametrize(("percent", "grams"), [(40, 5.0), (33, 4.1), (0, 0.0), (100, 12.5)])
+def test_unfinished_match_keeps_the_printed_share(tmp_path, kind, percent, grams):
+    path = tmp_path / "bambu.db"
+    store = Store(path)
+    store.migrate()
+    spool = add_spool(store)
+    other = add_spool(store)
+    store.map_slot(0, 1, other)
+    job_id = sliced_job(store, spool_id=spool)
+    name = f"lamp-arm-{job_id}-p1"
+    journal = Journal(store, Settings())
+    print_id = journal.on_event(job_ev(EventKind.STARTED, name))
+    assert remaining(store, spool) == pytest.approx(987.5)
+
+    journal.on_event(job_ev(kind, name, LATER, percent=percent), slot=(0, 1))
+
+    row = store.print_by_id(print_id)
+    assert (row.outcome, row.job_id, row.spool_id) == (str(kind), job_id, spool)  # no question
+    assert row.grams == pytest.approx(grams)
+    assert row.cost_filament_uah == pytest.approx(grams * 0.6)
+    assert remaining(store, spool) == pytest.approx(1000.0 - grams)
+    assert remaining(store, other) == pytest.approx(1000.0)
+    store.close()
+
+    again = Store(path)  # a restart replays the end: nothing moves twice
+    again.migrate()
+    Journal(again, Settings()).on_event(job_ev(kind, name, LATER, percent=percent), slot=(0, 1))
+    assert again.print_by_id(print_id).grams == pytest.approx(grams)
+    assert remaining(again, spool) == pytest.approx(1000.0 - grams)
+    again.close()
+
+
+@pytest.mark.parametrize("kind", [EventKind.FAILED, EventKind.CANCELLED])
+@pytest.mark.parametrize("lost", [False, True])
+def test_unfinished_match_without_percent_is_refunded_and_asked(tmp_path, kind, lost):
+    path = tmp_path / "bambu.db"
+    store = Store(path)
+    store.migrate()
+    spool = add_spool(store)
+    other = add_spool(store)
+    store.map_slot(0, 1, other)
+    job_id = sliced_job(store, spool_id=spool)
+    name = f"lamp-arm-{job_id}-p1"
+    journal = Journal(store, Settings())
+    print_id = journal.on_event(job_ev(EventKind.STARTED, name))
+
+    end = job_ev(kind, name, LATER, percent=None, end_unknown=lost, lost=lost)
+    journal.on_event(end, slot=None if lost else (0, 1))
+
+    row = store.print_by_id(print_id)
+    # spool_id None: the service asks the phase 1 spool question, even with the slot's spool known.
+    assert (row.outcome, row.job_id, row.spool_id) == (str(kind), job_id, None)
+    assert row.grams == pytest.approx(12.5) and row.deducted_g is None
+    assert row.cost_filament_uah is None
+    assert remaining(store, spool) == pytest.approx(1000.0)
+    assert remaining(store, other) == pytest.approx(1000.0)
+    store.close()
+
+    again = Store(path)
+    again.migrate()
+    Journal(again, Settings()).on_event(end, slot=None if lost else (0, 1))
+    assert again.print_by_id(print_id).spool_id is None
+    assert remaining(again, spool) == pytest.approx(1000.0)
+    assert remaining(again, other) == pytest.approx(1000.0)
+    again.close()
+
+
+def test_kit_plate_learnt_at_the_close_rebooks_its_grams(store):
+    spool = add_spool(store)
+    job_id = sliced_job(store, name="Desk Kit", kind="kit", plates=KIT_PLATES, spool_id=spool)
+    name = f"desk-kit-{job_id}-kit"
+    journal = Journal(store, Settings())
+    print_id = journal.on_event(job_ev(EventKind.STARTED, name, plate=None))
+    assert remaining(store, spool) == pytest.approx(990.0)  # R2: plate 1 grams meanwhile
+
+    journal.on_event(job_ev(EventKind.FINISHED, name, LATER, plate=2))
+
+    row = store.print_by_id(print_id)
+    assert (row.plate, row.spool_id) == (2, spool)
+    assert row.grams == pytest.approx(5.5)
+    assert remaining(store, spool) == pytest.approx(994.5)
+
+
+def test_kit_plate_learnt_at_a_failed_close_takes_its_share(store):
+    spool = add_spool(store)
+    job_id = sliced_job(store, name="Desk Kit", kind="kit", plates=KIT_PLATES, spool_id=spool)
+    name = f"desk-kit-{job_id}-kit"
+    journal = Journal(store, Settings())
+    print_id = journal.on_event(job_ev(EventKind.STARTED, name, plate=None))
+    journal.on_event(job_ev(EventKind.FAILED, name, LATER, plate=2, percent=50))
+    row = store.print_by_id(print_id)
+    assert (row.plate, row.grams) == (2, pytest.approx(2.8))  # 5.5 * 50 % = 2.75
+    assert remaining(store, spool) == pytest.approx(997.2)
+
+
+def test_kit_plate_at_the_close_outside_the_result_keeps_the_row(store):
+    spool = add_spool(store)
+    job_id = sliced_job(store, name="Desk Kit", kind="kit", plates=KIT_PLATES, spool_id=spool)
+    name = f"desk-kit-{job_id}-kit"
+    journal = Journal(store, Settings())
+    print_id = journal.on_event(job_ev(EventKind.STARTED, name, plate=None))
+    journal.on_event(job_ev(EventKind.FINISHED, name, LATER, plate=7))
+    row = store.print_by_id(print_id)
+    assert (row.plate, row.grams) == (None, pytest.approx(10.0))
+    assert remaining(store, spool) == pytest.approx(990.0)
+
+
+def test_inactive_spool_is_treated_as_gone(store):
+    spool = add_spool(store)
+    store.update_spool(spool, active=False)  # retired after the slice
+    job_id = sliced_job(store, spool_id=spool)
+    name = f"lamp-arm-{job_id}-p1"
+    journal = Journal(store, Settings())
+    print_id = journal.on_event(job_ev(EventKind.STARTED, name))
+
+    row = store.print_by_id(print_id)
+    assert (row.source, row.job_id, row.plate, row.spool_id) == ("job", job_id, 1, None)
+    assert row.deducted_g is None
+    assert remaining(store, spool) == pytest.approx(1000.0)
+
+    journal.on_event(job_ev(EventKind.FINISHED, name, LATER))  # no slot: the question is asked
+    assert store.print_by_id(print_id).spool_id is None
+    assert remaining(store, spool) == pytest.approx(1000.0)
 
 
 def test_end_unknown_closes_without_duration_or_cost(store):

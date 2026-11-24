@@ -100,13 +100,47 @@ class Journal:
         self._store.set_print_fields(print_id, source="job", job_id=match.job_id, plate=match.plate)
         spool = None
         if match.spool_id is not None:
-            spool = next((s for s in self._store.spools(active_only=False) if s.id == match.spool_id), None)
-            if spool is None:
+            spool = self._spool_by_id(match.spool_id)
+            if spool is None or not spool.active:
                 log.warning(
-                    "job %d: its spool %d is gone, asked after the print", match.job_id, match.spool_id
+                    "job %d: its spool %d is gone or retired, asked after the print",
+                    match.job_id,
+                    match.spool_id,
                 )
+                spool = None
         # Without the spool the grams wait for the slot's spool or the owner's answer (phase 1).
         rebook_grams(self._store, print_id, spool, match.grams)
+
+    def _spool_by_id(self, spool_id: int | None) -> Spool | None:
+        if spool_id is None:
+            return None
+        return next((s for s in self._store.spools(active_only=False) if s.id == spool_id), None)
+
+    def _settle_job(self, row: PrintRow, event: Event) -> bool:
+        """Fix a matched row's booking at its end. True when it was refunded (ask the owner).
+
+        A kit plate learnt only now takes that plate's grams. A print that did not finish
+        keeps the share it printed, or, without a percent, nothing: the spool question decides.
+        Runs once per row: the caller only gets here for a row it is closing.
+        """
+        assert row.job_id is not None
+        grams = row.grams
+        plate = event.state.plate
+        if row.plate is None and plate is not None:
+            job = self._store.job(row.job_id)
+            found = _result_plate(job, plate) if job is not None and job.kind == "kit" else None
+            if found is not None:
+                self._store.set_print_fields(row.id, plate=plate)
+                grams = found[0]
+        if event.kind is not EventKind.FINISHED and grams is not None:
+            percent = event.state.percent
+            if percent is None or not 0 <= percent <= 100:
+                rebook_grams(self._store, row.id, None, grams)
+                return True
+            grams = round(grams * percent / 100, 1)
+        if grams != row.grams:
+            rebook_grams(self._store, row.id, self._spool_by_id(row.spool_id), grams)
+        return False
 
     def _close(self, event: Event, slot: Slot | None, first_seen: datetime | None) -> int | None:
         row = self._store.print_by_identity(event.identity)
@@ -123,8 +157,16 @@ class Journal:
         minutes = None if event.end_unknown else max((ended - started).total_seconds() / 60, 0.0)
         self._store.close_print(row.id, str(event.kind), ended, minutes)
 
+        refunded = False
+        if row.job_id is not None:
+            try:
+                with self._store.transaction():
+                    refunded = self._settle_job(row, event)
+            except Exception:
+                log.exception("settling the grams of a %s job print failed", event.kind)
+            row = self._store.print_by_id(row.id) or row
         spool = self._store.slot_spool(*slot) if slot is not None else None
-        if spool is not None and row.spool_id is None:
+        if spool is not None and row.spool_id is None and not refunded:
             # Grams given earlier without a spool are deducted from this one now.
             rebook_grams(self._store, row.id, spool, row.grams)
         if minutes is None:
