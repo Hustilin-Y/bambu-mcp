@@ -13,7 +13,7 @@ from bambu_mcp import jobs as jobs_module
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.messages import render_proposal, render_sliced
 from bambu_mcp.notify import LogNotifier, Press, SendError, ServiceNotifyClient
-from bambu_mcp.printer.link import LinkStatus
+from bambu_mcp.printer.link import LinkStatus, PrinterNotConnected
 from bambu_mcp.printer.state import PrinterState, Tray
 from bambu_mcp.proposal import SlotChoice, estimate_cost
 from bambu_mcp.service import (
@@ -55,9 +55,17 @@ class FakeLink:
         self.on_status = on_status
         self.started = False
         self.stopped = False
+        self.trays: list[dict] = []
+        self.full_reports = 0
 
     def start(self) -> None:
         self.started = True
+
+    def set_tray(self, **fields) -> None:
+        self.trays.append(fields)
+
+    def request_full_report(self) -> None:
+        self.full_reports += 1
 
     def stop(self) -> None:
         self.stopped = True
@@ -387,6 +395,35 @@ async def test_missing_hms_file_warns_once(tmp_path, caplog):
         Service(SECRETS, Settings(data_dir=tmp_path), store, LogNotifier(), FakeLink, camera)
     assert not caplog.records
     store.close()
+
+
+TRAY_FIELDS = dict(
+    ams=0, slot=2, tray_info_idx="GFA00", tray_type="PLA", color_rgba="FF8800FF",
+    nozzle_temp_min=190, nozzle_temp_max=230,
+)
+
+
+async def test_set_tray_goes_through_the_running_link_only(harness):
+    store = harness.store
+
+    async def camera():
+        return None
+
+    idle = Service(SECRETS, harness.settings, store, LogNotifier(), FakeLink, camera)
+    with pytest.raises(PrinterNotConnected):
+        idle.set_tray(**TRAY_FIELDS)
+    with pytest.raises(PrinterNotConnected):
+        idle.request_full_report()
+
+    service = await harness.start()
+    service.set_tray(**TRAY_FIELDS)
+    service.request_full_report()
+    link = harness.links[-1]
+    assert link.trays == [TRAY_FIELDS] and link.full_reports == 1
+    await harness.stop()
+    with pytest.raises(PrinterNotConnected):
+        service.set_tray(**TRAY_FIELDS)
+    assert link.trays == [TRAY_FIELDS]
 
 
 def test_notify_dedupe_fits_the_api_limit():

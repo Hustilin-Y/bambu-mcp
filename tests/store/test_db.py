@@ -30,7 +30,7 @@ def test_migrate_is_idempotent_and_seeds_tariff(tmp_path: Path):
     assert t.day_uah == 4.32
     assert t.night_uah is None
     assert t.valid_from == date(2024, 6, 1)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 5
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 6
     assert s._conn().execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     s.close()
 
@@ -215,7 +215,7 @@ def test_migrate_v1_database_adds_deduction_columns(tmp_path: Path):
     (row,) = s.history(None, 10)
     assert row.identity[0] == "old"
     assert (row.deducted_spool_id, row.deducted_g) == (None, None)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 5
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 6
     s.close()
 
 
@@ -271,7 +271,7 @@ def test_migrate_v2_database_adds_outbox(tmp_path: Path):
         + "ALTER TABLE prints ADD COLUMN deducted_g REAL;\nPRAGMA user_version = 2;"
     )
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 5
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 6
     assert s.outbox_head() is None
     s.close()
 
@@ -371,7 +371,7 @@ def test_migrate_v3_to_v4(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 5
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 6
     (row,) = s.history(None, 10)
     assert row.identity[0] == "kept"
     assert s.outbox_head().dedupe == "k1"
@@ -409,7 +409,7 @@ def test_migrate_v4_to_v5_adds_print_job_columns(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 5
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 6
     row = s.print_by_id(print_id)
     assert (row.identity[0], row.spool_id, row.grams, row.deducted_g) == ("lamp-arm-1-p1", spool, 12.0, 12.0)
     assert (row.job_id, row.plate) == (None, None)
@@ -437,3 +437,42 @@ def test_transition_job_is_a_check_and_set(store):
         store.transition_job(a, ("slicing",), name="x")
     with pytest.raises(ValueError):
         store.transition_job(a, ())
+
+
+def test_migrate_v5_to_v6_adds_spool_tray_metadata(tmp_path: Path):
+    path = tmp_path / "v5.db"
+    conn = sqlite3.connect(path)
+    v1 = (Path(__file__).parents[2] / "src/bambu_mcp/store/schema.sql").read_text(encoding="utf-8")
+    conn.executescript(v1 + "".join(f"\n{_MIGRATIONS[v]}" for v in (2, 3, 4, 5)) + "\nPRAGMA user_version = 5;")
+    spool = conn.execute(
+        "INSERT INTO spools (brand, material, color_name, color_hex, filament_preset, price_uah, net_g,"
+        " remaining_g) VALUES ('Bambu', 'PLA', 'Black', '#000000', 'Bambu PLA Basic @BBL P2S', 700, 1000, 988)"
+    ).lastrowid
+    conn.execute("INSERT INTO slots (ams, slot, spool_id) VALUES (0, 1, ?)", (spool,))
+    conn.commit()
+    assert "tray_info_idx" not in {r[1] for r in conn.execute("PRAGMA table_info(spools)")}
+    conn.close()
+
+    s = Store(path)
+    s.migrate()
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 6
+    (row,) = s.spools()
+    assert (row.id, row.filament_preset, row.remaining_g) == (spool, "Bambu PLA Basic @BBL P2S", 988)
+    assert (row.tray_info_idx, row.nozzle_temp_min, row.nozzle_temp_max) == (None, None, None)
+    assert s.slot_spool(0, 1).id == spool
+    s.update_spool(spool, tray_info_idx="GFA00", nozzle_temp_min=190, nozzle_temp_max=230)
+    (row,) = s.spools()
+    assert (row.tray_info_idx, row.nozzle_temp_min, row.nozzle_temp_max) == ("GFA00", 190, 230)
+    s.close()
+
+
+def test_add_spool_with_tray_metadata(store: Store):
+    sid = store.add_spool(
+        "Bambu", "PETG", "Blue", "#0000FF", None, 600, 1000,
+        tray_info_idx="GFG99", nozzle_temp_min=220, nozzle_temp_max=260,
+    )
+    (row,) = store.spools()
+    assert (row.id, row.tray_info_idx, row.nozzle_temp_min, row.nozzle_temp_max) == (sid, "GFG99", 220, 260)
+    plain = _spool(store)
+    assert store.spools()[1].id == plain
+    assert store.spools()[1].tray_info_idx is None

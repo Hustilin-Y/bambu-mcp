@@ -40,7 +40,7 @@ from bambu_mcp.manifest import NAME_RE
 from slice_agent.config import AgentConfig, load_config
 from slice_agent.lease import PC_AGENT_URL, RENEW_S, Lease
 from slice_agent.output import OutputError, check_output, read_output, read_plate_png
-from slice_agent.profiles import flatten_all
+from slice_agent.profiles import filament_tray_info, flatten_all
 from slice_agent.runner import OUT_SUFFIX, Overrides, build_command, check_out_name, slice_isolated
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -546,9 +546,18 @@ def serve(cfg: AgentConfig) -> int:
 
 
 def flatten(cfg: AgentConfig) -> int:
-    for path in flatten_all(cfg):
+    paths = flatten_all(cfg)
+    for path in paths:
         print(f"wrote {path}")
     print("assertions OK")
+    # The owner copies these into the server's spool records (add_spool / update_spool).
+    for path in paths:
+        if not path.name.startswith("filament-"):
+            continue
+        preset = json.loads(path.read_text(encoding="utf-8"))
+        info = filament_tray_info(preset)
+        fields = " ".join(f"{k}={'?' if v is None else v}" for k, v in info.items())
+        print(f"filament {preset.get('name')}: {fields}")
     return 0
 
 

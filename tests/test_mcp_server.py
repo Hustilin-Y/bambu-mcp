@@ -22,7 +22,7 @@ from bambu_mcp.jobs import create_job_from_bytes
 from bambu_mcp.journal import Journal
 from bambu_mcp.mcp_server import build_app
 from bambu_mcp.notify import LogNotifier, Press
-from bambu_mcp.printer.link import LinkStatus
+from bambu_mcp.printer.link import LinkStatus, PrinterNotConnected
 from bambu_mcp.printer.state import Hms, PrinterState, Tray
 from bambu_mcp.service import Service
 from bambu_mcp.slicer import SliceClient, SliceOutcome
@@ -61,6 +61,7 @@ TOOL_NAMES = {
     "slice_job",
     "job_status",
     "jobs",
+    "load_spool",
 }
 WRITE_TOOLS = TOOL_NAMES - {
     "printer_status",
@@ -89,6 +90,17 @@ class FakeService:
             trays=(Tray(0, 0, "PLA", "FF0000FF", 80), Tray(0, 1, "PETG", "00FF00FF", None)),
         )
         self.link_status = LinkStatus.CONNECTED
+        self.trays_sent: list[dict] = []
+        self.full_reports = 0
+        self.set_tray_error: Exception | None = None
+
+    def set_tray(self, **fields) -> None:
+        if self.set_tray_error is not None:
+            raise self.set_tray_error
+        self.trays_sent.append(fields)
+
+    def request_full_report(self) -> None:
+        self.full_reports += 1
 
 
 class Harness:
@@ -250,6 +262,175 @@ def test_spool_inventory(h):
 
     missing = h.call_raw("set_spool_weight", spool_id=999, remaining_g=1)
     assert missing["isError"] is True and "no spool 999" in missing["content"][0]["text"]
+
+
+def test_spool_tools_store_tray_metadata(h):
+    spool = h.call("add_spool", brand="Bambu", material="PLA", color_name="Orange", color_hex="#FF8800",
+                   price_uah=600, net_g=1000, tray_info_idx="GFA00", nozzle_temp_min=190, nozzle_temp_max=230)
+    assert (spool["tray_info_idx"], spool["nozzle_temp_min"], spool["nozzle_temp_max"]) == ("GFA00", 190, 230)
+    plain = h.call("add_spool", brand="Elegoo", material="PETG", color_name="Black", color_hex="#000000",
+                   price_uah=550, net_g=1000)
+    assert (plain["tray_info_idx"], plain["nozzle_temp_min"], plain["nozzle_temp_max"]) == (None, None, None)
+    updated = h.call("update_spool", spool_id=plain["id"], tray_info_idx="GFG99", nozzle_temp_min=220,
+                     nozzle_temp_max=260)
+    assert (updated["tray_info_idx"], updated["nozzle_temp_min"], updated["nozzle_temp_max"]) == ("GFG99", 220, 260)
+    assert h.call("update_spool", spool_id=plain["id"], nozzle_temp_max=250)["nozzle_temp_min"] == 220
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"tray_info_idx": "gfa00"},
+        {"tray_info_idx": "GF"},
+        {"tray_info_idx": "GFA00/../x"},
+        {"nozzle_temp_min": 149},
+        {"nozzle_temp_max": 321},
+        {"nozzle_temp_min": 240, "nozzle_temp_max": 230},
+        {"nozzle_temp_min": 270},  # above the stored max 260
+    ],
+)
+def test_spool_tools_reject_bad_tray_metadata(h, fields):
+    spool = h.call("add_spool", brand="Elegoo", material="PETG", color_name="Black", color_hex="#000000",
+                   price_uah=550, net_g=1000, nozzle_temp_min=220, nozzle_temp_max=260)
+    result = h.call_raw("update_spool", spool_id=spool["id"], **fields)
+    assert result["isError"] is True
+    (stored,) = h.call("spools")["spools"]
+    assert (stored["tray_info_idx"], stored["nozzle_temp_min"], stored["nozzle_temp_max"]) == (None, 220, 260)
+    added = h.call_raw("add_spool", brand="X", material="PLA", color_name="Y", color_hex="#FFFFFF",
+                       price_uah=1, net_g=1000, **{"nozzle_temp_min": 200, "nozzle_temp_max": 220, **fields})
+    assert added["isError"] is True
+    assert len(h.call("spools")["spools"]) == 1
+
+
+# -- load_spool ----------------------------------------------------------------------
+
+
+def _loadable_spool(h, **changes) -> dict:
+    fields = dict(brand="Bambu", material="pla", color_name="Orange", color_hex="#ff8800", price_uah=600,
+                  net_g=1000, filament_preset="Bambu PLA Basic @BBL P2S", tray_info_idx="GFA00",
+                  nozzle_temp_min=190, nozzle_temp_max=230)
+    fields.update(changes)
+    return h.call("add_spool", **{k: v for k, v in fields.items() if v is not None})
+
+
+def _idle(h, gcode_state: str = "IDLE") -> None:
+    h.service.state = replace(h.service.state, gcode_state=gcode_state)
+
+
+def test_load_spool_maps_slot_and_sends_once(h):
+    _idle(h)
+    spool = _loadable_spool(h)
+    result = h.call_raw("load_spool", spool_id=spool["id"], ams=0, slot=1)
+    assert not result.get("isError"), result
+    out = result["structuredContent"]
+    assert h.service.trays_sent == [
+        dict(ams=0, slot=1, tray_info_idx="GFA00", tray_type="PLA", color_rgba="FF8800FF",
+             nozzle_temp_min=190, nozzle_temp_max=230)
+    ]
+    assert h.service.full_reports == 1
+    assert out["sent"] == {
+        "command": "ams_filament_setting",
+        "ams_id": 0,
+        "tray_id": 1,
+        "tray_info_idx": "GFA00",
+        "tray_type": "PLA",
+        "tray_color": "FF8800FF",
+        "nozzle_temp_min": 190,
+        "nozzle_temp_max": 230,
+    }
+    assert out["spool"]["id"] == spool["id"]
+    assert "printer screen" in out["note"]
+    assert h.store.slot_spool(0, 1).id == spool["id"]
+    trays = {(t["ams"], t["slot"]): t for t in h.call("ams_status")["trays"]}
+    assert trays[(0, 1)]["spool"]["id"] == spool["id"]
+    raw = json.dumps(result)
+    for secret in (ACCESS_CODE, SERIAL, SECRETS.host, "pc-token-abc", "device/"):
+        assert secret not in raw
+
+
+@pytest.mark.parametrize("gcode_state", ["IDLE", "FINISH", "FAILED"])
+def test_load_spool_allowed_when_the_printer_is_not_busy(h, gcode_state):
+    _idle(h, gcode_state)
+    spool = _loadable_spool(h, color_hex="#00FF00")
+    h.call("load_spool", spool_id=spool["id"], ams=0, slot=0)
+    assert h.service.trays_sent[0]["color_rgba"] == "00FF00FF"
+
+
+@pytest.mark.parametrize(
+    "gcode_state", ["RUNNING", "PAUSE", "PREPARE", "SLICING", "INIT", "OFFLINE", "UNKNOWN"]
+)
+def test_load_spool_refuses_while_printing_or_unknown(h, gcode_state):
+    _idle(h, gcode_state)
+    spool = _loadable_spool(h)
+    result = h.call_raw("load_spool", spool_id=spool["id"], ams=0, slot=0)
+    assert result["isError"] is True
+    assert gcode_state in result["content"][0]["text"]
+    assert h.service.trays_sent == [] and h.store.slot_spool(0, 0) is None
+
+
+@pytest.mark.parametrize("status", [LinkStatus.DISCONNECTED, LinkStatus.CONNECTING, LinkStatus.AUTH_FAILED])
+def test_load_spool_refuses_without_a_connected_printer(h, status):
+    _idle(h)
+    h.service.link_status = status
+    spool = _loadable_spool(h)
+    result = h.call_raw("load_spool", spool_id=spool["id"], ams=0, slot=0)
+    assert result["isError"] is True
+    assert "not connected" in result["content"][0]["text"]
+    assert h.service.trays_sent == [] and h.store.slot_spool(0, 0) is None
+
+
+def test_load_spool_refuses_when_the_link_drops_before_the_send(h):
+    _idle(h)
+    h.service.set_tray_error = PrinterNotConnected("printer link is not connected, nothing was sent")
+    spool = _loadable_spool(h)
+    result = h.call_raw("load_spool", spool_id=spool["id"], ams=0, slot=0)
+    assert result["isError"] is True
+    assert "not connected" in result["content"][0]["text"]
+    assert h.store.slot_spool(0, 0) is None and h.service.full_reports == 0
+
+
+@pytest.mark.parametrize(
+    ("ams", "slot", "message"),
+    [(-1, 0, "0..3"), (4, 0, "0..3"), (0, -1, "0..3"), (0, 4, "0..3"), (1, 0, "no AMS unit 1")],
+)
+def test_load_spool_refuses_bad_or_absent_slots(h, ams, slot, message):
+    _idle(h)  # the fake state has one AMS unit, 0
+    spool = _loadable_spool(h)
+    result = h.call_raw("load_spool", spool_id=spool["id"], ams=ams, slot=slot)
+    assert result["isError"] is True
+    assert message in result["content"][0]["text"]
+    assert h.service.trays_sent == []
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"tray_info_idx": None}, "tray_info_idx"),
+        ({"nozzle_temp_min": None, "nozzle_temp_max": None}, "nozzle_temp_min, nozzle_temp_max"),
+        ({"color_hex": ""}, "color_hex"),
+        ({"material": ""}, "material"),
+        ({"material": "Silk PLA+"}, "material"),
+        ({"color_hex": "orange"}, "color_hex"),
+    ],
+)
+def test_load_spool_refuses_incomplete_spools(h, changes, message):
+    _idle(h)
+    spool = _loadable_spool(h, **changes)
+    result = h.call_raw("load_spool", spool_id=spool["id"], ams=0, slot=0)
+    assert result["isError"] is True
+    assert message in result["content"][0]["text"]
+    assert h.service.trays_sent == []
+
+
+def test_load_spool_refuses_missing_and_retired_spools(h):
+    _idle(h)
+    missing = h.call_raw("load_spool", spool_id=999, ams=0, slot=0)
+    assert missing["isError"] is True and "no spool 999" in missing["content"][0]["text"]
+    spool = _loadable_spool(h)
+    h.call("update_spool", spool_id=spool["id"], active=False)
+    retired = h.call_raw("load_spool", spool_id=spool["id"], ams=0, slot=0)
+    assert retired["isError"] is True and "inactive" in retired["content"][0]["text"]
+    assert h.service.trays_sent == []
 
 
 def test_plates(h):

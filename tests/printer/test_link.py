@@ -25,9 +25,12 @@ from bambu_mcp.printer.link import (
     GET_VERSION,
     PUSH_ALL,
     READ_COMMANDS,
+    TRAY_TYPES,
     LinkStatus,
     PrinterLink,
+    PrinterNotConnected,
     build_tls_context,
+    tray_setting,
 )
 
 TLS = Path(__file__).parent.parent / "fixtures" / "synthetic" / "tls"
@@ -57,6 +60,7 @@ class FakeClient:
         self.calls: list[tuple] = []
         self.sock = FakeSocket()
         self.connect_error: OSError | None = None
+        self.publish_rc = mqtt.MQTT_ERR_SUCCESS
         self.on_connect = self.on_disconnect = self.on_message = None
 
     def username_pw_set(self, username, password=None):
@@ -84,6 +88,9 @@ class FakeClient:
 
     def publish(self, topic, payload=None, qos=0, retain=False, **kwargs):
         self.calls.append(("publish", topic, json.loads(payload)))
+        info = mqtt.MQTTMessageInfo(len(self.calls))
+        info.rc = self.publish_rc
+        return info
 
     def socket(self):
         return self.sock
@@ -202,6 +209,166 @@ def test_refuses_non_read_command(h):
         with pytest.raises(ValueError):
             h.link._publish(payload)
     assert "publish" not in h.client.names()
+
+
+# -- the one write: ams_filament_setting ---------------------------------------------
+
+TRAY = dict(
+    ams=1,
+    slot=2,
+    tray_info_idx="GFA00",
+    tray_type="PLA",
+    color_rgba="FF8800FF",
+    nozzle_temp_min=190,
+    nozzle_temp_max=230,
+)
+TRAY_PAYLOAD = {
+    "print": {
+        "sequence_id": "0",
+        "command": "ams_filament_setting",
+        "ams_id": 1,
+        "tray_id": 2,
+        "tray_info_idx": "GFA00",
+        "tray_color": "FF8800FF",
+        "nozzle_temp_min": 190,
+        "nozzle_temp_max": 230,
+        "tray_type": "PLA",
+    }
+}
+
+
+def test_set_tray_payload_exact(h):
+    assert tray_setting(**TRAY) == TRAY_PAYLOAD
+    h.client.fire_connect()
+    h.client.calls.clear()
+    h.link.set_tray(**TRAY)
+    assert h.client.calls == [("publish", f"device/{SERIAL}/request", TRAY_PAYLOAD)]
+
+
+def test_set_tray_type_list_is_closed_and_upper_case():
+    assert TRAY_TYPES == (
+        "PLA", "PETG", "ABS", "ASA", "TPU", "PC", "PA", "PLA-CF", "PETG-CF", "PVA", "PLA-S", "SUPPORT",
+    )
+    for tray_type in TRAY_TYPES:
+        assert tray_setting(**{**TRAY, "tray_type": tray_type})["print"]["tray_type"] == tray_type
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"ams": -1},
+        {"ams": 4},
+        {"ams": 255},
+        {"slot": -1},
+        {"slot": 4},
+        {"slot": 254},
+        {"ams": True},
+        {"slot": 1.0},
+        {"ams": "1"},
+        {"color_rgba": "ff8800ff"},
+        {"color_rgba": "#FF8800"},
+        {"color_rgba": "FF8800"},
+        {"color_rgba": "FF8800FF0"},
+        {"color_rgba": "GG8800FF"},
+        {"color_rgba": "FF8800F\n"},
+        {"color_rgba": None},
+        {"tray_info_idx": "gfa00"},
+        {"tray_info_idx": "GF"},
+        {"tray_info_idx": "GFA000000"},
+        {"tray_info_idx": "GF A0"},
+        {"tray_info_idx": "GFA00\n"},
+        {"tray_info_idx": ""},
+        {"tray_type": "pla"},
+        {"tray_type": "PLA+"},
+        {"tray_type": "PA-CF"},
+        {"tray_type": ""},
+        {"nozzle_temp_min": 149},
+        {"nozzle_temp_max": 321},
+        {"nozzle_temp_min": 240, "nozzle_temp_max": 230},
+        {"nozzle_temp_min": 190.0},
+        {"nozzle_temp_max": False},
+    ],
+)
+def test_set_tray_rejects_bad_colour_and_ids(h, change):
+    h.client.fire_connect()
+    h.client.calls.clear()
+    with pytest.raises(ValueError):
+        tray_setting(**{**TRAY, **change})
+    with pytest.raises(ValueError):
+        h.link.set_tray(**{**TRAY, **change})
+    assert "publish" not in h.client.names()
+
+
+def test_set_tray_accepts_the_bounds(h):
+    h.client.fire_connect()
+    h.client.calls.clear()
+    h.link.set_tray(**{**TRAY, "ams": 0, "slot": 0, "nozzle_temp_min": 150, "nozzle_temp_max": 150})
+    h.link.set_tray(**{**TRAY, "ams": 3, "slot": 3, "nozzle_temp_min": 320, "nozzle_temp_max": 320})
+    sent = [c[2]["print"] for c in h.client.calls if c[0] == "publish"]
+    assert [(p["ams_id"], p["tray_id"], p["nozzle_temp_min"]) for p in sent] == [(0, 0, 150), (3, 3, 320)]
+
+
+def test_set_tray_raises_when_not_verified(h):
+    h.client.calls.clear()
+    with pytest.raises(PrinterNotConnected):
+        h.link.set_tray(**TRAY)
+    assert "publish" not in h.client.names()
+
+
+def test_set_tray_raises_when_paho_refuses_the_publish(h):
+    h.client.fire_connect()
+    h.client.publish_rc = mqtt.MQTT_ERR_NO_CONN
+    with pytest.raises(PrinterNotConnected) as exc:
+        h.link.set_tray(**TRAY)
+    assert SERIAL not in str(exc.value) and ACCESS_CODE not in str(exc.value)
+
+
+def _nested(payload: dict) -> dict:
+    return {"print": {**payload["print"], "inner": {"command": "stop"}}}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"print": {"sequence_id": "0", "command": "stop"}},
+        {"print": {"sequence_id": "0", "command": "pause"}},
+        {"print": {"sequence_id": "0", "command": "resume"}},
+        {"print": {"sequence_id": "0", "command": "gcode_line", "param": "M104 S0"}},
+        {"print": {"sequence_id": "0", "command": "project_file", "url": "file:///x.3mf"}},
+        {"print": {**TRAY_PAYLOAD["print"], "command": "project_file"}},
+        {"print": {**TRAY_PAYLOAD["print"], "command": "gcode_line", "param": "M104 S0"}},
+        {"print": {**TRAY_PAYLOAD["print"], "url": "file:///x.3mf"}},
+        {"print": {**TRAY_PAYLOAD["print"], "param": "G28"}},
+        {"print": {**TRAY_PAYLOAD["print"], "sequence_id": "1"}},
+        {"print": {**TRAY_PAYLOAD["print"], "tray_color": "ff8800ff"}},
+        {"print": {**TRAY_PAYLOAD["print"], "ams_id": 7}},
+        {"print": {**TRAY_PAYLOAD["print"], "ams_id": True}},
+        {"print": {**TRAY_PAYLOAD["print"], "nozzle_temp_max": 400}},
+        {"print": {k: v for k, v in TRAY_PAYLOAD["print"].items() if k != "tray_type"}},
+        _nested(TRAY_PAYLOAD),
+        {**TRAY_PAYLOAD, "pushing": {"sequence_id": "0", "command": "pushall"}},
+        {**TRAY_PAYLOAD, "system": {"sequence_id": "0", "command": "ledctrl"}},
+        {"system": TRAY_PAYLOAD["print"]},
+        {"print": [TRAY_PAYLOAD["print"]]},
+        [TRAY_PAYLOAD],
+        json.dumps(TRAY_PAYLOAD),
+        None,
+    ],
+)
+def test_publish_still_refuses_other_commands(h, payload):
+    h.client.fire_connect()
+    h.client.calls.clear()
+    with pytest.raises(ValueError):
+        h.link._publish(payload)
+    assert "publish" not in h.client.names()
+
+
+def test_publish_accepts_exactly_the_reads_and_a_valid_tray_setting(h):
+    h.client.fire_connect()
+    h.client.calls.clear()
+    for payload in (GET_VERSION, PUSH_ALL, TRAY_PAYLOAD):
+        h.link._publish(payload)
+    assert [c[2] for c in h.client.calls] == [GET_VERSION, PUSH_ALL, TRAY_PAYLOAD]
 
 
 def test_auth_failure_stops_reconnecting(h, caplog):

@@ -52,7 +52,7 @@ from bambu_mcp.messages import (
 from bambu_mcp.names import slug
 from bambu_mcp.notify import Button, LogNotifier, Notifier, Press, SendError, ServiceNotifyClient
 from bambu_mcp.printer.hms import HmsTexts
-from bambu_mcp.printer.link import LinkStatus, PrinterLink
+from bambu_mcp.printer.link import LinkStatus, PrinterLink, PrinterNotConnected
 from bambu_mcp.printer.state import PrinterState, apply
 from bambu_mcp.proposal import (
     SlotChoice,
@@ -131,6 +131,19 @@ class Link(Protocol):
     def start(self) -> None: ...
 
     def stop(self) -> None: ...
+
+    def request_full_report(self) -> None: ...
+
+    def set_tray(
+        self,
+        ams: int,
+        slot: int,
+        tray_info_idx: str,
+        tray_type: str,
+        color_rgba: str,
+        nozzle_temp_min: int,
+        nozzle_temp_max: int,
+    ) -> None: ...
 
 
 class Slicer(Protocol):
@@ -251,6 +264,7 @@ class Service:
 
         self._state = PrinterState.empty()
         self._link_status = LinkStatus.DISCONNECTED
+        self._link: Link | None = None  # while run() is running
         self._slot: Slot | None = None  # AMS slot of the current or last print
         self._job_seen: tuple[tuple, datetime] | None = None  # job identity, first seen at
         self._first_report = True  # the first state after start is checked against the journal
@@ -275,6 +289,36 @@ class Service:
     def link_status(self) -> LinkStatus:
         return self._link_status
 
+    def _running_link(self) -> Link:
+        if self._link is None:
+            raise PrinterNotConnected("printer link is not running, nothing was sent")
+        return self._link
+
+    def set_tray(
+        self,
+        *,
+        ams: int,
+        slot: int,
+        tray_info_idx: str,
+        tray_type: str,
+        color_rgba: str,
+        nozzle_temp_min: int,
+        nozzle_temp_max: int,
+    ) -> None:
+        """The one printer write (``load_spool``): see ``PrinterLink.set_tray``."""
+        self._running_link().set_tray(
+            ams=ams,
+            slot=slot,
+            tray_info_idx=tray_info_idx,
+            tray_type=tray_type,
+            color_rgba=color_rgba,
+            nozzle_temp_min=nozzle_temp_min,
+            nozzle_temp_max=nozzle_temp_max,
+        )
+
+    def request_full_report(self) -> None:
+        self._running_link().request_full_report()
+
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._inbox = asyncio.Queue()
@@ -297,9 +341,11 @@ class Service:
             asyncio.create_task(self._tariff_loop(), name="bambu-tariff"),
         ]
         link.start()
+        self._link = link
         try:
             await self._stop_requested.wait()
         finally:
+            self._link = None
             await asyncio.to_thread(link.stop)  # joins paho's network thread
             tasks += self._slice_tasks  # a cancelled slice marks its job failed
             for task in tasks:

@@ -92,6 +92,38 @@ def _check_machine(nozzle: str, m: dict) -> None:
         raise AssertionError(f"unexpected nozzle {m.get('nozzle_diameter')!r}, expected {[nozzle]}")
 
 
+def _first(value: object) -> object:
+    """Bambu stores most filament keys as one-element lists."""
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def _temp(value: object) -> int | None:
+    value = _first(value)
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def filament_tray_info(preset: dict) -> dict[str, object]:
+    """What the server's spool record needs for load_spool, from a flattened filament preset.
+
+    Keys are named as the spool tool parameters (``material`` is the preset's filament_type).
+    """
+    filament_id = preset.get("filament_id")
+    material = _first(preset.get("filament_type"))
+    return {
+        "tray_info_idx": filament_id if isinstance(filament_id, str) and filament_id else None,
+        "nozzle_temp_min": _temp(preset.get("nozzle_temperature_range_low")),
+        "nozzle_temp_max": _temp(preset.get("nozzle_temperature_range_high")),
+        "material": material if isinstance(material, str) and material else None,
+    }
+
+
 def flatten_all(cfg: AgentConfig) -> list[Path]:
     """Write machine-<nozzle>, process-<set> and filament-<slug> JSON files; return their paths."""
     idx = _index(preset_roots(cfg))

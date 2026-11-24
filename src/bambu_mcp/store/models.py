@@ -18,6 +18,10 @@ class Spool:
     net_g: float
     remaining_g: float
     active: bool
+    # For load_spool, copied once by the owner from `slice-agent flatten` output.
+    tray_info_idx: str | None = None  # Bambu filament_id of the preset, e.g. "GFA00"
+    nozzle_temp_min: int | None = None  # nozzle_temperature_range_low
+    nozzle_temp_max: int | None = None  # nozzle_temperature_range_high
 
     @property
     def price_per_kg_uah(self) -> float:

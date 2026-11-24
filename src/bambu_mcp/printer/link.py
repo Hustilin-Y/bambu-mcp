@@ -1,7 +1,9 @@
-"""Read-only MQTT link to the printer.
+"""MQTT link to the printer: reads, plus one validated write.
 
-The only network path to the printer in phase 1. It sends nothing but the two
-read commands in ``READ_COMMANDS`` and only after the peer is verified as the
+The only network path to the printer. It sends the two read commands in
+``READ_COMMANDS`` and, since phase 2, exactly one write: ``ams_filament_setting``
+built by ``tray_setting`` (AMS slot material and colour, every field checked).
+Nothing else is ever published, and only after the peer is verified as the
 configured printer.
 
 Peer identity is checked twice: in the TLS handshake (so the access code is
@@ -35,6 +37,30 @@ GET_VERSION: Final = {"info": {"sequence_id": "0", "command": "get_version"}}
 PUSH_ALL: Final = {"pushing": {"sequence_id": "0", "command": "pushall"}}
 READ_COMMANDS: Final = (GET_VERSION, PUSH_ALL)
 
+# The one write: field set of ha-bambulab's AMS_FILAMENT_SETTING_TEMPLATE.
+AMS_FILAMENT_SETTING: Final = "ams_filament_setting"
+TRAY_TYPES: Final = (
+    "PLA", "PETG", "ABS", "ASA", "TPU", "PC", "PA", "PLA-CF", "PETG-CF", "PVA", "PLA-S", "SUPPORT",
+)
+AMS_UNITS: Final = range(4)
+AMS_SLOTS: Final = range(4)
+NOZZLE_TEMP_RANGE: Final = (150, 320)
+_TRAY_KEYS: Final = frozenset(
+    {
+        "sequence_id",
+        "command",
+        "ams_id",
+        "tray_id",
+        "tray_info_idx",
+        "tray_color",
+        "nozzle_temp_min",
+        "nozzle_temp_max",
+        "tray_type",
+    }
+)
+_COLOR_RE: Final = re.compile(r"[0-9A-F]{8}", re.ASCII)
+TRAY_INFO_IDX_RE: Final = re.compile(r"[A-Z0-9]{3,8}", re.ASCII)
+
 PORT: Final = 8883
 USERNAME: Final = "bblp"
 KEEPALIVE_S: Final = 60
@@ -45,6 +71,92 @@ _AUTH_FAILURE_CODES: Final = frozenset({134, 135})  # bad user name or password,
 _PIN_RE: Final = re.compile(r"[0-9a-f]{64}")
 
 Schedule = Callable[[float, Callable[[], None]], None]
+
+
+class PrinterNotConnected(RuntimeError):
+    """A write could not be handed to the printer: nothing was sent."""
+
+
+def _is_int(value: Any) -> bool:
+    return type(value) is int  # not bool, not float
+
+
+def tray_ids(ams: int, slot: int) -> tuple[int, int]:
+    """(``ams_id``, ``tray_id``) for an AMS unit and a slot within it.
+
+    As ha-bambulab does for current firmware: the unit index and the slot index
+    0..3 within that unit. Unverified on the P2S: the first live ``load_spool``
+    must confirm the printer reads them this way.
+    """
+    return ams, slot
+
+
+def tray_setting(
+    *,
+    ams: int,
+    slot: int,
+    tray_info_idx: str,
+    tray_type: str,
+    color_rgba: str,
+    nozzle_temp_min: int,
+    nozzle_temp_max: int,
+) -> dict:
+    """The ``ams_filament_setting`` payload for one AMS slot. ``ValueError`` on any bad field."""
+    if not (_is_int(ams) and ams in AMS_UNITS):
+        raise ValueError("ams must be an integer 0..3")
+    if not (_is_int(slot) and slot in AMS_SLOTS):
+        raise ValueError("slot must be an integer 0..3")
+    if not (isinstance(tray_info_idx, str) and TRAY_INFO_IDX_RE.fullmatch(tray_info_idx)):
+        raise ValueError("tray_info_idx must be 3..8 upper-case letters or digits")
+    if not isinstance(tray_type, str) or tray_type not in TRAY_TYPES:
+        raise ValueError(f"tray_type must be one of {', '.join(TRAY_TYPES)}")
+    if not (isinstance(color_rgba, str) and _COLOR_RE.fullmatch(color_rgba)):
+        raise ValueError("color_rgba must be RRGGBBAA in upper-case hex")
+    low, high = NOZZLE_TEMP_RANGE
+    for name, temp in (("nozzle_temp_min", nozzle_temp_min), ("nozzle_temp_max", nozzle_temp_max)):
+        if not (_is_int(temp) and low <= temp <= high):
+            raise ValueError(f"{name} must be an integer {low}..{high}")
+    if nozzle_temp_min > nozzle_temp_max:
+        raise ValueError("nozzle_temp_min must not be above nozzle_temp_max")
+    ams_id, tray_id = tray_ids(ams, slot)
+    return {
+        "print": {
+            "sequence_id": "0",
+            "command": AMS_FILAMENT_SETTING,
+            "ams_id": ams_id,
+            "tray_id": tray_id,
+            "tray_info_idx": tray_info_idx,
+            "tray_color": color_rgba,
+            "nozzle_temp_min": nozzle_temp_min,
+            "nozzle_temp_max": nozzle_temp_max,
+            "tray_type": tray_type,
+        }
+    }
+
+
+def _is_tray_setting(payload: Any) -> bool:
+    """True only for a payload ``tray_setting`` builds itself, key for key and type for type."""
+    if not isinstance(payload, dict) or set(payload) != {"print"}:
+        return False
+    body = payload["print"]
+    if not isinstance(body, dict) or set(body) != _TRAY_KEYS:
+        return False
+    if body["command"] != AMS_FILAMENT_SETTING or body["sequence_id"] != "0":
+        return False
+    try:
+        # ams_id/tray_id are read back as ams/slot: valid while tray_ids is the identity.
+        rebuilt = tray_setting(
+            ams=body["ams_id"],
+            slot=body["tray_id"],
+            tray_info_idx=body["tray_info_idx"],
+            tray_type=body["tray_type"],
+            color_rgba=body["tray_color"],
+            nozzle_temp_min=body["nozzle_temp_min"],
+            nozzle_temp_max=body["nozzle_temp_max"],
+        )
+    except (ValueError, TypeError):
+        return False
+    return rebuilt == payload
 
 
 class LinkStatus(Enum):
@@ -127,7 +239,7 @@ def build_tls_context(settings: Settings, serial: str | None = None) -> ssl.SSLC
 
 
 class PrinterLink:
-    """Keeps a verified, read-only MQTT session to the printer."""
+    """Keeps a verified MQTT session to the printer: reads and the one tray write."""
 
     def __init__(
         self,
@@ -190,15 +302,54 @@ class PrinterLink:
     def request_full_report(self) -> None:
         self._publish(PUSH_ALL)
 
+    def set_tray(
+        self,
+        ams: int,
+        slot: int,
+        tray_info_idx: str,
+        tray_type: str,
+        color_rgba: str,
+        nozzle_temp_min: int,
+        nozzle_temp_max: int,
+    ) -> None:
+        """Set an AMS slot's material, colour and nozzle temperatures (``ams_filament_setting``).
+
+        ``ValueError`` on a bad field, ``PrinterNotConnected`` when the message was not
+        handed to the connected printer. Never retried: the caller decides.
+        """
+        payload = tray_setting(
+            ams=ams,
+            slot=slot,
+            tray_info_idx=tray_info_idx,
+            tray_type=tray_type,
+            color_rgba=color_rgba,
+            nozzle_temp_min=nozzle_temp_min,
+            nozzle_temp_max=nozzle_temp_max,
+        )
+        if not self._publish(payload):
+            raise PrinterNotConnected("printer link is not connected, nothing was sent")
+        log.info(
+            "sent ams_filament_setting: AMS %d slot %d %s %s %s %d..%d",
+            ams,
+            slot,
+            tray_type,
+            color_rgba,
+            tray_info_idx,
+            nozzle_temp_min,
+            nozzle_temp_max,
+        )
+
     # --- internals ---------------------------------------------------------
 
-    def _publish(self, payload: dict) -> None:
-        if payload not in READ_COMMANDS:
-            raise ValueError("only read commands may be sent to the printer")
+    def _publish(self, payload: dict) -> bool:
+        """Publish an allowed payload. False when the link is not verified or paho refuses it."""
+        if payload not in READ_COMMANDS and not _is_tray_setting(payload):
+            raise ValueError("only the read commands and a valid tray setting may be sent to the printer")
         if not self._verified:
-            log.debug("printer link not verified, read request dropped")
-            return
-        self._client.publish(self._request_topic, json.dumps(payload), qos=0)
+            log.debug("printer link not verified, request dropped")
+            return False
+        info = self._client.publish(self._request_topic, json.dumps(payload), qos=0)
+        return info.rc == mqtt.MQTT_ERR_SUCCESS
 
     def _emit(self, status: LinkStatus) -> None:
         try:

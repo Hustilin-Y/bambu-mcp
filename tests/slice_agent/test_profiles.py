@@ -4,7 +4,8 @@ from pathlib import Path
 import pytest
 
 from slice_agent.config import AgentConfig
-from slice_agent.profiles import flatten_all, preset_roots, resolve_preset
+from slice_agent import app as app_mod
+from slice_agent.profiles import filament_tray_info, flatten_all, preset_roots, resolve_preset
 
 BED = ["0x0", "256x0", "256x256", "0x256"]
 BED_200 = ["0x0", "200x0", "200x200", "0x200"]
@@ -30,8 +31,10 @@ def build_tree(tmp_path: Path, bed=BED) -> Path:
         retraction_length="9", print_settings_id="")
     put(sysroot, "process", PROCESS, inherits="fdm_process_common", type="process", wall_loops="3")
     put(sysroot, "filament", "fdm_filament_pet", type="filament", filament_type=["PETG"],
-        nozzle_temperature=["240"], retraction_length=["7"])
-    put(sysroot, "filament", FILAMENT, inherits="fdm_filament_pet", type="filament", nozzle_temperature=["250"])
+        nozzle_temperature=["240"], retraction_length=["7"], nozzle_temperature_range_low=["220"],
+        nozzle_temperature_range_high=["260"])
+    put(sysroot, "filament", FILAMENT, inherits="fdm_filament_pet", type="filament", nozzle_temperature=["250"],
+        filament_id="GFG99")
     return data
 
 
@@ -136,3 +139,35 @@ def test_nozzle_mismatch_fails(tmp_path):
     bad = AgentConfig(**{**cfg.__dict__, "machine": {"0.6": MACHINE}})
     with pytest.raises(AssertionError, match="nozzle"):
         flatten_all(bad)
+
+
+def test_filament_tray_info_reads_the_flattened_preset():
+    preset = {"name": FILAMENT, "filament_id": "GFG99", "filament_type": ["PETG"],
+              "nozzle_temperature_range_low": ["220"], "nozzle_temperature_range_high": ["260"]}
+    assert filament_tray_info(preset) == {
+        "tray_info_idx": "GFG99", "nozzle_temp_min": 220, "nozzle_temp_max": 260, "material": "PETG",
+    }
+    scalar = {**preset, "filament_type": "PLA", "nozzle_temperature_range_low": "190",
+              "nozzle_temperature_range_high": 230}
+    assert filament_tray_info(scalar)["nozzle_temp_min"] == 190
+    assert filament_tray_info(scalar)["nozzle_temp_max"] == 230
+    assert filament_tray_info(scalar)["material"] == "PLA"
+    assert filament_tray_info({"name": "bare"}) == {
+        "tray_info_idx": None, "nozzle_temp_min": None, "nozzle_temp_max": None, "material": None,
+    }
+    junk = {"filament_id": ["GFG99"], "nozzle_temperature_range_low": ["hot"],
+            "nozzle_temperature_range_high": [], "filament_type": [7]}
+    assert filament_tray_info(junk) == {
+        "tray_info_idx": None, "nozzle_temp_min": None, "nozzle_temp_max": None, "material": None,
+    }
+
+
+def test_flatten_cli_prints_the_spool_fields_per_filament(tmp_path, capsys):
+    cfg = make_cfg(tmp_path, build_tree(tmp_path))
+    assert app_mod.flatten(cfg) == 0
+    out = capsys.readouterr().out
+    assert f"filament {FILAMENT}: tray_info_idx=GFG99 nozzle_temp_min=220 nozzle_temp_max=260 material=PETG" in out
+    assert "assertions OK" in out
+    f = json.loads((cfg.profiles_dir / "filament-generic-petg-bbl-p2s.json").read_text(encoding="utf-8"))
+    assert f["filament_id"] == "GFG99"
+    assert f["nozzle_temperature_range_low"] == ["220"]

@@ -22,6 +22,7 @@ import functools
 import hmac
 import json
 import logging
+import re
 import socket
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import date
@@ -56,7 +57,16 @@ from bambu_mcp.jobs import (
 from bambu_mcp.journal import FIT_VALUES, rebook_grams
 from bambu_mcp.manifest import INFILL_PATTERNS, MAX_MANIFEST_BYTES, ManifestError, parse_manifest
 from bambu_mcp.printer.hms import hms_code, severity
-from bambu_mcp.printer.link import LinkStatus
+from bambu_mcp.printer.link import (
+    AMS_SLOTS,
+    AMS_UNITS,
+    NOZZLE_TEMP_RANGE,
+    TRAY_INFO_IDX_RE,
+    TRAY_TYPES,
+    LinkStatus,
+    PrinterNotConnected,
+    tray_setting,
+)
 from bambu_mcp.printer.state import PrinterState
 from bambu_mcp.proposal import NAMED_SETS, slot_number
 from bambu_mcp.store.db import Store
@@ -84,6 +94,13 @@ HISTORY_MAX = 200
 JOBS_MAX = 50
 SET_KEY = "set"  # slice_job settings: the named set to start from
 PATH_INTAKE_OFF = "path intake is off: upload with `bambu-mcp upload`"
+# gcode_state values (phase 1 names) in which the AMS may be reconfigured.
+LOADABLE_STATES = ("IDLE", "FINISH", "FAILED")
+_SPOOL_HEX_RE = re.compile(r"#?([0-9A-Fa-f]{6})([0-9A-Fa-f]{2})?", re.ASCII)
+LOAD_SPOOL_NOTE = (
+    "Sent once, not retried. Check the AMS slot on the printer screen; "
+    "ams_status shows the printer's next report."
+)
 
 READ = ToolAnnotations(read_only_hint=True)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False)
@@ -105,6 +122,20 @@ class StatusSource(Protocol):
     def start_slice(
         self, job_id: int, explicit: Mapping | None = None, *, named_set: str = ...
     ) -> Job: ...
+
+    def set_tray(
+        self,
+        *,
+        ams: int,
+        slot: int,
+        tray_info_idx: str,
+        tray_type: str,
+        color_rgba: str,
+        nozzle_temp_min: int,
+        nozzle_temp_max: int,
+    ) -> None: ...
+
+    def request_full_report(self) -> None: ...
 
 
 # -- auth ------------------------------------------------------------------------
@@ -175,6 +206,9 @@ def _spool(s: Spool) -> dict[str, Any]:
         "remaining_g": round(s.remaining_g, 1),
         "price_per_kg_uah": _money(s.price_per_kg_uah),
         "active": s.active,
+        "tray_info_idx": s.tray_info_idx,
+        "nozzle_temp_min": s.nozzle_temp_min,
+        "nozzle_temp_max": s.nozzle_temp_max,
     }
 
 
@@ -381,6 +415,84 @@ def _spool_by_id(store: Store, spool_id: int) -> Spool:
     return spool
 
 
+# -- load_spool ----------------------------------------------------------------------
+
+
+def _check_tray_metadata(
+    tray_info_idx: str | None, nozzle_temp_min: int | None, nozzle_temp_max: int | None
+) -> None:
+    """The spool's load_spool fields as they will be stored (None = not set)."""
+    if tray_info_idx is not None and not TRAY_INFO_IDX_RE.fullmatch(tray_info_idx):
+        raise ToolError(
+            "tray_info_idx must be the preset's filament_id: 3..8 upper-case letters or digits, e.g. GFA00"
+        )
+    low, high = NOZZLE_TEMP_RANGE
+    for name, temp in (("nozzle_temp_min", nozzle_temp_min), ("nozzle_temp_max", nozzle_temp_max)):
+        if temp is not None and not low <= temp <= high:
+            raise ToolError(f"{name} must be {low}..{high} °C")
+    if nozzle_temp_min is not None and nozzle_temp_max is not None and nozzle_temp_min > nozzle_temp_max:
+        raise ToolError(f"nozzle_temp_min {nozzle_temp_min} is above nozzle_temp_max {nozzle_temp_max}")
+
+
+def _tray_color(color_hex: str) -> str | None:
+    """``#RRGGBB`` (or ``#RRGGBBAA``) as the AMS wants it: ``RRGGBBAA`` upper-case, alpha FF."""
+    match = _SPOOL_HEX_RE.fullmatch(color_hex)
+    return (match.group(1) + (match.group(2) or "FF")).upper() if match else None
+
+
+def _tray_fields(spool: Spool) -> dict[str, Any]:
+    """``set_tray`` keyword arguments from a spool, or ``ToolError`` naming what is missing."""
+    if not spool.active:
+        raise ToolError(f"spool {spool.id} is inactive (retired): reactivate it with update_spool first")
+    missing = [
+        name
+        for name, value in (
+            ("material", spool.material),
+            ("color_hex", spool.color_hex),
+            ("tray_info_idx", spool.tray_info_idx),
+            ("nozzle_temp_min", spool.nozzle_temp_min),
+            ("nozzle_temp_max", spool.nozzle_temp_max),
+        )
+        if value is None or (isinstance(value, str) and not value.strip())
+    ]
+    if missing:
+        raise ToolError(
+            f"spool {spool.id} lacks {', '.join(missing)}: set them with update_spool "
+            "(tray_info_idx and the nozzle range are printed by `slice-agent flatten`)"
+        )
+    tray_type = spool.material.strip().upper()
+    if tray_type not in TRAY_TYPES:
+        raise ToolError(
+            f"spool {spool.id} material {spool.material!r} is not an AMS type: {', '.join(TRAY_TYPES)}"
+        )
+    color = _tray_color(spool.color_hex.strip())
+    if color is None:
+        raise ToolError(f"spool {spool.id} color_hex {spool.color_hex!r} is not #RRGGBB")
+    return {
+        "tray_info_idx": spool.tray_info_idx,
+        "tray_type": tray_type,
+        "color_rgba": color,
+        "nozzle_temp_min": spool.nozzle_temp_min,
+        "nozzle_temp_max": spool.nozzle_temp_max,
+    }
+
+
+def _check_printer_ready(state: PrinterState, link: LinkStatus, ams: int, slot: int) -> None:
+    if ams not in AMS_UNITS or slot not in AMS_SLOTS:
+        raise ToolError("ams and slot must each be 0..3")
+    if link is not LinkStatus.CONNECTED:
+        raise ToolError(f"the printer is not connected (link {link.value}), nothing was sent")
+    if state.gcode_state not in LOADABLE_STATES:
+        raise ToolError(
+            f"the printer is {state.gcode_state}: load_spool works only when it is "
+            f"{', '.join(LOADABLE_STATES)}, nothing was sent"
+        )
+    units = sorted({t.ams for t in state.trays})
+    if ams not in units:
+        found = ", ".join(map(str, units)) or "none"
+        raise ToolError(f"no AMS unit {ams} in the printer's last report (units: {found}), nothing was sent")
+
+
 # -- app ---------------------------------------------------------------------------
 
 
@@ -467,12 +579,29 @@ def build_mcp(
         price_uah: float,
         net_g: float,
         filament_preset: str | None = None,
+        tray_info_idx: str | None = None,
+        nozzle_temp_min: int | None = None,
+        nozzle_temp_max: int | None = None,
     ) -> dict[str, Any]:
-        """Add a full spool (remaining = net_g). Price in UAH for the whole spool."""
+        """Add a full spool (remaining = net_g). Price in UAH for the whole spool.
+
+        tray_info_idx (the preset's filament_id) and nozzle_temp_min/max (°C) are what
+        load_spool sends to the AMS; `slice-agent flatten` prints them per filament preset.
+        """
         if net_g <= 0 or price_uah < 0:
             raise ToolError("net_g must be positive and price_uah non-negative")
+        _check_tray_metadata(tray_info_idx, nozzle_temp_min, nozzle_temp_max)
         spool_id = store.add_spool(
-            brand, material, color_name, color_hex, filament_preset, price_uah, net_g
+            brand,
+            material,
+            color_name,
+            color_hex,
+            filament_preset,
+            price_uah,
+            net_g,
+            tray_info_idx=tray_info_idx,
+            nozzle_temp_min=nozzle_temp_min,
+            nozzle_temp_max=nozzle_temp_max,
         )
         return _spool(_spool_by_id(store, spool_id))
 
@@ -487,8 +616,14 @@ def build_mcp(
         price_uah: float | None = None,
         net_g: float | None = None,
         active: bool | None = None,
+        tray_info_idx: str | None = None,
+        nozzle_temp_min: int | None = None,
+        nozzle_temp_max: int | None = None,
     ) -> dict[str, Any]:
-        """Change spool fields; omitted fields stay as they are. active=false retires a spool."""
+        """Change spool fields; omitted fields stay as they are. active=false retires a spool.
+
+        tray_info_idx and nozzle_temp_min/max: see add_spool (needed by load_spool).
+        """
         fields = {
             k: v
             for k, v in {
@@ -500,12 +635,20 @@ def build_mcp(
                 "price_uah": price_uah,
                 "net_g": net_g,
                 "active": active,
+                "tray_info_idx": tray_info_idx,
+                "nozzle_temp_min": nozzle_temp_min,
+                "nozzle_temp_max": nozzle_temp_max,
             }.items()
             if v is not None
         }
         if net_g is not None and net_g <= 0:
             raise ToolError("net_g must be positive")
-        _spool_by_id(store, spool_id)
+        current = _spool_by_id(store, spool_id)
+        _check_tray_metadata(  # the values as they will be stored, the other bound included
+            fields.get("tray_info_idx", current.tray_info_idx),
+            fields.get("nozzle_temp_min", current.nozzle_temp_min),
+            fields.get("nozzle_temp_max", current.nozzle_temp_max),
+        )
         with _tool_errors():
             store.update_spool(spool_id, **fields)
         return _spool(_spool_by_id(store, spool_id))
@@ -529,6 +672,39 @@ def build_mcp(
         store.map_slot(ams, slot, spool_id)
         spool = store.slot_spool(ams, slot)
         return {"ams": ams, "slot": slot, "spool": _spool(spool) if spool else None}
+
+    @mcp.tool(annotations=WRITE)
+    async def load_spool(spool_id: int, ams: int, slot: int) -> dict[str, Any]:
+        """Tell the printer which filament is in an AMS slot (material, colour, nozzle range)
+        and map the spool to that slot. The only tool that writes to the printer.
+
+        Needs an idle printer (IDLE, FINISH or FAILED), ams and slot 0..3 of a reported
+        AMS unit, and a spool with material, color_hex, tray_info_idx and nozzle_temp_min/max.
+        Sent once: check the printer screen afterwards.
+        """
+        spool = _spool_by_id(store, spool_id)
+        fields = _tray_fields(spool)
+        # Synchronous from here on: no await between the checks and the send.
+        _check_printer_ready(service.state, service.link_status, ams, slot)
+        sent = tray_setting(ams=ams, slot=slot, **fields)["print"]
+        try:
+            service.set_tray(ams=ams, slot=slot, **fields)
+        except PrinterNotConnected as exc:
+            raise ToolError(str(exc)) from None
+        except ValueError as exc:
+            raise ToolError(f"refused before sending: {exc}") from None
+        store.map_slot(ams, slot, spool_id)
+        try:
+            service.request_full_report()
+        except PrinterNotConnected:
+            log.warning("load_spool sent, but the follow-up full report could not be requested")
+        return {
+            "sent": {k: v for k, v in sent.items() if k != "sequence_id"},
+            "ams": ams,
+            "slot": slot,
+            "spool": _spool(_spool_by_id(store, spool_id)),
+            "note": LOAD_SPOOL_NOTE,
+        }
 
     @mcp.tool(annotations=WRITE)
     async def add_plate(name: str, bed_type: str) -> dict[str, Any]:

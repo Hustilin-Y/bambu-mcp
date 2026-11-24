@@ -21,7 +21,7 @@ from bambu_mcp.store.models import (
 )
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 # schema.sql is the version-1 schema; each later version is one migration script.
 _MIGRATIONS = {
     2: "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
@@ -58,6 +58,10 @@ _MIGRATIONS = {
     # The sliced job a print was matched to by its file name, and the plate printed.
     5: "ALTER TABLE prints ADD COLUMN job_id INTEGER REFERENCES jobs(id);\n"
     "ALTER TABLE prints ADD COLUMN plate INTEGER;",
+    # What load_spool sends to the AMS: the preset's filament_id and nozzle range.
+    6: "ALTER TABLE spools ADD COLUMN tray_info_idx TEXT;\n"
+    "ALTER TABLE spools ADD COLUMN nozzle_temp_min INTEGER;\n"
+    "ALTER TABLE spools ADD COLUMN nozzle_temp_max INTEGER;",
 }
 _SEEN_TTL_S = 30 * 24 * 3600
 _DEFAULT_TARIFF = (date(2024, 6, 1), 4.32, None)
@@ -73,6 +77,9 @@ _SPOOL_FIELDS = frozenset(
         "net_g",
         "remaining_g",
         "active",
+        "tray_info_idx",
+        "nozzle_temp_min",
+        "nozzle_temp_max",
     }
 )
 _PRINT_FIELDS = frozenset(
@@ -98,6 +105,9 @@ def _spool(row: sqlite3.Row) -> Spool:
         net_g=row["net_g"],
         remaining_g=row["remaining_g"],
         active=bool(row["active"]),
+        tray_info_idx=row["tray_info_idx"],
+        nozzle_temp_min=row["nozzle_temp_min"],
+        nozzle_temp_max=row["nozzle_temp_max"],
     )
 
 
@@ -265,12 +275,29 @@ class Store:
         filament_preset: str | None,
         price_uah: float,
         net_g: float,
+        *,
+        tray_info_idx: str | None = None,
+        nozzle_temp_min: int | None = None,
+        nozzle_temp_max: int | None = None,
     ) -> int:
         with self._tx() as conn:
             cur = conn.execute(
                 "INSERT INTO spools (brand, material, color_name, color_hex, filament_preset,"
-                " price_uah, net_g, remaining_g) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (brand, material, color_name, color_hex, filament_preset, price_uah, net_g, net_g),
+                " price_uah, net_g, remaining_g, tray_info_idx, nozzle_temp_min, nozzle_temp_max)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    brand,
+                    material,
+                    color_name,
+                    color_hex,
+                    filament_preset,
+                    price_uah,
+                    net_g,
+                    net_g,
+                    tray_info_idx,
+                    nozzle_temp_min,
+                    nozzle_temp_max,
+                ),
             )
             return int(cur.lastrowid)
 
