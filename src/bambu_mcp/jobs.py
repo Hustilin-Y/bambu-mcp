@@ -18,6 +18,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,7 +37,9 @@ from bambu_mcp.store.models import Job
 
 log = logging.getLogger(__name__)
 
-MAX_FILE_BYTES = 50 * 1024 * 1024
+# The service holds a job's 3MF in memory through a slice (MemoryMax 150M): 20 MB, while
+# the slice-agent on the PC keeps its own 50 MB cap.
+MAX_FILE_BYTES = 20 * 1024 * 1024
 MANIFEST_NAME = "manifest.json"
 JOBS_DIR = "jobs"
 INCOMING = ".incoming"
@@ -53,6 +56,14 @@ class JobTooLarge(JobError):
 
 class JobBusy(Exception):
     """The job is being sliced already."""
+
+
+@dataclass(frozen=True)
+class SliceStart:
+    """A claimed job whose slice runs in the background, and the slot warning it runs with."""
+
+    job: Job
+    warning: str | None  # proposal.SlotChoice.warning: a material mismatch, Russian, Markdown-escaped
 
 
 def _size(n: int) -> str:

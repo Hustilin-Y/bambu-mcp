@@ -34,7 +34,7 @@ from bambu_mcp import mcp_server
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.cost import tariff_check_due
 from bambu_mcp.events import CANCEL_ERROR, Event, EventDetector, EventKind, event_identity
-from bambu_mcp.jobs import JobBusy
+from bambu_mcp.jobs import JobBusy, SliceStart
 from bambu_mcp.journal import NO_SPOOL, TERMINAL_KINDS, Journal, Slot
 from bambu_mcp.logthrottle import Throttle
 from bambu_mcp.manifest import Manifest, ManifestError, parse_manifest, verify_file
@@ -765,13 +765,16 @@ class Service:
 
     def start_slice(
         self, job_id: int, explicit: Mapping | None = None, *, named_set: str = DEFAULT_NAMED_SET
-    ) -> Job:
-        """``slice_job`` in the background: the job is claimed before this returns."""
+    ) -> SliceStart:
+        """``slice_job`` in the background: the job is claimed before this returns.
+
+        The slot warning is returned at once, so a caller that skipped the proposal sees it.
+        """
         job, plan = self._claim(job_id, explicit, named_set)
         task = asyncio.create_task(self._slice_claimed(job, plan), name=f"bambu-slice-{job.id}")
         self._slice_tasks.add(task)
         task.add_done_callback(self._slice_tasks.discard)
-        return job
+        return SliceStart(job, plan.choice.warning)
 
     def _job(self, job_id: int) -> Job:
         job = self._store.job(job_id)
@@ -961,6 +964,7 @@ class Service:
                 "spool_id": choice.spool_id,
                 "tray_type": choice.tray_type,
                 "color": plan.color,
+                "warning": choice.warning,
             },
             "material": plan.material,
             "plate_type": plan.plate_type,

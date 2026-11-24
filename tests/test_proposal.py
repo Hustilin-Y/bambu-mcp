@@ -473,3 +473,17 @@ def test_named_set_value_refused_for_nozzle_names_set_and_key():
     assert resolve_settings({}, None, {}, "strong", nozzle="0.6") == {
         "wall_loops": 4, "sparse_infill_density": 25, "enable_support": False,
     }
+
+
+def test_render_sliced_shows_the_slot_warning():
+    warning = "⚠️ Нужен PETG, а в AMS его нет: выбран слот 1 PLA. Заправь PETG или подтверди печать из PLA"
+    choice = SlotChoice(0, 0, 1, warning, tray_type="PLA", color_name="белый", remaining_g=800.0)
+    cost = CostLine(filament_uah=7.70, power_uah=1.70, kwh=0.39, tariff=TARIFF)
+    part = render_sliced(_job("part"), [{"index": 1, "minutes": 100.2, "grams": {"PLA": 14.0}}], [cost],
+                         settings=SETTINGS, slot_choice=choice, plate_type="Textured PEI Plate")
+    assert part.split("\n")[-1] == warning and part.count("\n") == 1
+    kit = render_sliced(_job("kit", _raw("kit")),
+                        [{"index": 1, "minutes": 20, "grams": {"PLA": 3.0}},
+                         {"index": 2, "minutes": 90, "grams": {"PLA": 18.4}}],
+                        [cost, cost], settings={}, slot_choice=choice, plate_type="Textured PEI Plate")
+    assert kit.split("\n")[-1] == warning and kit.split("\n")[-2].startswith("Всего: ")

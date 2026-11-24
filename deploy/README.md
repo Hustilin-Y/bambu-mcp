@@ -140,7 +140,7 @@ Two ways, both owner only (the `CLIENT_TOKEN_<NAME>` tokens of step 2). The serv
   jobs_root_allowed = "/<cad-workshop checkout on workshop>"
   ```
 
-- `bambu-mcp upload` sends a manifest and the 3MF next to it from the PC (`POST /jobs`, 3MF up to 50 MB) and prints the new job id. The token comes only from the environment variable named by `--token-env` (default `BAMBU_MCP_TOKEN`), never from argv. Use the value of `CLIENT_TOKEN_PC`. In PowerShell, typed at a hidden prompt:
+- `bambu-mcp upload` sends a manifest and the 3MF next to it from the PC (`POST /jobs`, 3MF up to 20 MB) and prints the new job id. The token comes only from the environment variable named by `--token-env` (default `BAMBU_MCP_TOKEN`), never from argv. Use the value of `CLIENT_TOKEN_PC`. In PowerShell, typed at a hidden prompt:
 
   ```
   [Environment]::SetEnvironmentVariable("BAMBU_MCP_TOKEN", [Net.NetworkCredential]::new("", (Read-Host -AsSecureString "token")).Password, "User")

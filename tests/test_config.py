@@ -86,13 +86,13 @@ def test_settings_phase2_keys(tmp_path):
     toml.write_text(
         f'jobs_root_allowed = "{root}"\n'
         'gateway_url = "http://127.0.0.1:8800"\n'
-        'slice_agent_url = "http://192.168.88.10:11436"\n'
+        'slice_agent_url = "http://192.0.2.10:11436"\n'
         'service_url = "http://192.168.88.11:8765"\n'
     )
     s = Settings.load(toml)
     assert s.jobs_root_allowed == Path(root)
     assert s.gateway_url == "http://127.0.0.1:8800"
-    assert s.slice_agent_url == "http://192.168.88.10:11436"
+    assert s.slice_agent_url == "http://192.0.2.10:11436"
     assert s.service_url == "http://192.168.88.11:8765"
 
 

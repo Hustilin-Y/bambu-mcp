@@ -415,3 +415,12 @@ def test_jobs_route_parts_exactly_once(client, store, settings, parts):
 def test_jobs_route_needs_multipart(client):
     r = client.post("/jobs", json={"a": 1}, headers={"Authorization": "Bearer pc-token-abc"})
     assert r.status_code == 422
+
+
+def test_service_3mf_cap_is_20_mb_and_the_agent_keeps_50():
+    from bambu_mcp import upload
+    from slice_agent import app as agent_app
+
+    assert jobs.MAX_FILE_BYTES == 20 * 1024 * 1024
+    assert upload.MAX_FILE_BYTES == jobs.MAX_FILE_BYTES
+    assert agent_app.MAX_FILE_BYTES == 50 * 1024 * 1024

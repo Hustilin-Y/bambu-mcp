@@ -356,7 +356,9 @@ def render_sliced(
     """The slice summary, plain text.
 
     ``plate_results`` are the slice-agent's plates (``{"index", "minutes", "grams":
-    {filament: g}}``), ``cost_lines`` one per plate in the same order.
+    {filament: g}}``), ``cost_lines`` one per plate in the same order. The slot's
+    warning (a material mismatch) ends the text, as in the proposal: a job sliced
+    without a proposal shows it only here.
     """
     if not plate_results or len(plate_results) != len(cost_lines):
         raise ValueError("render_sliced needs one cost line per plate result")
@@ -366,9 +368,10 @@ def render_sliced(
         (int(p["index"]), float(p["minutes"]), sum(float(g) for g in p["grams"].values()), c)
         for p, c in zip(plate_results, cost_lines, strict=True)
     ]
+    warning = [slot_choice.warning] if slot_choice.warning else []
     if manifest.kind != "kit":
         _index, minutes, grams, cost = rows[0]
-        return f"{head} {_result_text(minutes, grams, cost)}"
+        return "\n".join([f"{head} {_result_text(minutes, grams, cost)}", *warning])
     costs = [c for *_, c in rows]
     known = all(c.filament_uah is not None for c in costs)
     total = CostLine(
@@ -379,4 +382,4 @@ def render_sliced(
     )
     lines = [head, *(f"Пластина {i}: {_result_text(m, g, c)}" for i, m, g, c in rows)]
     lines.append(f"Всего: {_result_text(sum(r[1] for r in rows), sum(r[2] for r in rows), total)}")
-    return "\n".join(lines)
+    return "\n".join([*lines, *warning])

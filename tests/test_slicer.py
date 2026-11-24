@@ -21,7 +21,7 @@ from slice_agent.runner import SliceRun
 
 GATEWAY = "http://192.168.88.11:8780"
 GATEWAY_KEY = "gateway-secret-key"
-AGENT = "http://192.168.88.20:11436"
+AGENT = "http://192.0.2.20:11436"
 TOKEN = "slice-secret-token"
 PNG = b"\x89PNG\r\n\x1a\nplate"
 UPLOAD = b"PK\x03\x04" + b"model-bytes" * 10

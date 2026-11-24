@@ -1345,7 +1345,7 @@ async def test_build_slicer(tmp_path, caplog):
             assert build_slicer(SECRETS, Settings(data_dir=tmp_path), http) == (None, None)
         full = Secrets(**{**SECRETS.__dict__, "gateway_key": "gw-key", "slice_agent_token": "agent-token"})
         settings = Settings(
-            data_dir=tmp_path, gateway_url="http://192.168.88.11:8780", slice_agent_url="http://192.168.88.20:11436"
+            data_dir=tmp_path, gateway_url="http://192.0.2.11:8780", slice_agent_url="http://192.0.2.20:11436"
         )
         client, waker = build_slicer(full, settings, http)
         assert isinstance(client, SliceClient) and isinstance(waker, GatewayWaker)

@@ -50,6 +50,7 @@ from bambu_mcp.jobs import (
     JobError,
     JobTooLarge,
     JobUpload,
+    SliceStart,
     create_job_from_bytes,
     create_job_from_path,
     incoming_dir,
@@ -123,7 +124,7 @@ class StatusSource(Protocol):
 
     def start_slice(
         self, job_id: int, explicit: Mapping | None = None, *, named_set: str = ...
-    ) -> Job: ...
+    ) -> SliceStart: ...
 
     def set_tray(
         self,
@@ -406,8 +407,16 @@ def _job_status(store: Store, job: Job, tz: ZoneInfo) -> dict[str, Any]:
         "plate_type": result.get("plate_type"),
         "nozzle": result.get("nozzle") or _stored_nozzle(job),
         "plates": _job_plates(result),
+        "warning": _slot_warning(result),
         "error": job.error,
     }
+
+
+def _slot_warning(result: Mapping) -> str | None:
+    """The material mismatch the job was sliced with (``SlotChoice.warning``), if any."""
+    slot = result.get("slot")
+    warning = slot.get("warning") if isinstance(slot, dict) else None
+    return warning if isinstance(warning, str) and warning else None
 
 
 def _spool_by_id(store: Store, spool_id: int) -> Spool:
@@ -824,6 +833,7 @@ def build_mcp(
         (0..100), sparse_infill_pattern, wall_loops (1..10), wall_generator, enable_support,
         support_type, brim_type, curr_bed_type, layer_height. They win over the part's last
         settings and its hints. Follow it with job_status; the summary also goes to Telegram.
+        `warning` is the AMS slot warning (a material mismatch, Russian) or null: tell the owner.
         """
         job = job_or_error(job_id)
         explicit, named = explicit_settings(settings, _job_nozzle(job))
@@ -831,19 +841,19 @@ def build_mcp(
         try:
             # The Telegram button's path: claimed now, sliced in a background task, so a
             # cancelled tool call never interrupts the slice.
-            service.start_slice(job_id, explicit, **options)
+            started = service.start_slice(job_id, explicit, **options)
         except JobBusy:
             raise ToolError(f"job {job_id} is being sliced already") from None
         except KeyError:
             raise ToolError(f"job {job_id} not found") from None
         except ValueError as exc:
             raise ToolError(str(exc)) from None
-        return {"job_id": job_id, "status": "slicing"}
+        return {"job_id": job_id, "status": "slicing", "warning": started.warning}
 
     @mcp.tool(annotations=READ)
     async def job_status(job_id: int) -> dict[str, Any]:
         """A job: status, settings, AMS slot, plate type, nozzle, per-plate minutes, grams and
-        cost (UAH), the sliced file name and the last error."""
+        cost (UAH), the sliced file name, the slot warning (material mismatch) and the last error."""
         return _job_status(store, job_or_error(job_id), tz)
 
     @mcp.tool(annotations=READ)

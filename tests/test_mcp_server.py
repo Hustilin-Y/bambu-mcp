@@ -858,7 +858,7 @@ def test_slice_job_returns_at_once_and_refuses_a_second_start(jh):
     job_id = jh.add_job()
     jh.slicer.hold.set()
     started = jh.call("slice_job", job_id=job_id)
-    assert started == {"job_id": job_id, "status": "slicing"}
+    assert started == {"job_id": job_id, "status": "slicing", "warning": None}
     assert jh.call("job_status", job_id=job_id)["status"] == "slicing"
     assert jh.error("slice_job", job_id=job_id) == f"job {job_id} is being sliced already"
     jh.slicer.hold.clear()
@@ -975,3 +975,33 @@ def test_job_status_with_an_unreadable_manifest_has_no_nozzle(jh):
         conn.execute("UPDATE jobs SET manifest_json = '{' WHERE id = ?", (job_id,))
     status = jh.call("job_status", job_id=job_id)
     assert status["status"] == "new" and status["nozzle"] is None
+
+
+
+def test_material_mismatch_warning_without_a_proposal(jh):
+    # The part's hint says PETG, only PLA is loaded: Claude Code calls slice_job directly.
+    jh.service._state = replace(PrinterState.empty(), trays=(Tray(0, 0, "PLA", "161616FF", None),))
+    pla = jh.store.add_spool("Elegoo", "PLA", "black", "#161616", "Generic PLA @BBL P2S", 500.0, 1000.0)
+    jh.store.map_slot(0, 0, pla)
+    job_id = jh.add_job()
+    warning = "⚠️ Нужен PETG, а в AMS его нет: выбран слот 1 PLA. Заправь PETG или подтверди печать из PLA"
+
+    started = jh.call("slice_job", job_id=job_id)
+    assert started == {"job_id": job_id, "status": "slicing", "warning": warning}
+    jh.wait_status(job_id, "sliced")
+
+    assert jh.call("job_status", job_id=job_id)["warning"] == warning
+    assert jh.store.outbox_count() == 1  # no proposal was queued, only the summary
+    (summary,) = [
+        row["text"]
+        for row in jh.store._conn().execute("SELECT kind, text FROM outbox WHERE kind = 'job_sliced'")
+    ]
+    assert summary.split("\n")[-1] == warning
+    assert "слот 1 PLA" in summary
+
+
+def test_job_status_without_a_mismatch_has_no_warning(jh):
+    job_id = jh.add_job()
+    assert jh.call("slice_job", job_id=job_id)["warning"] is None
+    jh.wait_status(job_id, "sliced")
+    assert jh.call("job_status", job_id=job_id)["warning"] is None
