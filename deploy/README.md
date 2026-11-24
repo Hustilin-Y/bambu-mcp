@@ -202,7 +202,7 @@ Spool records have three new fields for `load_spool`: `tray_info_idx`, `nozzle_t
 
 It sends once and does not retry: check the slot on the printer screen. Nothing checks that the spool's material belongs to the `tray_info_idx` filament family, so a wrong id sets the wrong filament profile on the printer.
 
-Still open (plan Task 10, Step 6): the owner has not yet confirmed on the idle printer the `ams_id`/`tray_id` numbering, that `PLA-S` is accepted, and that the next `pushall` shows the new type and colour. Treat `load_spool` as unverified until then.
+Checked live on 2026-11-24 (plan Task 10, Step 6): `ams_id` is the AMS unit and `tray_id` the slot within it (slot 2 of AMS 0 is `tray_id` 1), the printer takes the type, colour and nozzle range, and the next report shows them while the other slots stay as they were. `PLA-S` is not checked yet.
 
 ## Checks after deploy
 
