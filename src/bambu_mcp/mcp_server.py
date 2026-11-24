@@ -68,7 +68,7 @@ from bambu_mcp.printer.link import (
     PrinterNotConnected,
 )
 from bambu_mcp.printer.state import PrinterState
-from bambu_mcp.proposal import NAMED_SETS, slot_number
+from bambu_mcp.proposal import MAX_SLOT_NUMBER, NAMED_SETS, slot_number
 from bambu_mcp.store.db import Store
 from bambu_mcp.store.models import Job, Plate, PrintRow, Spool, Tariff
 from slice_agent.runner import (
@@ -120,10 +120,10 @@ class StatusSource(Protocol):
     @property
     def state_fresh(self) -> bool: ...
 
-    async def propose(self, job_id: int) -> str: ...
+    async def propose(self, job_id: int, slot: int | None = None) -> str: ...
 
     def start_slice(
-        self, job_id: int, explicit: Mapping | None = None, *, named_set: str = ...
+        self, job_id: int, explicit: Mapping | None = None, *, named_set: str = ..., slot: int | None = None
     ) -> SliceStart: ...
 
     def set_tray(
@@ -404,6 +404,7 @@ def _job_status(store: Store, job: Job, tz: ZoneInfo) -> dict[str, Any]:
         "settings": _loads(job.settings_json),
         "named_set": result.get("named_set"),
         "slot": _job_slot(store, result),
+        "chosen_slot": job.slot,
         "plate_type": result.get("plate_type"),
         "nozzle": result.get("nozzle") or _stored_nozzle(job),
         "plates": _job_plates(result),
@@ -417,6 +418,12 @@ def _slot_warning(result: Mapping) -> str | None:
     slot = result.get("slot")
     warning = slot.get("warning") if isinstance(slot, dict) else None
     return warning if isinstance(warning, str) and warning else None
+
+
+def _check_slot_number(slot: int | None) -> None:
+    """The owner's slot number range; whether it can be printed from is the service's check."""
+    if slot is not None and not 1 <= slot <= MAX_SLOT_NUMBER:
+        raise ToolError(f"slot must be 1..{MAX_SLOT_NUMBER}, got {slot}")
 
 
 def _spool_by_id(store: Store, spool_id: int) -> Spool:
@@ -811,14 +818,21 @@ def build_mcp(
         return {"job_id": job.id, "name": job.name, "kind": job.kind, "status": job.status}
 
     @mcp.tool(annotations=WRITE)
-    async def propose_job(job_id: int) -> dict[str, Any]:
-        """Send the job's proposal (settings, AMS slot, plate) to Telegram with slice/change buttons.
+    async def propose_job(job_id: int, slot: int | None = None) -> dict[str, Any]:
+        """Send the job's proposal (settings, AMS slot, plate) to Telegram with slice, change and
+        slot buttons.
 
+        `slot` (1..16, AMS 1 is 1..4, AMS 2 is 5..8) is the owner's choice of AMS slot: pass it
+        only when the owner names one. It is stored with the job and used by later slices.
+        Without it the stored slot is used, else the slot whose material matches the part.
         Returns the same text. Nothing is sliced or printed.
         """
         job_or_error(job_id)
+        _check_slot_number(slot)
         try:
-            text = await service.propose(job_id)
+            text = await service.propose(job_id, slot)
+        except JobBusy:
+            raise ToolError(f"job {job_id} is being sliced already") from None
         except KeyError:
             raise ToolError(f"job {job_id} not found") from None
         except ValueError as exc:
@@ -826,18 +840,26 @@ def build_mcp(
         return {"job_id": job_id, "text": text}
 
     @mcp.tool(annotations=WRITE)
-    async def slice_job(job_id: int, settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def slice_job(
+        job_id: int, settings: dict[str, Any] | None = None, slot: int | None = None
+    ) -> dict[str, Any]:
         """Start slicing a job on the owner's PC (woken if needed). Returns at once, never prints.
 
         `settings`: {"set": "standard" | "strong" | "draft"} and/or overrides: sparse_infill_density
         (0..100), sparse_infill_pattern, wall_loops (1..10), wall_generator, enable_support,
         support_type, brim_type, curr_bed_type, layer_height. They win over the part's last
-        settings and its hints. Follow it with job_status; the summary also goes to Telegram.
-        `warning` is the AMS slot warning (a material mismatch, Russian) or null: tell the owner.
+        settings and its hints. `slot` (1..16) is the owner's choice of AMS slot: pass it only
+        when the owner names one. It is stored with the job. Without it the job's stored slot
+        is used, else the slot whose material matches the part. Follow it with job_status; the
+        summary also goes to Telegram. `warning` is the AMS slot warning (a material mismatch,
+        Russian) or null: tell the owner.
         """
         job = job_or_error(job_id)
         explicit, named = explicit_settings(settings, _job_nozzle(job))
-        options = {"named_set": named} if named else {}
+        _check_slot_number(slot)
+        options: dict[str, Any] = {"named_set": named} if named else {}
+        if slot is not None:
+            options["slot"] = slot
         try:
             # The Telegram button's path: claimed now, sliced in a background task, so a
             # cancelled tool call never interrupts the slice.
@@ -852,8 +874,9 @@ def build_mcp(
 
     @mcp.tool(annotations=READ)
     async def job_status(job_id: int) -> dict[str, Any]:
-        """A job: status, settings, AMS slot, plate type, nozzle, per-plate minutes, grams and
-        cost (UAH), the sliced file name, the slot warning (material mismatch) and the last error."""
+        """A job: status, settings, AMS slot it was sliced with, the owner's chosen slot (1..16 or
+        null: by material), plate type, nozzle, per-plate minutes, grams and cost (UAH), the
+        sliced file name, the slot warning (material mismatch) and the last error."""
         return _job_status(store, job_or_error(job_id), tz)
 
     @mcp.tool(annotations=READ)

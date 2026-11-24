@@ -90,3 +90,4 @@ class Job:
     result_json: str | None
     sliced_file: str | None  # a file name, never a path
     error: str | None
+    slot: int | None = None  # the owner's AMS slot choice (1..16), None: chosen by material

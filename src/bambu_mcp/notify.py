@@ -70,7 +70,10 @@ class Press:
 
 
 class Notifier(Protocol):
-    """``send`` makes one attempt: the message id (None when only logged) or ``SendError``."""
+    """``send`` makes one attempt: the message id (None when only logged) or ``SendError``.
+
+    ``edit`` returns False when the add-in did not take the edit (after its retries).
+    """
 
     async def send(
         self,
@@ -87,7 +90,7 @@ class Notifier(Protocol):
         message_id: str,
         text: str | None = None,
         buttons: list[list[Button]] | None = None,
-    ) -> None: ...
+    ) -> bool: ...
 
     def presses(self) -> AsyncIterator[Press]: ...
 
@@ -117,8 +120,9 @@ class LogNotifier:
         message_id: str,
         text: str | None = None,
         buttons: list[list[Button]] | None = None,
-    ) -> None:
+    ) -> bool:
         log.info("notify edit (log only): message %s", message_id)
+        return True  # nothing to deliver, so nothing to send again
 
     async def presses(self) -> AsyncIterator[Press]:
         return
@@ -248,13 +252,13 @@ class ServiceNotifyClient:
         message_id: str,
         text: str | None = None,
         buttons: list[list[Button]] | None = None,
-    ) -> None:
+    ) -> bool:
         payload: dict[str, Any] = {}
         if text is not None:
             payload["text"] = text
         if buttons is not None:
             payload["buttons"] = _buttons_json(buttons)
-        await self._request("PATCH", f"/v1/messages/{message_id}", json=payload)
+        return await self._request("PATCH", f"/v1/messages/{message_id}", json=payload) is not None
 
     async def presses(self) -> AsyncIterator[Press]:
         """Long-poll forever. Each press is yielded once, in seq order within a batch."""

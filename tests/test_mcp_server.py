@@ -1005,3 +1005,60 @@ def test_job_status_without_a_mismatch_has_no_warning(jh):
     assert jh.call("slice_job", job_id=job_id)["warning"] is None
     jh.wait_status(job_id, "sliced")
     assert jh.call("job_status", job_id=job_id)["warning"] is None
+
+
+# -- the owner's slot choice (Task 12) --------------------------------------------------
+
+
+def test_slice_job_with_a_slot_uses_its_spool_and_returns_the_mismatch(jh):
+    # A PLA part printed from the blue PETG in slot 2, as the owner asked.
+    jh.service._state = replace(
+        PrinterState.empty(), trays=(Tray(0, 0, "PLA", "FFFFFFFF", None), Tray(0, 1, "PETG", "1E4FC8FF", None))
+    )
+    pla = jh.store.add_spool("Elegoo", "PLA", "white", "#FFFFFF", "Generic PLA @BBL P2S", 500.0, 1000.0)
+    jh.store.map_slot(0, 0, pla)
+    blue = jh.store.add_spool("Elegoo", "PETG", "синий", "#1E4FC8", "Generic PETG HF @BBL P2S", 600.0, 1000.0)
+    jh.store.map_slot(0, 1, blue)
+    job_id = jh.add_job(hints={}, profile={"material": "PLA", "nozzle_mm": 0.4})
+    warning = "⚠️ Нужен PLA, а выбран слот 2 PETG: печать будет из PETG"
+
+    started = jh.call("slice_job", job_id=job_id, slot=2)
+    assert started == {"job_id": job_id, "status": "slicing", "warning": warning}
+    jh.wait_status(job_id, "sliced")
+    assert jh.slicer.requests[0].filament == "Generic PETG HF @BBL P2S"
+    status = jh.call("job_status", job_id=job_id)
+    assert status["chosen_slot"] == 2 and status["warning"] == warning
+    assert status["slot"]["number"] == 2 and status["slot"]["spool"] == "Elegoo PETG синий"
+
+
+def test_bad_slot_lists_the_usable_ones_and_wakes_nothing(jh):
+    job_id = jh.add_job()
+    # Slot 2 holds PLA but no spool is mapped to it, slot 3 is not in the report.
+    for tool in ("slice_job", "propose_job"):
+        for slot in (2, 3):
+            text = jh.error(tool, job_id=job_id, slot=slot)
+            assert text == (
+                f"slot {slot} is empty or has no active spool with a filament preset, usable: 1 PETG white"
+            )
+        for slot in (0, 17):
+            assert jh.error(tool, job_id=job_id, slot=slot) == f"slot must be 1..16, got {slot}"
+    assert jh.waker.calls == 0 and jh.slicer.requests == []
+    assert jh.store.outbox_count() == 0
+    job = jh.store.job(job_id)
+    assert (job.status, job.slot) == ("new", None)
+
+
+def test_propose_job_with_a_slot_is_stored_and_shown_by_job_status(jh):
+    job_id = jh.add_job()
+    assert jh.call("job_status", job_id=job_id)["chosen_slot"] is None
+    result = jh.call("propose_job", job_id=job_id, slot=1)
+    assert "слот 1 PETG white" in result["text"]
+    assert jh.call("job_status", job_id=job_id)["chosen_slot"] == 1
+
+
+def test_slot_tool_descriptions_name_the_owners_choice(jh):
+    tools = {t["name"]: t for t in jh.rpc("tools/list")["tools"]}
+    for name in ("propose_job", "slice_job"):
+        description = tools[name]["description"]
+        assert "owner" in description and "material" in description, name
+        assert "slot" in tools[name]["inputSchema"]["properties"], name

@@ -19,6 +19,7 @@ from bambu_mcp.proposal import (
     last_settings,
     pick_slot,
     resolve_settings,
+    slot_number,
 )
 from bambu_mcp.store.models import Job, Spool, Tariff
 from slice_agent.runner import Overrides
@@ -487,3 +488,95 @@ def test_render_sliced_shows_the_slot_warning():
                          {"index": 2, "minutes": 90, "grams": {"PLA": 18.4}}],
                         [cost, cost], settings={}, slot_choice=choice, plate_type="Textured PEI Plate")
     assert kit.split("\n")[-1] == warning and kit.split("\n")[-2].startswith("Всего: ")
+
+
+# -- owner's slot choice (Task 12) ---------------------------------------------------
+
+
+def _preset_spool(id, material, color, **changes) -> Spool:
+    return replace(_spool(id, material=material, color=color), filament_preset=f"Generic {material}", **changes)
+
+
+def test_slot_number_round_trip_over_16_slots():
+    from bambu_mcp.proposal import slot_position
+
+    assert [slot_number(*slot_position(n)) for n in range(1, 17)] == list(range(1, 17))
+    assert [slot_position(n) for n in (1, 2, 4, 5, 16)] == [(0, 0), (0, 1), (0, 3), (1, 0), (3, 3)]
+    for bad in (0, 17, -1, True):
+        with pytest.raises(ValueError, match="1..16"):
+            slot_position(bad)
+
+
+def test_usable_slots_need_a_loaded_tray_and_an_active_spool_with_a_preset():
+    from bambu_mcp.proposal import usable_slots
+
+    trays = (
+        _tray(0, 0, "PLA"), _tray(0, 1, "PETG"), _tray(0, 2, "PETG"), _tray(0, 3, None, None),
+        _tray(1, 0, "PLA"), _tray(1, 1, "PLA"),
+    )
+    spools = {
+        (0, 0): _preset_spool(1, "PLA", "белый"),
+        (0, 1): _preset_spool(2, "PETG", "синий"),
+        (0, 2): _spool(3),  # no preset
+        (0, 3): _preset_spool(4, "PLA", "серый"),  # tray empty
+        (1, 0): _preset_spool(5, "PLA", "красный", active=False),
+    }
+    usable = usable_slots(trays, spools)
+    assert [(u.number, u.label) for u in usable] == [(1, "1 PLA белый"), (2, "2 PETG синий")]
+    assert usable[1].spool.id == 2 and (usable[1].ams, usable[1].slot) == (0, 1)
+
+
+def test_pick_slot_forced_slot_with_the_matching_material():
+    trays = (_tray(0, 0, "PETG"), _tray(0, 1, "PETG"))
+    spools = {(0, 0): _preset_spool(1, "PETG", "чёрный"), (0, 1): _preset_spool(2, "PETG", "синий", remaining_g=5.0)}
+    choice = pick_slot(trays, spools, "PETG", "чёрный", forced=(0, 1))
+    assert (choice.ams, choice.slot, choice.spool_id, choice.warning) == (0, 1, 2, None)
+    assert (choice.tray_type, choice.color_name, choice.remaining_g) == ("PETG", "синий", 5.0)
+    # Without a forced slot the material match is unchanged.
+    assert pick_slot(trays, spools, "PETG", "чёрный").slot == 0
+
+
+def test_pick_slot_forced_slot_keeps_the_material_mismatch_warning():
+    trays = (_tray(0, 0, "PLA"), _tray(0, 1, "PETG"))
+    spools = {(0, 0): _preset_spool(1, "PLA", "белый"), (0, 1): _preset_spool(2, "PETG", "синий", remaining_g=10.0)}
+    choice = pick_slot(trays, spools, "PLA", None, forced=(0, 1))
+    assert (choice.ams, choice.slot, choice.spool_id) == (0, 1, 2)
+    assert choice.warning == "⚠️ Нужен PLA, а выбран слот 2 PETG: печать будет из PETG"
+    assert "—" not in choice.warning and ";" not in choice.warning
+    # The remainder warning comes from the forced slot's spool.
+    text = render_proposal(_job(), SETTINGS, choice, "Textured PEI Plate", None)
+    assert choice.warning in text and "На катушке" in text
+
+
+def test_pick_slot_forced_slot_must_be_usable():
+    from bambu_mcp.proposal import SlotUnusable
+
+    trays = (_tray(0, 0, "PLA"), _tray(0, 1, "PETG"), _tray(0, 2, "PETG"), _tray(0, 3, None, None))
+    spools = {(0, 1): _preset_spool(2, "PETG", "синий"), (0, 2): _spool(3)}
+    for forced, number in (((0, 0), 1), ((0, 2), 3), ((0, 3), 4), ((1, 0), 5)):
+        with pytest.raises(SlotUnusable) as info:
+            pick_slot(trays, spools, "PLA", None, forced=forced)
+        assert info.value.number == number
+        assert str(info.value) == (
+            f"slot {number} is empty or has no active spool with a filament preset, usable: 2 PETG синий"
+        )
+    with pytest.raises(SlotUnusable, match="usable: none"):
+        pick_slot(trays, {}, "PLA", None, forced=(0, 1))
+
+
+def test_slot_buttons_mark_the_chosen_slot():
+    from bambu_mcp.messages import slot_buttons
+    from bambu_mcp.proposal import UsableSlot
+
+    usable = [
+        UsableSlot(n, *divmod(n - 1, 4), _preset_spool(n, "PETG", "синий" if n != 3 else "x" * 80))
+        for n in range(1, 18)
+    ]
+    rows = slot_buttons(7, usable, chosen=2)
+    assert [len(r) for r in rows] == [4, 4, 4, 4]  # at most 16, four per row
+    flat = [b for row in rows for b in row]
+    assert flat[0].id == "job:7:slot:1" and flat[0].text == "1 PETG синий"
+    assert flat[1].text == "✓ 2 PETG синий"
+    assert len(flat[2].text) == 64 and flat[2].text.startswith("3 PETG x")
+    assert flat[-1].id == "job:7:slot:16"
+    assert slot_buttons(7, [], chosen=None) == []

@@ -21,7 +21,7 @@ from bambu_mcp.store.models import (
 )
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 # schema.sql is the version-1 schema; each later version is one migration script.
 _MIGRATIONS = {
     2: "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
@@ -62,6 +62,8 @@ _MIGRATIONS = {
     6: "ALTER TABLE spools ADD COLUMN tray_info_idx TEXT;\n"
     "ALTER TABLE spools ADD COLUMN nozzle_temp_min INTEGER;\n"
     "ALTER TABLE spools ADD COLUMN nozzle_temp_max INTEGER;",
+    # The AMS slot the owner chose for a job (1..16 as the owner counts), NULL: by material.
+    7: "ALTER TABLE jobs ADD COLUMN slot INTEGER CHECK (slot BETWEEN 1 AND 16);",
 }
 _SEEN_TTL_S = 30 * 24 * 3600
 _DEFAULT_TARIFF = (date(2024, 6, 1), 4.32, None)
@@ -85,7 +87,7 @@ _SPOOL_FIELDS = frozenset(
 _PRINT_FIELDS = frozenset(
     {"spool_id", "grams", "kwh", "cost_filament_uah", "cost_power_uah", "fit", "source", "job_id", "plate"}
 )
-_JOB_FIELDS = frozenset({"status", "settings_json", "result_json", "sliced_file", "error"})
+_JOB_FIELDS = frozenset({"status", "settings_json", "result_json", "sliced_file", "error", "slot"})
 
 
 def _norm(identity: tuple) -> tuple[str, str, str]:
@@ -147,6 +149,7 @@ def _job(row: sqlite3.Row) -> Job:
         result_json=row["result_json"],
         sliced_file=row["sliced_file"],
         error=row["error"],
+        slot=row["slot"],
     )
 
 

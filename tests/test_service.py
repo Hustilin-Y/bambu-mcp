@@ -14,10 +14,10 @@ from bambu_mcp import jobs as jobs_module
 from bambu_mcp import mcp_server
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.messages import render_proposal, render_sliced
-from bambu_mcp.notify import LogNotifier, Press, SendError, ServiceNotifyClient
+from bambu_mcp.notify import Button, LogNotifier, Press, SendError, ServiceNotifyClient
 from bambu_mcp.printer.link import LinkStatus, PrinterNotConnected, tray_setting
 from bambu_mcp.printer.state import PrinterState, Tray
-from bambu_mcp.proposal import SlotChoice, estimate_cost
+from bambu_mcp.proposal import SlotChoice, SlotUnusable, estimate_cost
 from bambu_mcp.service import (
     AUTH_FAILED_TEXT,
     CHANGE_TEXT,
@@ -78,6 +78,8 @@ class RecordingNotifier:
     def __init__(self) -> None:
         self.sent: list[dict] = []
         self.edits: list[tuple[str, str | None]] = []
+        self.edit_buttons: list[list[list[Button]] | None] = []
+        self.edit_ok = True
         self.press_queue: asyncio.Queue[Press] = asyncio.Queue()
         self.fail = False
         self.attempts = 0
@@ -93,6 +95,8 @@ class RecordingNotifier:
 
     async def edit(self, message_id, text=None, buttons=None):
         self.edits.append((message_id, text))
+        self.edit_buttons.append(buttons)
+        return self.edit_ok
 
     async def presses(self):
         while True:
@@ -991,7 +995,9 @@ async def test_propose_sends_the_summary_with_slice_and_change_buttons(tmp_path)
     await drain(service)
     choice = SlotChoice(0, 0, spool, None, tray_type="PETG", color_name="белый", remaining_g=1000.0)
     assert notifier.sent[0]["text"] == render_proposal(job, OVERRIDES, choice, "Textured PEI Plate", None)
-    assert notifier.button_ids(0) == [f"job:{job.id}:slice", f"job:{job.id}:change"]
+    assert notifier.button_ids(0) == [f"job:{job.id}:slice", f"job:{job.id}:change", f"job:{job.id}:slot:1"]
+    # Only slot 1 has a spool with a preset: slots 2 and 3 are loaded but not mapped.
+    assert notifier.sent[0]["buttons"][1] == [Button(f"job:{job.id}:slot:1", "✓ 1 petg белый")]
     assert store.job(job.id).status == "new"
     store.close()
 
@@ -1306,7 +1312,7 @@ async def test_change_press_edits_the_message(harness):
     await queue.put(Press(9, "m3", f"job:{job.id}:change", T0))
     await until(lambda: harness.notifier.edits)
     assert harness.notifier.edits == [("m3", CHANGE_TEXT)]
-    assert CHANGE_TEXT == "Скажи ассистенту, что поменять: стенки, заполнение, поддержки, пластину"
+    assert CHANGE_TEXT == "Скажи ассистенту, что поменять: слот, стенки, заполнение, поддержки, пластину"
     assert harness.store.job(job.id).status == "new"
 
 
@@ -1462,3 +1468,146 @@ async def test_short_summary_is_the_picture_caption(tmp_path):
     await drain(service)
     assert len(notifier.sent) == 1 and notifier.sent[0]["files"] == [("plate-1.png", PNG)]
     store.close()
+
+
+# -- the owner's slot choice (Task 12) --------------------------------------------------
+
+BLUE_PRESET = "Generic PETG HF @BBL P2S"
+
+
+def add_blue_spool(store: Store) -> int:
+    """A second PETG spool with its own preset in slot 2 (ams 0, slot 1)."""
+    spool = store.add_spool("Elegoo", "PETG", "синий", "#1E4FC8", BLUE_PRESET, 600.0, 1000.0)
+    store.map_slot(0, 1, spool)
+    return spool
+
+
+def flat_buttons(rows) -> list[Button]:
+    return [b for row in rows or [] for b in row]
+
+
+async def test_propose_with_a_slot_stores_it_and_marks_its_button(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)
+    add_blue_spool(store)
+    job = add_job(store, service._settings)
+    text = await service.propose(job.id, slot=2)
+    assert store.job(job.id).slot == 2
+    assert "слот 2 PETG синий" in text
+    await drain(service)
+    assert notifier.sent[0]["text"] == text
+    assert [b.text for b in flat_buttons(notifier.sent[0]["buttons"][1:])] == ["1 petg белый", "✓ 2 PETG синий"]
+    # A later proposal without a slot keeps the stored one.
+    assert "слот 2 PETG синий" in await service.propose(job.id)
+    store.close()
+
+
+async def test_propose_with_a_slot_is_refused_while_slicing(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)
+    add_blue_spool(store)
+    job = add_job(store, service._settings)
+    store.update_job(job.id, status="slicing")
+    with pytest.raises(JobBusy):
+        await service.propose(job.id, slot=2)
+    assert store.job(job.id).slot is None
+    assert notifier.sent == []
+    store.close()
+
+
+async def test_slice_job_with_a_slot_stores_it_and_uses_its_preset(tmp_path):
+    slicer, waker = FakeSlicer(), FakeWaker()
+    service, store, _ = job_service(tmp_path, slicer, waker)
+    add_spool(store)
+    blue = add_blue_spool(store)
+    job = add_job(store, service._settings)
+    done = await service.slice_job(job.id, slot=2)
+    assert done.slot == 2 and done.status == "sliced"
+    assert slicer.requests[0].filament == BLUE_PRESET
+    slot = json.loads(done.result_json)["slot"]
+    assert (slot["ams"], slot["slot"], slot["spool_id"], slot["warning"]) == (0, 1, blue, None)
+    store.close()
+
+
+async def test_unusable_slot_refused_before_anything_changes(tmp_path):
+    waker = FakeWaker()
+    service, store, _ = job_service(tmp_path, waker=waker)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    for number in (2, 4):  # 2: loaded, no spool mapped; 4: empty tray
+        with pytest.raises(SlotUnusable, match=f"slot {number} .*usable: 1 petg белый"):
+            await service.slice_job(job.id, slot=number)
+        with pytest.raises(SlotUnusable):
+            await service.propose(job.id, slot=number)
+    after = store.job(job.id)
+    assert (after.status, after.slot) == ("new", None)
+    assert waker.budgets == [] and store.outbox_count() == 0
+    store.close()
+
+
+async def slot_harness(harness, **slicer_kwargs):
+    harness.slicer, harness.waker = FakeSlicer(**slicer_kwargs), FakeWaker()
+    harness.settings = job_settings(harness.settings.data_dir)
+    service = await harness.start()
+    service._state = replace(PrinterState.empty(), trays=TRAYS)
+    add_spool(harness.store)
+    blue = add_blue_spool(harness.store)
+    job = add_job(harness.store, harness.settings)
+    return service, job, blue
+
+
+async def test_slot_press_edits_the_proposal_and_a_later_slice_press_uses_it(harness):
+    service, job, blue = await slot_harness(harness)
+    queue = harness.notifier.press_queue
+
+    await queue.put(Press(1, "m4", f"job:{job.id}:slot:2", T0))
+    await until(lambda: harness.notifier.edits)
+    message_id, text = harness.notifier.edits[0]
+    assert message_id == "m4" and "слот 2 PETG синий" in text
+    rows = harness.notifier.edit_buttons[0]
+    assert [b.id for b in rows[0]] == [f"job:{job.id}:slice", f"job:{job.id}:change"]
+    assert [(b.id, b.text) for b in flat_buttons(rows[1:])] == [
+        (f"job:{job.id}:slot:1", "1 petg белый"),
+        (f"job:{job.id}:slot:2", "✓ 2 PETG синий"),
+    ]
+    assert harness.store.job(job.id).slot == 2
+    assert harness.store.outbox_count() == 0  # edited in place, nothing new sent
+
+    await queue.put(Press(2, "m4", f"job:{job.id}:slice", T0))
+    await until(lambda: harness.store.job(job.id).status == "sliced")
+    assert harness.slicer.requests[0].filament == BLUE_PRESET
+    assert json.loads(harness.store.job(job.id).result_json)["slot"]["spool_id"] == blue
+
+
+async def test_slot_press_sends_a_new_proposal_when_the_edit_fails(harness):
+    _service, job, _blue = await slot_harness(harness)
+    harness.notifier.edit_ok = False
+    await harness.notifier.press_queue.put(Press(1, "m4", f"job:{job.id}:slot:2", T0))
+    await until(lambda: harness.notifier.sent)
+    sent = harness.notifier.sent[0]
+    assert sent["text"] == harness.notifier.edits[0][1]
+    assert "✓ 2 PETG синий" in [b.text for b in flat_buttons(sent["buttons"])]
+    assert harness.store.job(job.id).slot == 2
+
+
+async def test_unusable_slot_press_is_answered_and_changes_nothing(harness):
+    _service, job, _blue = await slot_harness(harness)
+    queue = harness.notifier.press_queue
+    # Malformed slot buttons are ignored like any unknown button.
+    for seq, button in enumerate((f"job:{job.id}:slot:x", f"job:{job.id}:slot:17", f"job:{job.id}:slot:"), 1):
+        await queue.put(Press(seq, "m4", button, T0))
+    await queue.put(Press(9, "m4", f"job:{job.id}:slot:4", T0))  # empty tray
+    await until(lambda: harness.notifier.sent)
+    assert texts(harness.notifier) == ["Слот 4 пустой или без катушки с пресетом, выбери другой"]
+    assert harness.notifier.edits == []
+    assert harness.store.job(job.id).slot is None
+
+
+async def test_slot_press_while_slicing_is_ignored_like_the_slice_button(harness):
+    _service, job, _blue = await slot_harness(harness)
+    harness.store.update_job(job.id, status="slicing")
+    await harness.notifier.press_queue.put(Press(1, "m4", f"job:{job.id}:slot:2", T0))
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits == [("m4", "Уже режу «lamp-arm»")]
+    assert harness.store.job(job.id).slot is None
+    assert harness.store.outbox_count() == 0

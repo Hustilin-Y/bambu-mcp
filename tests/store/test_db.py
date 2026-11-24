@@ -30,7 +30,7 @@ def test_migrate_is_idempotent_and_seeds_tariff(tmp_path: Path):
     assert t.day_uah == 4.32
     assert t.night_uah is None
     assert t.valid_from == date(2024, 6, 1)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 6
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
     assert s._conn().execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     s.close()
 
@@ -215,7 +215,7 @@ def test_migrate_v1_database_adds_deduction_columns(tmp_path: Path):
     (row,) = s.history(None, 10)
     assert row.identity[0] == "old"
     assert (row.deducted_spool_id, row.deducted_g) == (None, None)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 6
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
     s.close()
 
 
@@ -271,7 +271,7 @@ def test_migrate_v2_database_adds_outbox(tmp_path: Path):
         + "ALTER TABLE prints ADD COLUMN deducted_g REAL;\nPRAGMA user_version = 2;"
     )
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 6
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
     assert s.outbox_head() is None
     s.close()
 
@@ -371,7 +371,7 @@ def test_migrate_v3_to_v4(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 6
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
     (row,) = s.history(None, 10)
     assert row.identity[0] == "kept"
     assert s.outbox_head().dedupe == "k1"
@@ -409,7 +409,7 @@ def test_migrate_v4_to_v5_adds_print_job_columns(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 6
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
     row = s.print_by_id(print_id)
     assert (row.identity[0], row.spool_id, row.grams, row.deducted_g) == ("lamp-arm-1-p1", spool, 12.0, 12.0)
     assert (row.job_id, row.plate) == (None, None)
@@ -455,7 +455,7 @@ def test_migrate_v5_to_v6_adds_spool_tray_metadata(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 6
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
     (row,) = s.spools()
     assert (row.id, row.filament_preset, row.remaining_g) == (spool, "Bambu PLA Basic @BBL P2S", 988)
     assert (row.tray_info_idx, row.nozzle_temp_min, row.nozzle_temp_max) == (None, None, None)
@@ -476,3 +476,31 @@ def test_add_spool_with_tray_metadata(store: Store):
     plain = _spool(store)
     assert store.spools()[1].id == plain
     assert store.spools()[1].tray_info_idx is None
+
+
+def test_migrate_v6_to_v7_adds_the_job_slot(tmp_path: Path):
+    path = tmp_path / "v6.db"
+    conn = sqlite3.connect(path)
+    v1 = (Path(__file__).parents[2] / "src/bambu_mcp/store/schema.sql").read_text(encoding="utf-8")
+    conn.executescript(v1 + "".join(f"\n{_MIGRATIONS[v]}" for v in range(2, 7)) + "\nPRAGMA user_version = 6;")
+    job_id = conn.execute(
+        "INSERT INTO jobs (name, kind, manifest_json, file_sha256, created_at, status, settings_json)"
+        " VALUES ('lamp-arm', 'part', '{}', ?, '2026-11-23T00:00:00+00:00', 'sliced', '{\"wall_loops\": 4}')",
+        ("a" * 64,),
+    ).lastrowid
+    conn.commit()
+    conn.close()
+
+    s = Store(path)
+    s.migrate()
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
+    job = s.job(job_id)
+    assert (job.name, job.status, job.settings_json, job.slot) == ("lamp-arm", "sliced", '{"wall_loops": 4}', None)
+    s.update_job(job_id, slot=2)
+    assert s.job(job_id).slot == 2
+    assert s.transition_job(job_id, ("sliced",), status="slicing", slot=16) is True
+    assert s.job(job_id).slot == 16
+    for bad in (0, 17):
+        with pytest.raises(sqlite3.IntegrityError):
+            s.update_job(job_id, slot=bad)
+    s.close()

@@ -13,7 +13,14 @@ from bambu_mcp.events import Event, EventKind
 from bambu_mcp.manifest import Manifest, PlateInfo, parse_manifest
 from bambu_mcp.notify import Button
 from bambu_mcp.printer.hms import HmsTexts, describe, hms_code
-from bambu_mcp.proposal import SlotChoice, hint_overrides, job_material, slot_number
+from bambu_mcp.proposal import (
+    MAX_SLOT_NUMBER,
+    SlotChoice,
+    UsableSlot,
+    hint_overrides,
+    job_material,
+    slot_number,
+)
 from bambu_mcp.store.models import Job, Spool
 
 DEFAULT_TZ = ZoneInfo("Europe/Kyiv")  # the service passes settings.timezone
@@ -22,6 +29,8 @@ END_UNKNOWN_TEXT = "Точное время окончания неизвест�
 LOST_TITLE = "❌ Печать прервана, пока сервис не видел"
 _BUTTON_TEXT_MAX = 64
 _SPOOLS_PER_ROW = 2
+_SLOTS_PER_ROW = 4
+CHOSEN_MARK = "✓ "
 # Characters the add-in's rich Markdown reads as formatting (multiclaude telegram.markdown_literal).
 _MARKDOWN_SPECIAL = re.compile(r"([\\`*_~=|\[\]$])")
 
@@ -145,6 +154,18 @@ def spool_buttons(print_id: int, spools: Sequence[Spool]) -> list[list[Button]]:
     rows = [buttons[i : i + _SPOOLS_PER_ROW] for i in range(0, len(buttons), _SPOOLS_PER_ROW)]
     rows.append([Button(f"spool:{print_id}:none", "Другая / не знаю")])
     return rows
+
+
+def slot_buttons(job_id: int, usable: Sequence[UsableSlot], chosen: int | None) -> list[list[Button]]:
+    """The proposal's slot rows: ``job:<id>:slot:<n>``, the ``chosen`` number marked."""
+    buttons = [
+        Button(
+            f"job:{job_id}:slot:{u.number}",
+            f"{CHOSEN_MARK if u.number == chosen else ''}{u.label}"[:_BUTTON_TEXT_MAX],
+        )
+        for u in usable[:MAX_SLOT_NUMBER]
+    ]
+    return [buttons[i : i + _SLOTS_PER_ROW] for i in range(0, len(buttons), _SLOTS_PER_ROW)]
 
 
 # -- job proposal and slice summary ------------------------------------------------
