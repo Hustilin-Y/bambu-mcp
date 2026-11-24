@@ -22,7 +22,7 @@ from bambu_mcp.jobs import create_job_from_bytes
 from bambu_mcp.journal import Journal
 from bambu_mcp.mcp_server import build_app
 from bambu_mcp.notify import LogNotifier, Press
-from bambu_mcp.printer.link import LinkStatus, PrinterNotConnected
+from bambu_mcp.printer.link import LinkStatus, PrinterNotConnected, tray_setting
 from bambu_mcp.printer.state import Hms, PrinterState, Tray
 from bambu_mcp.service import Service
 from bambu_mcp.slicer import SliceClient, SliceOutcome
@@ -93,11 +93,13 @@ class FakeService:
         self.trays_sent: list[dict] = []
         self.full_reports = 0
         self.set_tray_error: Exception | None = None
+        self.state_fresh = True
 
-    def set_tray(self, **fields) -> None:
+    def set_tray(self, **fields) -> dict:
         if self.set_tray_error is not None:
             raise self.set_tray_error
         self.trays_sent.append(fields)
+        return tray_setting(**fields)
 
     def request_full_report(self) -> None:
         self.full_reports += 1
@@ -411,15 +413,46 @@ def test_load_spool_refuses_bad_or_absent_slots(h, ams, slot, message):
         ({"material": ""}, "material"),
         ({"material": "Silk PLA+"}, "material"),
         ({"color_hex": "orange"}, "color_hex"),
+        ({"color_hex": "FF8800"}, "color_hex"),
+        ({"color_hex": "#FF880000"}, "color_hex"),
+        ({"color_hex": "#F80"}, "color_hex"),
     ],
 )
 def test_load_spool_refuses_incomplete_spools(h, changes, message):
+    """Rows written before the spool tools validated colours, straight into the store."""
     _idle(h)
-    spool = _loadable_spool(h, **changes)
-    result = h.call_raw("load_spool", spool_id=spool["id"], ams=0, slot=0)
+    fields = dict(brand="Bambu", material="PLA", color_name="Orange", color_hex="#FF8800",
+                  filament_preset=None, price_uah=600, net_g=1000)
+    meta = dict(tray_info_idx="GFA00", nozzle_temp_min=190, nozzle_temp_max=230)
+    for key, value in changes.items():
+        (fields if key in fields else meta)[key] = value
+    spool_id = h.store.add_spool(**fields, **meta)
+    result = h.call_raw("load_spool", spool_id=spool_id, ams=0, slot=0)
     assert result["isError"] is True
     assert message in result["content"][0]["text"]
     assert h.service.trays_sent == []
+
+
+def test_load_spool_refuses_until_a_fresh_report_since_connect(h):
+    _idle(h)
+    h.service.state_fresh = False
+    spool = _loadable_spool(h)
+    result = h.call_raw("load_spool", spool_id=spool["id"], ams=0, slot=0)
+    assert result["isError"] is True
+    assert "first report" in result["content"][0]["text"]
+    assert h.service.trays_sent == [] and h.store.slot_spool(0, 0) is None
+
+
+@pytest.mark.parametrize("color_hex", ["FF8800", "#FF880000", "#F80", "orange", "", "#GG8800", " #FF8800"])
+def test_spool_tools_require_rrggbb_colours(h, color_hex):
+    added = h.call_raw("add_spool", brand="X", material="PLA", color_name="Y", color_hex=color_hex,
+                       price_uah=1, net_g=1000)
+    assert added["isError"] is True and "#RRGGBB" in added["content"][0]["text"]
+    spool = h.call("add_spool", brand="X", material="PLA", color_name="Y", color_hex="#ff8800",
+                   price_uah=1, net_g=1000)
+    updated = h.call_raw("update_spool", spool_id=spool["id"], color_hex=color_hex)
+    assert updated["isError"] is True and "#RRGGBB" in updated["content"][0]["text"]
+    assert [s["color_hex"] for s in h.call("spools")["spools"]] == ["#ff8800"]
 
 
 def test_load_spool_refuses_missing_and_retired_spools(h):

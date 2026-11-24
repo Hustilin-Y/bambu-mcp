@@ -8,12 +8,14 @@ from pathlib import Path
 
 import httpx
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from bambu_mcp import jobs as jobs_module
+from bambu_mcp import mcp_server
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.messages import render_proposal, render_sliced
 from bambu_mcp.notify import LogNotifier, Press, SendError, ServiceNotifyClient
-from bambu_mcp.printer.link import LinkStatus, PrinterNotConnected
+from bambu_mcp.printer.link import LinkStatus, PrinterNotConnected, tray_setting
 from bambu_mcp.printer.state import PrinterState, Tray
 from bambu_mcp.proposal import SlotChoice, estimate_cost
 from bambu_mcp.service import (
@@ -61,8 +63,9 @@ class FakeLink:
     def start(self) -> None:
         self.started = True
 
-    def set_tray(self, **fields) -> None:
+    def set_tray(self, **fields) -> dict:
         self.trays.append(fields)
+        return tray_setting(**fields)
 
     def request_full_report(self) -> None:
         self.full_reports += 1
@@ -416,7 +419,7 @@ async def test_set_tray_goes_through_the_running_link_only(harness):
         idle.request_full_report()
 
     service = await harness.start()
-    service.set_tray(**TRAY_FIELDS)
+    assert service.set_tray(**TRAY_FIELDS) == tray_setting(**TRAY_FIELDS)
     service.request_full_report()
     link = harness.links[-1]
     assert link.trays == [TRAY_FIELDS] and link.full_reports == 1
@@ -424,6 +427,74 @@ async def test_set_tray_goes_through_the_running_link_only(harness):
     with pytest.raises(PrinterNotConnected):
         service.set_tray(**TRAY_FIELDS)
     assert link.trays == [TRAY_FIELDS]
+
+
+async def _status(harness, status: LinkStatus) -> None:
+    await asyncio.to_thread(harness.links[-1].on_status, status)
+    await harness.service.settle()
+
+
+async def test_load_spool_waits_for_a_fresh_report_after_a_reconnect(harness):
+    """A drop makes the state UNKNOWN; after CONNECTED, load_spool waits for the next report."""
+    store = harness.store
+    spool_id = store.add_spool(
+        "Bambu", "PLA", "Orange", "#FF8800", None, 600, 1000,
+        tray_info_idx="GFA00", nozzle_temp_min=190, nozzle_temp_max=230,
+    )
+
+    async def camera():
+        return None
+
+    service = await harness.start()
+    mcp = mcp_server.build_mcp(service, store, harness.settings, camera)
+    link = harness.links[-1]
+
+    async def load() -> str | None:
+        """None when sent, else the refusal text."""
+        try:
+            result = await mcp.call_tool("load_spool", {"spool_id": spool_id, "ams": 0, "slot": 1})
+        except ToolError as exc:  # MCPServer.call_tool raises the tool's refusal
+            return str(exc)
+        assert not result.is_error
+        return None
+
+    assert not service.state_fresh
+    await _status(harness, LinkStatus.CONNECTED)
+    assert "first report" in await load()  # connected, no report yet
+    await harness.feed("pushall_idle")  # FINISH, one AMS unit
+    assert service.state.gcode_state == "FINISH" and service.state_fresh
+    assert await load() is None
+    assert len(link.trays) == 1 and link.full_reports == 1
+
+    await _status(harness, LinkStatus.DISCONNECTED)
+    assert service.state.gcode_state == "UNKNOWN" and not service.state_fresh
+    assert service.state.trays  # only gcode_state is forgotten
+    await _status(harness, LinkStatus.CONNECTING)
+    await _status(harness, LinkStatus.CONNECTED)
+    refused = await load()
+    assert "first report" in refused and "nothing was sent" in refused
+    await harness.feed_report({"info": {"command": "get_version", "sequence_id": "0"}})
+    assert "first report" in await load()  # not a state report
+    assert len(link.trays) == 1
+
+    await harness.feed("pushall_idle")
+    assert service.state_fresh and service.state.gcode_state == "FINISH"
+    assert await load() is None
+    assert len(link.trays) == 2
+
+
+async def test_disconnect_does_not_announce_events(harness):
+    """UNKNOWN on a drop is not a state change for the event detector (phase 1 logic)."""
+    service = await harness.start()
+    await _status(harness, LinkStatus.CONNECTED)
+    await harness.feed("running_mid")
+    sent = len(harness.notifier.sent)
+    await _status(harness, LinkStatus.DISCONNECTED)
+    await _status(harness, LinkStatus.CONNECTED)
+    await harness.feed("running_mid")
+    await until(lambda: harness.store.outbox_count() == 0)
+    assert len(harness.notifier.sent) == sent
+    assert service.state.gcode_state == "RUNNING"
 
 
 def test_notify_dedupe_fits_the_api_limit():

@@ -39,9 +39,8 @@ READ_COMMANDS: Final = (GET_VERSION, PUSH_ALL)
 
 # The one write: field set of ha-bambulab's AMS_FILAMENT_SETTING_TEMPLATE.
 AMS_FILAMENT_SETTING: Final = "ams_filament_setting"
-TRAY_TYPES: Final = (
-    "PLA", "PETG", "ABS", "ASA", "TPU", "PC", "PA", "PLA-CF", "PETG-CF", "PVA", "PLA-S", "SUPPORT",
-)
+# Bambu filament_type spellings; support material is PLA-S (no bare "SUPPORT" type exists).
+TRAY_TYPES: Final = ("PLA", "PETG", "ABS", "ASA", "TPU", "PC", "PA", "PLA-CF", "PETG-CF", "PVA", "PLA-S")
 AMS_UNITS: Final = range(4)
 AMS_SLOTS: Final = range(4)
 NOZZLE_TEMP_RANGE: Final = (150, 320)
@@ -143,11 +142,17 @@ def _is_tray_setting(payload: Any) -> bool:
         return False
     if body["command"] != AMS_FILAMENT_SETTING or body["sequence_id"] != "0":
         return False
+    ids = (body["ams_id"], body["tray_id"])
+    if not all(_is_int(i) for i in ids):  # True would hash like 1 in the lookup below
+        return False
+    # The inverse of tray_ids, so whatever mapping it holds is read back the same way.
+    unit_slot = {tray_ids(a, s): (a, s) for a in AMS_UNITS for s in AMS_SLOTS}.get(ids)
+    if unit_slot is None:
+        return False
     try:
-        # ams_id/tray_id are read back as ams/slot: valid while tray_ids is the identity.
         rebuilt = tray_setting(
-            ams=body["ams_id"],
-            slot=body["tray_id"],
+            ams=unit_slot[0],
+            slot=unit_slot[1],
             tray_info_idx=body["tray_info_idx"],
             tray_type=body["tray_type"],
             color_rgba=body["tray_color"],
@@ -311,11 +316,11 @@ class PrinterLink:
         color_rgba: str,
         nozzle_temp_min: int,
         nozzle_temp_max: int,
-    ) -> None:
+    ) -> dict:
         """Set an AMS slot's material, colour and nozzle temperatures (``ams_filament_setting``).
 
-        ``ValueError`` on a bad field, ``PrinterNotConnected`` when the message was not
-        handed to the connected printer. Never retried: the caller decides.
+        Returns the payload published. ``ValueError`` on a bad field, ``PrinterNotConnected``
+        when the message was not handed to the connected printer. Never retried.
         """
         payload = tray_setting(
             ams=ams,
@@ -338,6 +343,7 @@ class PrinterLink:
             nozzle_temp_min,
             nozzle_temp_max,
         )
+        return payload
 
     # --- internals ---------------------------------------------------------
 

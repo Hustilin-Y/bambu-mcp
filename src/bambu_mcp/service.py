@@ -143,7 +143,7 @@ class Link(Protocol):
         color_rgba: str,
         nozzle_temp_min: int,
         nozzle_temp_max: int,
-    ) -> None: ...
+    ) -> dict: ...
 
 
 class Slicer(Protocol):
@@ -265,6 +265,7 @@ class Service:
         self._state = PrinterState.empty()
         self._link_status = LinkStatus.DISCONNECTED
         self._link: Link | None = None  # while run() is running
+        self._state_fresh = False  # a report with gcode_state arrived since the last CONNECTED
         self._slot: Slot | None = None  # AMS slot of the current or last print
         self._job_seen: tuple[tuple, datetime] | None = None  # job identity, first seen at
         self._first_report = True  # the first state after start is checked against the journal
@@ -289,6 +290,11 @@ class Service:
     def link_status(self) -> LinkStatus:
         return self._link_status
 
+    @property
+    def state_fresh(self) -> bool:
+        """True once a report with ``gcode_state`` arrived since the link last (re)connected."""
+        return self._state_fresh and self._link_status is LinkStatus.CONNECTED
+
     def _running_link(self) -> Link:
         if self._link is None:
             raise PrinterNotConnected("printer link is not running, nothing was sent")
@@ -304,9 +310,9 @@ class Service:
         color_rgba: str,
         nozzle_temp_min: int,
         nozzle_temp_max: int,
-    ) -> None:
-        """The one printer write (``load_spool``): see ``PrinterLink.set_tray``."""
-        self._running_link().set_tray(
+    ) -> dict:
+        """The one printer write (``load_spool``): see ``PrinterLink.set_tray``. Returns the payload."""
+        return self._running_link().set_tray(
             ams=ams,
             slot=slot,
             tray_info_idx=tray_info_idx,
@@ -586,6 +592,11 @@ class Service:
 
     def _handle_status(self, status: LinkStatus) -> None:
         self._link_status = status
+        self._state_fresh = False  # CONNECTED included: wait for the printer's next report
+        if status is not LinkStatus.CONNECTED and self._state.gcode_state != "UNKNOWN":
+            # The printer may change unseen while the link is down. The event detector
+            # compares an UNKNOWN state with the last known one, so this announces nothing.
+            self._state = replace(self._state, gcode_state="UNKNOWN", raw_unknown_state=None)
         if status is LinkStatus.AUTH_FAILED and not self._auth_alerted:
             self._auth_alerted = True
             at = self._clock().astimezone(UTC)
@@ -609,6 +620,9 @@ class Service:
             return
         at = self._clock()
         self._state = new
+        body = report.get("print")
+        if isinstance(body, dict) and "gcode_state" in body:
+            self._state_fresh = True
         if new.gcode_state != "UNKNOWN":
             identity = event_identity(new)
             if self._job_seen is None or self._job_seen[0] != identity:

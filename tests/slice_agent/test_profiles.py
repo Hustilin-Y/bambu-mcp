@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from slice_agent.config import AgentConfig
 from slice_agent import app as app_mod
+from slice_agent.config import AgentConfig
 from slice_agent.profiles import filament_tray_info, flatten_all, preset_roots, resolve_preset
 
 BED = ["0x0", "256x0", "256x256", "0x256"]
@@ -171,3 +171,17 @@ def test_flatten_cli_prints_the_spool_fields_per_filament(tmp_path, capsys):
     f = json.loads((cfg.profiles_dir / "filament-generic-petg-bbl-p2s.json").read_text(encoding="utf-8"))
     assert f["filament_id"] == "GFG99"
     assert f["nozzle_temperature_range_low"] == ["220"]
+
+
+def test_flatten_cli_prints_question_marks_for_missing_fields(tmp_path, capsys):
+    data = build_tree(tmp_path)
+    put(data / "system" / "BBL", "filament", "Bare PLA @BBL P2S", type="filament", filament_type=["PLA"],
+        nozzle_temperature_range_high=["230"])
+    cfg = make_cfg(tmp_path, data)
+    cfg = AgentConfig(**{**cfg.__dict__, "filaments": [FILAMENT, "Bare PLA @BBL P2S"]})
+    assert app_mod.flatten(cfg) == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("filament ")]
+    assert lines == [
+        f"filament {FILAMENT}: tray_info_idx=GFG99 nozzle_temp_min=220 nozzle_temp_max=260 material=PETG",
+        "filament Bare PLA @BBL P2S: tray_info_idx=? nozzle_temp_min=? nozzle_temp_max=230 material=PLA",
+    ]

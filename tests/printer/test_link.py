@@ -21,6 +21,7 @@ from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.reasoncodes import ReasonCode
 
 from bambu_mcp.config import Secrets, Settings
+from bambu_mcp.printer import link as link_module
 from bambu_mcp.printer.link import (
     GET_VERSION,
     PUSH_ALL,
@@ -241,16 +242,39 @@ def test_set_tray_payload_exact(h):
     assert tray_setting(**TRAY) == TRAY_PAYLOAD
     h.client.fire_connect()
     h.client.calls.clear()
-    h.link.set_tray(**TRAY)
+    assert h.link.set_tray(**TRAY) == TRAY_PAYLOAD  # the payload it published
     assert h.client.calls == [("publish", f"device/{SERIAL}/request", TRAY_PAYLOAD)]
 
 
 def test_set_tray_type_list_is_closed_and_upper_case():
-    assert TRAY_TYPES == (
-        "PLA", "PETG", "ABS", "ASA", "TPU", "PC", "PA", "PLA-CF", "PETG-CF", "PVA", "PLA-S", "SUPPORT",
-    )
+    assert TRAY_TYPES == ("PLA", "PETG", "ABS", "ASA", "TPU", "PC", "PA", "PLA-CF", "PETG-CF", "PVA", "PLA-S")
     for tray_type in TRAY_TYPES:
         assert tray_setting(**{**TRAY, "tray_type": tray_type})["print"]["tray_type"] == tray_type
+    with pytest.raises(ValueError):
+        tray_setting(**{**TRAY, "tray_type": "SUPPORT"})
+
+
+def _global_index(ams: int, slot: int) -> tuple[int, int]:
+    return ams, ams * 4 + slot
+
+
+@pytest.mark.parametrize("mapping", [None, _global_index], ids=["unit-slot", "global-index"])
+def test_every_slot_round_trips_through_publish(h, monkeypatch, mapping):
+    """_is_tray_setting inverts tray_ids: a Step 6 change to tray_ids keeps every slot sendable."""
+    if mapping is not None:
+        monkeypatch.setattr(link_module, "tray_ids", mapping)
+    h.client.fire_connect()
+    h.client.calls.clear()
+    pairs = [(ams, slot) for ams in range(4) for slot in range(4)]
+    for ams, slot in pairs:
+        h.link.set_tray(**{**TRAY, "ams": ams, "slot": slot})
+    sent = [c[2]["print"] for c in h.client.calls if c[0] == "publish"]
+    assert [(p["ams_id"], p["tray_id"]) for p in sent] == [link_module.tray_ids(a, s) for a, s in pairs]
+    assert len(set(map(json.dumps, sent))) == 16
+    # An id pair outside the image of tray_ids is refused.
+    bad = {"print": {**TRAY_PAYLOAD["print"], "ams_id": 0, "tray_id": 15 if mapping is None else 16}}
+    with pytest.raises(ValueError):
+        h.link._publish(bad)
 
 
 @pytest.mark.parametrize(

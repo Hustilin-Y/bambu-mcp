@@ -65,7 +65,6 @@ from bambu_mcp.printer.link import (
     TRAY_TYPES,
     LinkStatus,
     PrinterNotConnected,
-    tray_setting,
 )
 from bambu_mcp.printer.state import PrinterState
 from bambu_mcp.proposal import NAMED_SETS, slot_number
@@ -96,7 +95,7 @@ SET_KEY = "set"  # slice_job settings: the named set to start from
 PATH_INTAKE_OFF = "path intake is off: upload with `bambu-mcp upload`"
 # gcode_state values (phase 1 names) in which the AMS may be reconfigured.
 LOADABLE_STATES = ("IDLE", "FINISH", "FAILED")
-_SPOOL_HEX_RE = re.compile(r"#?([0-9A-Fa-f]{6})([0-9A-Fa-f]{2})?", re.ASCII)
+_SPOOL_HEX_RE = re.compile(r"#[0-9A-Fa-f]{6}", re.ASCII)  # a spool's color_hex, exactly
 LOAD_SPOOL_NOTE = (
     "Sent once, not retried. Check the AMS slot on the printer screen; "
     "ams_status shows the printer's next report."
@@ -117,6 +116,9 @@ class StatusSource(Protocol):
     @property
     def link_status(self) -> LinkStatus: ...
 
+    @property
+    def state_fresh(self) -> bool: ...
+
     async def propose(self, job_id: int) -> str: ...
 
     def start_slice(
@@ -133,7 +135,7 @@ class StatusSource(Protocol):
         color_rgba: str,
         nozzle_temp_min: int,
         nozzle_temp_max: int,
-    ) -> None: ...
+    ) -> dict: ...
 
     def request_full_report(self) -> None: ...
 
@@ -434,10 +436,14 @@ def _check_tray_metadata(
         raise ToolError(f"nozzle_temp_min {nozzle_temp_min} is above nozzle_temp_max {nozzle_temp_max}")
 
 
+def _check_color_hex(color_hex: str | None) -> None:
+    if color_hex is not None and not _SPOOL_HEX_RE.fullmatch(color_hex):
+        raise ToolError(f"color_hex must be #RRGGBB (6 hex digits), got {color_hex!r}")
+
+
 def _tray_color(color_hex: str) -> str | None:
-    """``#RRGGBB`` (or ``#RRGGBBAA``) as the AMS wants it: ``RRGGBBAA`` upper-case, alpha FF."""
-    match = _SPOOL_HEX_RE.fullmatch(color_hex)
-    return (match.group(1) + (match.group(2) or "FF")).upper() if match else None
+    """A spool's ``#RRGGBB`` as the AMS wants it: ``RRGGBBFF`` upper-case (always opaque)."""
+    return f"{color_hex[1:].upper()}FF" if _SPOOL_HEX_RE.fullmatch(color_hex) else None
 
 
 def _tray_fields(spool: Spool) -> dict[str, Any]:
@@ -465,9 +471,11 @@ def _tray_fields(spool: Spool) -> dict[str, Any]:
         raise ToolError(
             f"spool {spool.id} material {spool.material!r} is not an AMS type: {', '.join(TRAY_TYPES)}"
         )
-    color = _tray_color(spool.color_hex.strip())
-    if color is None:
-        raise ToolError(f"spool {spool.id} color_hex {spool.color_hex!r} is not #RRGGBB")
+    color = _tray_color(spool.color_hex)
+    if color is None:  # a row written before the spool tools checked colours
+        raise ToolError(
+            f"spool {spool.id} color_hex {spool.color_hex!r} is not #RRGGBB: fix it with update_spool"
+        )
     return {
         "tray_info_idx": spool.tray_info_idx,
         "tray_type": tray_type,
@@ -477,11 +485,18 @@ def _tray_fields(spool: Spool) -> dict[str, Any]:
     }
 
 
-def _check_printer_ready(state: PrinterState, link: LinkStatus, ams: int, slot: int) -> None:
+def _check_printer_ready(service: StatusSource, ams: int, slot: int) -> None:
     if ams not in AMS_UNITS or slot not in AMS_SLOTS:
         raise ToolError("ams and slot must each be 0..3")
+    link = service.link_status
     if link is not LinkStatus.CONNECTED:
         raise ToolError(f"the printer is not connected (link {link.value}), nothing was sent")
+    if not service.state_fresh:
+        raise ToolError(
+            "waiting for the printer's first report since it connected, try again in a few seconds; "
+            "nothing was sent"
+        )
+    state = service.state
     if state.gcode_state not in LOADABLE_STATES:
         raise ToolError(
             f"the printer is {state.gcode_state}: load_spool works only when it is "
@@ -590,6 +605,7 @@ def build_mcp(
         """
         if net_g <= 0 or price_uah < 0:
             raise ToolError("net_g must be positive and price_uah non-negative")
+        _check_color_hex(color_hex)
         _check_tray_metadata(tray_info_idx, nozzle_temp_min, nozzle_temp_max)
         spool_id = store.add_spool(
             brand,
@@ -644,6 +660,7 @@ def build_mcp(
         if net_g is not None and net_g <= 0:
             raise ToolError("net_g must be positive")
         current = _spool_by_id(store, spool_id)
+        _check_color_hex(color_hex)
         _check_tray_metadata(  # the values as they will be stored, the other bound included
             fields.get("tray_info_idx", current.tray_info_idx),
             fields.get("nozzle_temp_min", current.nozzle_temp_min),
@@ -685,10 +702,9 @@ def build_mcp(
         spool = _spool_by_id(store, spool_id)
         fields = _tray_fields(spool)
         # Synchronous from here on: no await between the checks and the send.
-        _check_printer_ready(service.state, service.link_status, ams, slot)
-        sent = tray_setting(ams=ams, slot=slot, **fields)["print"]
+        _check_printer_ready(service, ams, slot)
         try:
-            service.set_tray(ams=ams, slot=slot, **fields)
+            sent = service.set_tray(ams=ams, slot=slot, **fields)["print"]
         except PrinterNotConnected as exc:
             raise ToolError(str(exc)) from None
         except ValueError as exc:
