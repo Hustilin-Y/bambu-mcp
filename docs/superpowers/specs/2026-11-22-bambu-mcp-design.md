@@ -177,6 +177,13 @@ A kit is sliced once, each plate is its own print, confirmation and journal row.
 | Fit, «точно» (holes, snaps, threads from CAD Workshop) | classic wall generator, walls 3+, slow outer wall, no fuzzy skin, layer 0.12-0.2 | dimensional risk (outer wall speed, layer, wall count), then time | none of the part's tolerance features are thinned by infill or shells |
 | Watertight, «герметично» (jars, boxes, liquids) | walls 4-6, top/bottom 5+, 100 % infill below a size cap | shell thickness | no sparse layer reaches an outer surface |
 
+Who picks the preset, in this order:
+1. **The owner, in words or with a button.** The proposal gets a row of preset buttons, with the chosen one marked, like the slot buttons from Task 12.
+2. **The agent that designed the part.** CAD Workshop's `PRINT_HINTS` gains `goal` (a closed list of the preset keys, a primary and an optional secondary) and `goal_reason` (at most 200 characters). The cad skill and the CAD Workshop rules tell the agent to set them from the task: what the part does, the load, heat, outdoor use, fits, liquids, and whether it is a test print. The agent says why in the reason. Examples: a lamp arm under load gives `strength`, a jar or wax box gives `watertight`, a part with snaps, threads or a press fit gives `fit`, a fit test or calibration piece gives `speed` plus `cheap`, a visible decor part gives `quality`.
+3. **The service, as a fallback, from the manifest.** Tolerance features (holes, threads or snaps listed by CAD Workshop's checks) give `fit`. A closed cavity open at the top gives `watertight`. Otherwise it is `balanced`.
+
+The proposal always names the preset and where it came from ("цель: прочно, от ассистента: несущий кронштейн лампы"), so a wrong guess is one tap to change. The MCP tools take `goal` on `propose_job`, `slice_job` and the evaluation call, so Claude Code and the multiclaude assistant can pass a goal they inferred from the conversation. Whatever the owner names in words is explicit (R6) and wins.
+
 Presets can be combined as primary and secondary, "прочно и быстро" for example: the primary sets the hard limits, the secondary breaks ties. Settings outside the current override whitelist, such as ironing, seam position, the wall generator and outer wall speed, need the whitelist extended first, each with its own range. The table above lists the target set.
 
 Still open for the design: the number of variants per run (each is a slice on the PC, so 3 to 6 is a sane cap), whether the PC stays awake through the batch under one lease, and calibrating the strength proxy against a few real prints (break test or flex test).
