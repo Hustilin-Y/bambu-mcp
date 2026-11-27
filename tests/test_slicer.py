@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import math
 import zipfile
 from pathlib import Path
 
@@ -537,3 +538,71 @@ async def test_fetch_file_refuses_odd_names_without_a_request(tmp_path, name):
     with pytest.raises(FetchError):
         await agent.client().fetch_file(name, tmp_path / "f.gcode.3mf")
     assert agent.requests == []
+
+
+FEATURES_BODY = {
+    "outer_wall": 120.5, "inner_wall": 240.0, "top_surface": 30.25, "bottom_surface": 30.0,
+    "sparse_infill": 400.0, "internal_solid_infill": 55.5, "support": 0.0, "other": 12.0,
+}
+
+
+async def test_ok_body_carries_features_and_layer_height():
+    plate = {**OK_BODY["plates"][0], "features": FEATURES_BODY, "layer_height": 0.2}
+    outcome = await Agent(httpx.Response(200, json={**OK_BODY, "plates": [plate]})).client().slice(request(), UPLOAD)
+    assert outcome.status == "ok"
+    assert outcome.plates[0]["features"] == FEATURES_BODY
+    assert outcome.plates[0]["layer_height"] == 0.2
+
+
+async def test_old_agent_without_features():
+    outcome = await Agent(httpx.Response(200, json=OK_BODY)).client().slice(request(), UPLOAD)
+    assert outcome.status == "ok"
+    assert "features" not in outcome.plates[0] and "layer_height" not in outcome.plates[0]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"features": None},
+        {"features": []},
+        {"features": {**FEATURES_BODY, "outer_wall": -1}},
+        {"features": {**FEATURES_BODY, "outer_wall": "big"}},
+        {"features": {**FEATURES_BODY, "outer_wall": True}},
+        {"features": {k: v for k, v in FEATURES_BODY.items() if k != "support"}},
+        {"features": {**FEATURES_BODY, "extra": 1.0}},
+        {"layer_height": 0},
+        {"layer_height": "0.2"},
+        {"layer_height": None},
+    ],
+)
+async def test_unusable_features_are_dropped_not_fatal(extra):
+    plate = {**OK_BODY["plates"][0], **extra}
+    outcome = await Agent(httpx.Response(200, json={**OK_BODY, "plates": [plate]})).client().slice(request(), UPLOAD)
+    assert outcome.status == "ok"  # features are a metric: a bad one costs the strength column, not the slice
+    assert outcome.plates[0] == {"index": 1, "minutes": 100.5, "grams": {"PETG": 14.25}}
+
+
+async def test_slice_client_gets_features_from_the_agent(tmp_path):
+    cfg = make_cfg(tmp_path)
+
+    def studio(cfg, *, out_name, input_3mf, **kw):
+        path = write_sliced(cfg.sliced_dir / f"{out_name}.gcode.3mf")
+        with zipfile.ZipFile(path) as z:
+            members = {n: z.read(n) for n in z.namelist()}
+        settings = json.loads(members["Metadata/project_settings.config"])
+        settings.update(filament_diameter=["1.75"], layer_height="0.2")
+        members["Metadata/project_settings.config"] = json.dumps(settings).encode()
+        members["Metadata/plate_1.gcode"] = b"M83\n;TYPE:Outer wall\nG1 X1 Y1 E10\n"
+        with zipfile.ZipFile(path, "w") as z:
+            for name, data in members.items():
+                z.writestr(name, data)
+        return SliceRun(0, "success"), path
+
+    app = create_app(cfg, slicer=studio, pc_agent=no_pc_agent())
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app)) as http:
+        outcome = await SliceClient(AGENT, TOKEN, http).slice(request(), UPLOAD)
+    assert outcome.status == "ok", outcome.detail
+    (plate,) = outcome.plates
+    assert plate["features"]["outer_wall"] == pytest.approx(10 * math.pi * 0.875**2, abs=0.01)
+    assert sum(plate["features"].values()) == plate["features"]["outer_wall"]
+    assert plate["layer_height"] == 0.2

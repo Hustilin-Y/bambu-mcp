@@ -25,6 +25,11 @@ LAYER_HEIGHTS = {"0.4": (0.12, 0.16, 0.20, 0.24, 0.28)}
 DENSITY_RANGE = (0, 100)  # percent, sent as "<n>%"
 WALL_LOOPS_RANGE = (1, 10)
 WALL_GENERATORS = ("arachne", "classic")
+SHELL_LAYERS_RANGE = (0, 20)  # top_shell_layers and bottom_shell_layers
+OUTER_WALL_SPEED_RANGE = (20, 300)  # mm/s, int or float
+# Spellings checked against Studio 02.08 P2S project_settings.config (tests/fixtures/studio).
+SEAM_POSITIONS = ("aligned", "back", "nearest", "random")
+IRONING_TYPES = ("no ironing", "top", "topmost")
 SUPPORT_TYPES = ("tree(auto)", "normal(auto)")
 BRIM_TYPES = ("no_brim", "auto_brim", "outer_only")
 _OUT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -47,6 +52,11 @@ def _in_range(bounds: tuple[int, int]):
     return lambda v: _is_int(v) and bounds[0] <= v <= bounds[1]
 
 
+def _number_in_range(bounds: tuple[int, int]):
+    # NaN and inf fail the comparison, so they are refused too.
+    return lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and bounds[0] <= v <= bounds[1]
+
+
 def _checks(nozzle: str) -> dict:
     """The override whitelist: key -> validator. Its keys are ``OVERRIDE_KEYS``, in order."""
     return {
@@ -61,6 +71,11 @@ def _checks(nozzle: str) -> dict:
         "layer_height": lambda v: (
             isinstance(v, (int, float)) and not isinstance(v, bool) and v in LAYER_HEIGHTS.get(nozzle, ())
         ),
+        "top_shell_layers": _in_range(SHELL_LAYERS_RANGE),
+        "bottom_shell_layers": _in_range(SHELL_LAYERS_RANGE),
+        "outer_wall_speed": _number_in_range(OUTER_WALL_SPEED_RANGE),
+        "seam_position": _choice(SEAM_POSITIONS),
+        "ironing_type": _choice(IRONING_TYPES),
     }
 
 

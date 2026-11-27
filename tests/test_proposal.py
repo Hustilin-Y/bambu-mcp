@@ -6,22 +6,22 @@ from pathlib import Path
 import pytest
 
 from bambu_mcp.config import Settings
-from bambu_mcp.cost import CostLine
+from bambu_mcp.cost import full_cost
 from bambu_mcp.manifest import parse_manifest
-from bambu_mcp.messages import render_proposal, render_sliced
+from bambu_mcp.messages import render_cost, render_proposal, render_sliced
 from bambu_mcp.printer.state import Tray
 from bambu_mcp.proposal import (
     NAMED_SETS,
     SlotChoice,
-    estimate_cost,
     job_hints,
     job_material,
     last_settings,
     pick_slot,
+    predict_cost,
     resolve_settings,
     slot_number,
 )
-from bambu_mcp.store.models import Job, Spool, Tariff
+from bambu_mcp.store.models import Amortization, Job, Spool, Tariff
 from slice_agent.runner import Overrides
 
 FIXTURES = Path(__file__).parent / "fixtures" / "manifest"
@@ -274,37 +274,49 @@ def test_pick_slot_escapes_printer_and_manifest_text():
 
 # -- texts --------------------------------------------------------------------------
 
-SAMPLE = "lamp-arm, пластина 1: слот 3 PETG чёрный (~310 г), 4 стенки, 25% gyroid, без поддержек, Textured PEI. ~1 ч 40 мин, 14 г, ~9.40 грн"
+SAMPLE = "🖨 lamp-arm, пластина 1: слот 3 PETG чёрный (~310 г), 4 стенки, 25% gyroid, без поддержек, Textured PEI. ~1 ч 40 мин, 14 г"
 SETTINGS = {"wall_loops": 4, "sparse_infill_density": 25, "sparse_infill_pattern": "gyroid", "enable_support": False}
 CHOICE = SlotChoice(0, 2, 1, None, tray_type="PETG", color_name="чёрный", remaining_g=310.0)
 
 
+def _cost(grams, minutes, kwh, spool=True, amort=None):
+    return full_cost(grams, _spool() if spool else None, minutes, kwh, TARIFF, amort, currency="UAH")
+
+
 def test_render_sliced_ru_format():
-    cost = CostLine(filament_uah=7.70, power_uah=1.70, kwh=0.39, tariff=TARIFF)
+    cost = _cost(14.0, 100.2, 0.39)
     plates = [{"index": 1, "minutes": 100.2, "grams": {"PETG": 14.04}}]
     text = render_sliced(
         _job("part"), plates, [cost], settings=SETTINGS, slot_choice=CHOICE, plate_type="Textured PEI Plate"
     )
-    assert _unescape(text) == SAMPLE
+    lines = _unescape(text).split("\n")
+    assert lines[0] == SAMPLE
+    assert lines[1:] == [
+        "🧵 пластик 7.70 грн (14 г × 550 грн/кг)",
+        "⚡ свет 1.68 грн (0.39 кВт·ч × 4.32)",
+        "🛠 амортизация: не задана",
+        "💰 итого 9.38 грн",
+    ]
     # Tildes are escaped: the add-in reads the text as Markdown (a ~ pair is strikethrough).
-    assert text == SAMPLE.replace("~", "\\~")
+    assert text.split("\n")[0] == SAMPLE.replace("~", "\\~")
     assert "—" not in text and ";" not in text
 
 
 def test_render_sliced_unknown_filament_price():
-    cost = CostLine(filament_uah=None, power_uah=1.70, kwh=0.39, tariff=TARIFF)
+    cost = _cost(14.0, 40, 0.39, spool=False)
     plates = [{"index": 1, "minutes": 40, "grams": {"PETG": 14.0}}]
     choice = SlotChoice(0, 0, None, None, tray_type="PETG")
     text = _unescape(render_sliced(_job(), plates, [cost], settings=SETTINGS, slot_choice=choice,
                                    plate_type="Cool Plate"))
     assert "слот 1 PETG (~? г)" in text
-    assert "Cool Plate." not in text and ", Cool. " in text
-    assert "~40 мин, 14 г, ~1.70 грн без пластика" in text
+    assert "Cool Plate." not in text and ", Cool. ~40 мин, 14 г\n" in text
+    assert "🧵 пластик: цена неизвестна" in text and "💰 итого 1.68 грн" in text
 
 
 def test_render_sliced_kit_lists_plates_and_total():
     raw = _raw("kit")
-    costs = [CostLine(1.0, 0.5, 0.1, TARIFF), CostLine(4.0, 1.25, 0.3, TARIFF)]
+    amort = Amortization(date(2024, 6, 1), 30000.0, 5000.0, 2.0, "UAH")
+    costs = [_cost(3.0, 20, 0.1, amort=amort), _cost(18.4, 90, 0.3, amort=amort)]
     plates = [
         {"index": 1, "minutes": 20, "grams": {"PLA": 3.0}},
         {"index": 2, "minutes": 90, "grams": {"PLA": 18.4}},
@@ -313,10 +325,33 @@ def test_render_sliced_kit_lists_plates_and_total():
     text = _unescape(render_sliced(_job("kit", raw), plates, costs, settings={"enable_support": True},
                                    slot_choice=choice, plate_type="Textured PEI Plate"))
     lines = text.split("\n")
-    assert lines[0] == "desk-kit, 2 пластины: слот 1 PLA белый (~800 г), с поддержками, Textured PEI."
-    assert lines[1] == "Пластина 1: ~20 мин, 3 г, ~1.50 грн"
-    assert lines[2] == "Пластина 2: ~1 ч 30 мин, 18 г, ~5.25 грн"
-    assert lines[3] == "Всего: ~1 ч 50 мин, 21 г, ~6.75 грн"
+    assert lines[0] == "🖨 desk-kit, 2 пластины: слот 1 PLA белый (~800 г), с поддержками, Textured PEI."
+    assert lines[1] == f"Пластина 1: ~20 мин, 3 г, ~{costs[0].total.amount:.2f} грн"
+    assert lines[2] == f"Пластина 2: ~1 ч 30 мин, 18 г, ~{costs[1].total.amount:.2f} грн"
+    assert lines[3] == "Всего: ~1 ч 50 мин, 21 г"
+    assert lines[4:] == [
+        "🧵 пластик 11.77 грн (21 г × 550 грн/кг)",
+        "⚡ свет 1.73 грн (0.40 кВт·ч × 4.32)",
+        "🛠 амортизация 14.67 грн (110 мин × 8.00 грн/ч)",
+        "💰 итого 28.16 грн",
+    ]
+
+
+def test_render_sliced_shows_a_currency_refusal():
+    eur_tariff = replace(TARIFF, currency="EUR")
+    off = full_cost(14.0, _spool(), 40, 0.39, eur_tariff, None, currency="EUR")
+    text = render_sliced(_job(), [{"index": 1, "minutes": 40, "grams": {"PETG": 14.0}}], [off],
+                         settings=SETTINGS, slot_choice=CHOICE, plate_type="Cool Plate", symbol="€")
+    assert text.split("\n")[1] == render_cost(off, "€")[0]
+    assert text.split("\n")[1].startswith("Стоимость не посчитана: катушка 1 в UAH")
+
+
+def test_render_proposal_shows_the_cost_lines():
+    cost = _cost(14.0, None, None)
+    text = _unescape(render_proposal(_job("part"), SETTINGS, CHOICE, "Textured PEI Plate", None, cost))
+    lines = text.split("\n")
+    assert lines[0].endswith("Textured PEI. ~14 г")
+    assert lines[1:4] == ["🧵 пластик 7.70 грн (14 г × 550 грн/кг)", "⏱ время неизвестно до нарезки", "💰 итого 7.70 грн"]
 
 
 def test_render_proposal_part():
@@ -324,7 +359,7 @@ def test_render_proposal_part():
     text = _unescape(render_proposal(_job("part"), SETTINGS, choice, "Textured PEI Plate", None))
     lines = text.split("\n")
     assert lines[0] == (
-        "lamp-arm, пластина 1: слот 3 PETG чёрный (~310 г), 4 стенки, 25% gyroid, без поддержек, "
+        "🖨 lamp-arm, пластина 1: слот 3 PETG чёрный (~310 г), 4 стенки, 25% gyroid, без поддержек, "
         "Textured PEI. ~14 г"
     )
     assert "Почему PETG: near a lamp" in text
@@ -364,7 +399,7 @@ def test_render_proposal_kit_lists_conflicts_and_plate_hints():
     settings = {"enable_support": True}
     text = _unescape(render_proposal(_job("kit", raw), settings, choice, "Textured PEI Plate", None))
     lines = text.split("\n")
-    assert lines[0] == "desk-kit, 2 пластины: слот 1 PLA белый (~20 г), с поддержками, Textured PEI."
+    assert lines[0] == "🖨 desk-kit, 2 пластины: слот 1 PLA белый (~20 г), с поддержками, Textured PEI."
     assert "Пластина 1: ~3 г" in lines
     assert "Пластина 2: ~18 г" in lines
     assert "Пластина 1: в CAD 3 стенки, в настройках по профилю" in text
@@ -379,25 +414,25 @@ def test_render_proposal_escapes_names_and_reason():
     raw["name"] = "arm_v2"
     raw["hints"]["material_reason"] = "*hot* [lamp]"
     text = render_proposal(_job("part", raw), SETTINGS, CHOICE, "Textured PEI Plate", None)
-    assert text.startswith("arm\\_v2, ")
+    assert text.startswith("🖨 arm\\_v2, ")
     assert "\\*hot\\* \\[lamp\\]" in text
 
 
 # -- cost ---------------------------------------------------------------------------
 
 
-def test_estimate_cost_uses_spool_price_and_tariff():
-    settings = Settings()
-    line = estimate_cost(120, 14.0, _spool(price=550.0), "PETG", TARIFF, settings, NOW)
-    assert round(line.filament_uah, 2) == 7.70
-    assert round(line.kwh, 3) == 0.45  # 120 min at the PLA fallback 200 W + 0.05 heat-up
-    assert round(line.power_uah, 3) == round(0.45 * 4.32, 3)
-    assert line.tariff is TARIFF
+def test_predict_cost_uses_spool_price_tariff_and_amortization():
+    amort = Amortization(date(2024, 6, 1), 30000.0, 5000.0, 2.0, "UAH")
+    cost = predict_cost(14.0, 120, _spool(price=550.0), "PETG", TARIFF, amort, Settings(), NOW, currency="UAH")
+    assert round(cost.plastic.amount, 2) == 7.70
+    assert round(cost.kwh, 3) == 0.45  # 120 min at the PLA fallback 200 W + 0.05 heat-up
+    assert round(cost.power.amount, 3) == round(0.45 * 4.32, 3)
+    assert cost.amort.amount == pytest.approx(16.0)
 
 
-def test_estimate_cost_without_spool_has_no_filament_cost():
-    line = estimate_cost(60, 14.0, None, "PETG", TARIFF, Settings(), NOW)
-    assert line.filament_uah is None
+def test_predict_cost_without_minutes_has_no_power():
+    cost = predict_cost(14.0, None, None, "PETG", TARIFF, None, Settings(), NOW, currency="UAH")
+    assert cost.plastic is None and cost.power is None and cost.total.amount == 0
 
 
 # -- fix round 1 --------------------------------------------------------------------
@@ -479,15 +514,15 @@ def test_named_set_value_refused_for_nozzle_names_set_and_key():
 def test_render_sliced_shows_the_slot_warning():
     warning = "⚠️ Нужен PETG, а в AMS его нет: выбран слот 1 PLA. Заправь PETG или подтверди печать из PLA"
     choice = SlotChoice(0, 0, 1, warning, tray_type="PLA", color_name="белый", remaining_g=800.0)
-    cost = CostLine(filament_uah=7.70, power_uah=1.70, kwh=0.39, tariff=TARIFF)
+    cost = _cost(14.0, 100.2, 0.39)
     part = render_sliced(_job("part"), [{"index": 1, "minutes": 100.2, "grams": {"PLA": 14.0}}], [cost],
                          settings=SETTINGS, slot_choice=choice, plate_type="Textured PEI Plate")
-    assert part.split("\n")[-1] == warning and part.count("\n") == 1
+    assert part.split("\n")[-1] == warning and part.count("\n") == 5
     kit = render_sliced(_job("kit", _raw("kit")),
                         [{"index": 1, "minutes": 20, "grams": {"PLA": 3.0}},
                          {"index": 2, "minutes": 90, "grams": {"PLA": 18.4}}],
                         [cost, cost], settings={}, slot_choice=choice, plate_type="Textured PEI Plate")
-    assert kit.split("\n")[-1] == warning and kit.split("\n")[-2].startswith("Всего: ")
+    assert kit.split("\n")[-1] == warning and kit.split("\n")[-2].startswith("💰 итого ")
 
 
 # -- owner's slot choice (Task 12) ---------------------------------------------------
@@ -575,8 +610,37 @@ def test_slot_buttons_mark_the_chosen_slot():
     rows = slot_buttons(7, usable, chosen=2)
     assert [len(r) for r in rows] == [4, 4, 4, 4]  # at most 16, four per row
     flat = [b for row in rows for b in row]
-    assert flat[0].id == "job:7:slot:1" and flat[0].text == "1 PETG синий"
-    assert flat[1].text == "✓ 2 PETG синий"
-    assert len(flat[2].text) == 64 and flat[2].text.startswith("3 PETG x")
+    assert flat[0].id == "job:7:slot:1" and flat[0].text == "1️⃣ PETG синий"
+    assert flat[1].text == "✅ 2️⃣ PETG синий"
+    assert len(flat[2].text) == 64 and flat[2].text.startswith("3️⃣ PETG x")
     assert flat[-1].id == "job:7:slot:16"
     assert slot_buttons(7, [], chosen=None) == []
+
+
+def test_precedence_with_goal_and_variant():
+    # explicit > variant > goal base point > last job > hints > named set (global constraints).
+    keys = ("wall_loops", "sparse_infill_density", "sparse_infill_pattern", "layer_height", "brim_type", "seam_position")
+    named = "strong"  # wall_loops 4, sparse_infill_density 25
+    hints = {"walls": 1, "infill_pct": 1, "infill_pattern": "grid", "brim": "outer"}
+    last = {"wall_loops": 2, "sparse_infill_density": 2, "sparse_infill_pattern": "honeycomb", "layer_height": 0.12}
+    base = {"wall_loops": 3, "sparse_infill_density": 3, "layer_height": 0.24}
+    variant = {"wall_loops": 5, "sparse_infill_density": 5}
+    explicit = {"wall_loops": 6}
+    out = resolve_settings(explicit, last, hints, named, goal_base=base, variant=variant, nozzle="0.4")
+    assert {k: out.get(k) for k in keys} == {
+        "wall_loops": 6,  # explicit
+        "sparse_infill_density": 5,  # variant
+        "sparse_infill_pattern": "honeycomb",  # last job: the base point does not set it
+        "layer_height": 0.24,  # goal base point
+        "brim_type": "outer_only",  # hints
+        "seam_position": None,  # nobody sets it: left to the process preset
+    }
+    # Without the new layers nothing changes.
+    assert resolve_settings(explicit, last, hints, named, nozzle="0.4") == resolve_settings(
+        explicit, last, hints, named, goal_base=None, variant=None, nozzle="0.4"
+    )
+    # A base point or variant entry the nozzle cannot take is dropped, like a stale last job's.
+    out = resolve_settings({}, None, {}, "standard", goal_base={"layer_height": 0.24}, variant={"wall_loops": 99},
+                           nozzle="0.6")
+    assert "layer_height" not in out and "wall_loops" not in out
+    Overrides.parse(out, "0.6")

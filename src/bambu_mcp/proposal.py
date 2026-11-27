@@ -9,13 +9,13 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from bambu_mcp.config import Settings
-from bambu_mcp.cost import CostLine, filament_cost, power_cost, print_kwh
+from bambu_mcp.cost import CostBreakdown, CurrencyMismatch, full_cost, print_kwh
 from bambu_mcp.manifest import Manifest
 from bambu_mcp.printer.state import Tray
-from bambu_mcp.store.models import Job, Spool, Tariff
+from bambu_mcp.store.models import Amortization, Job, Spool, Tariff
 from slice_agent.runner import Overrides
 
 DEFAULT_NOZZLE = "0.4"
@@ -78,14 +78,18 @@ def resolve_settings(
     hints: Mapping,
     named_set: str,
     *,
+    goal_base: Mapping | None = None,
+    variant: Mapping | None = None,
     checks: Mapping | None = None,
     nozzle: str = DEFAULT_NOZZLE,
 ) -> dict[str, object]:
-    """Overrides for a slice: explicit > the last sliced job of the part > hints > named set.
+    """Overrides for a slice: explicit > variant > goal base point > last job > hints > named set.
 
     ``explicit`` is the owner's request: anything outside the whitelist raises ``ValueError``
-    (the message names the key). ``last_job`` is that job's stored settings, entries that no
-    longer pass are dropped. ``checks`` are the manifest (or kit plate) checks.
+    (the message names the key). Only explicit fixes a setting (ruling R2). ``variant`` is the
+    chosen evaluation variant, ``goal_base`` the goal's base point (``evaluation.goal_base``)
+    and ``last_job`` the last sliced job's stored settings: entries of these three that do not
+    pass for ``nozzle`` are dropped. ``checks`` are the manifest (or kit plate) checks.
     """
     if named_set not in NAMED_SETS:
         raise ValueError(f"unknown named set: {named_set!r} (known: {', '.join(NAMED_SETS)})")
@@ -93,7 +97,13 @@ def resolve_settings(
     Overrides.parse(explicit, nozzle)
     if "support_type" in explicit and "enable_support" not in explicit:
         explicit["enable_support"] = True  # asking for a support type means wanting supports
-    above = {**hint_overrides(hints, checks), **_valid_entries(last_job, nozzle), **explicit}
+    above = {
+        **hint_overrides(hints, checks),
+        **_valid_entries(last_job, nozzle),
+        **_valid_entries(goal_base, nozzle),
+        **_valid_entries(variant, nozzle),
+        **explicit,
+    }
     for key, value in NAMED_SETS[named_set].items():
         if key in above:
             continue
@@ -323,21 +333,21 @@ def _forced_slot(
 # -- cost ---------------------------------------------------------------------------
 
 
-def estimate_cost(
-    minutes: float,
-    grams: float,
+def predict_cost(
+    grams: float | None,
+    minutes: float | None,
     spool: Spool | None,
     material: str,
     tariff: Tariff,
+    amort: Amortization | None,
     settings: Settings,
     start: datetime,
-) -> CostLine:
-    """Predicted cost of a plate started at ``start``: the spool's price, electricity at the tariff."""
-    kwh = print_kwh(minutes, material, settings)
-    end = start + timedelta(minutes=minutes)
-    return CostLine(
-        filament_uah=filament_cost(grams, spool, {}, material),
-        power_uah=power_cost(start, end, kwh, tariff, settings),
-        kwh=kwh,
-        tariff=tariff,
-    )
+    *,
+    currency: str,
+) -> CostBreakdown | CurrencyMismatch:
+    """Predicted cost of a plate started at ``start`` (now: nothing better is known).
+
+    ``minutes`` None (not sliced yet): the plastic alone.
+    """
+    kwh = None if minutes is None else print_kwh(minutes, material, settings)
+    return full_cost(grams, spool, minutes, kwh, tariff, amort, currency=currency, start=start, settings=settings)

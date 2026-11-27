@@ -30,7 +30,7 @@ def test_migrate_is_idempotent_and_seeds_tariff(tmp_path: Path):
     assert t.day_uah == 4.32
     assert t.night_uah is None
     assert t.valid_from == date(2024, 6, 1)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 12
     assert s._conn().execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     s.close()
 
@@ -215,7 +215,7 @@ def test_migrate_v1_database_adds_deduction_columns(tmp_path: Path):
     (row,) = s.history(None, 10)
     assert row.identity[0] == "old"
     assert (row.deducted_spool_id, row.deducted_g) == (None, None)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 12
     s.close()
 
 
@@ -271,7 +271,7 @@ def test_migrate_v2_database_adds_outbox(tmp_path: Path):
         + "ALTER TABLE prints ADD COLUMN deducted_g REAL;\nPRAGMA user_version = 2;"
     )
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 12
     assert s.outbox_head() is None
     s.close()
 
@@ -371,7 +371,7 @@ def test_migrate_v3_to_v4(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 12
     (row,) = s.history(None, 10)
     assert row.identity[0] == "kept"
     assert s.outbox_head().dedupe == "k1"
@@ -409,7 +409,7 @@ def test_migrate_v4_to_v5_adds_print_job_columns(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 12
     row = s.print_by_id(print_id)
     assert (row.identity[0], row.spool_id, row.grams, row.deducted_g) == ("lamp-arm-1-p1", spool, 12.0, 12.0)
     assert (row.job_id, row.plate) == (None, None)
@@ -455,7 +455,7 @@ def test_migrate_v5_to_v6_adds_spool_tray_metadata(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 12
     (row,) = s.spools()
     assert (row.id, row.filament_preset, row.remaining_g) == (spool, "Bambu PLA Basic @BBL P2S", 988)
     assert (row.tray_info_idx, row.nozzle_temp_min, row.nozzle_temp_max) == (None, None, None)
@@ -493,7 +493,7 @@ def test_migrate_v6_to_v7_adds_the_job_slot(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 12
     job = s.job(job_id)
     assert (job.name, job.status, job.settings_json, job.slot) == ("lamp-arm", "sliced", '{"wall_loops": 4}', None)
     s.update_job(job_id, slot=2)
@@ -525,7 +525,7 @@ def test_migrate_v7_to_v8_adds_confirmations(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 12
     job = s.job(job_id)
     assert (job.name, job.status, job.slot) == ("lamp-arm", "sliced", 3)
     assert s.spools()[0].id == spool_id and s.spools()[0].remaining_g == 640
@@ -538,3 +538,164 @@ def test_migrate_v7_to_v8_adds_confirmations(tmp_path: Path):
             with s.transaction() as tx:
                 tx.execute(f"UPDATE confirmations SET {column} = ? WHERE id = ?", (bad, c.id))
     s.close()
+
+
+def test_migrate_v8_to_v9_keeps_uah(tmp_path: Path):
+    path = tmp_path / "v8.db"
+    conn = sqlite3.connect(path)
+    v1 = (Path(__file__).parents[2] / "src/bambu_mcp/store/schema.sql").read_text(encoding="utf-8")
+    conn.executescript(v1 + "".join(f"\n{_MIGRATIONS[v]}" for v in range(2, 9)) + "\nPRAGMA user_version = 8;")
+    spool_id = conn.execute(
+        "INSERT INTO spools (brand, material, color_name, color_hex, price_uah, net_g, remaining_g)"
+        " VALUES ('Bambu', 'PLA', 'Black', '#000000', 700, 1000, 640)"
+    ).lastrowid
+    conn.execute("INSERT INTO tariffs (valid_from, day_uah, night_uah) VALUES ('2026-01-01', 4.8, 2.4)")
+    print_id = conn.execute(
+        "INSERT INTO prints (name, task_id, gcode_start, source, started_at, ended_at, outcome,"
+        " actual_min, spool_id, grams, kwh, cost_filament_uah, cost_power_uah)"
+        " VALUES ('bracket', '1', 's', 'external', '2026-11-01T10:00:00+00:00',"
+        " '2026-11-01T11:00:00+00:00', 'finished', 60, ?, 8, 0.25, 5.6, 1.2)",
+        (spool_id,),
+    ).lastrowid
+    conn.execute("INSERT INTO meta (key, value) VALUES ('tariff_reminded_on', '2026-11-01')")
+    conn.commit()
+    conn.close()
+
+    s = Store(path)
+    s.migrate()
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 12
+    (spool,) = s.spools()
+    assert (spool.id, spool.price_uah, spool.remaining_g, spool.currency) == (spool_id, 700, 640, "UAH")
+    t = s.tariff_on(date(2026, 6, 1))
+    assert (t.day_uah, t.night_uah, t.currency) == (4.8, 2.4, "UAH")
+    row = s.print_by_id(print_id)
+    assert (row.cost_filament_uah, row.cost_power_uah, row.cost_amort, row.currency) == (5.6, 1.2, None, "UAH")
+    assert (s.get_meta("currency"), s.get_meta("currency_symbol"), s.get_meta("country")) == ("UAH", "грн", "UA")
+    assert s.get_meta("tariff_reminded_on") == "2026-11-01"
+    assert s.currency() == ("UAH", "грн")
+    assert s.country() == "UA"
+    assert s.amortization_on(date(2030, 1, 1)) is None
+    s.migrate()  # idempotent: the owner's settings are not reset
+    s.set_currency("EUR", "€")
+    s.migrate()
+    assert s.currency() == ("EUR", "€")
+    s.close()
+
+
+def test_migrate_v9_to_v10(tmp_path: Path):
+    path = tmp_path / "v9.db"
+    conn = sqlite3.connect(path)
+    v1 = (Path(__file__).parents[2] / "src/bambu_mcp/store/schema.sql").read_text(encoding="utf-8")
+    conn.executescript(v1 + "".join(f"\n{_MIGRATIONS[v]}" for v in range(2, 10)) + "\nPRAGMA user_version = 9;")
+    conn.execute(
+        "INSERT INTO outbox (kind, text, dedupe, created_at, next_attempt_at)"
+        " VALUES ('finished', 'done', 'k1', 100.0, 100.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    s = Store(path)
+    s.migrate()
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 12
+    head = s.outbox_head()
+    assert (head.kind, head.text, head.dedupe, head.expires_at) == ("finished", "done", "k1", None)
+    s.outbox_delete(head.id)
+    assert s.outbox_add("print_confirm", "go?", "k2", now=200.0, expires_at=800.0)
+    assert s.outbox_add("finished", "done", "k3", now=200.0)
+    head = s.outbox_head()
+    assert (head.dedupe, head.expires_at) == ("k2", 800.0)
+    s.outbox_delete(head.id)
+    assert s.outbox_head().expires_at is None
+    s.migrate()
+    s.close()
+
+def test_migrate_v10_to_v11_job_goal_columns(tmp_path: Path):
+    path = tmp_path / "v10.db"
+    conn = sqlite3.connect(path)
+    v1 = (Path(__file__).parents[2] / "src/bambu_mcp/store/schema.sql").read_text(encoding="utf-8")
+    conn.executescript(v1 + "".join(f"\n{_MIGRATIONS[v]}" for v in range(2, 11)) + "\nPRAGMA user_version = 10;")
+    conn.execute(
+        "INSERT INTO jobs (name, kind, manifest_json, file_sha256, created_at)"
+        " VALUES ('bracket', 'part', '{}', 'ab', '2026-11-27T10:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    s = Store(path)
+    s.migrate()
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 12
+    job = s.jobs(1)[0]
+    assert (job.goal_json, job.variant_json, job.variants_json) == (None, None, None)
+    s.update_job(job.id, goal_json='{"primary": "fit"}', variant_json='{"wall_loops": 3}', variants_json="[]")
+    job = s.job(job.id)
+    assert (job.goal_json, job.variant_json, job.variants_json) == ('{"primary": "fit"}', '{"wall_loops": 3}', "[]")
+    s.migrate()
+    s.close()
+
+
+def test_migrate_v11_to_v12_job_explicit_column(tmp_path: Path):
+    path = tmp_path / "v11.db"
+    conn = sqlite3.connect(path)
+    v1 = (Path(__file__).parents[2] / "src/bambu_mcp/store/schema.sql").read_text(encoding="utf-8")
+    conn.executescript(v1 + "".join(f"\n{_MIGRATIONS[v]}" for v in range(2, 12)) + "\nPRAGMA user_version = 11;")
+    conn.execute(
+        "INSERT INTO jobs (name, kind, manifest_json, file_sha256, created_at)"
+        " VALUES ('bracket', 'part', '{}', 'ab', '2026-11-27T10:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    s = Store(path)
+    s.migrate()
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 12
+    job = s.jobs(1)[0]
+    assert job.explicit_json is None
+    s.update_job(job.id, explicit_json='{"wall_loops": 4}')
+    assert s.job(job.id).explicit_json == '{"wall_loops": 4}'
+    s.migrate()
+    s.close()
+
+
+def test_new_money_rows_take_the_current_currency(store: Store):
+    old = _spool(store)
+    store.set_currency("EUR", "€")
+    new = _spool(store)
+    store.add_tariff(date(2027, 1, 1), 0.25, None)
+    by_id = {sp.id: sp for sp in store.spools()}
+    assert (by_id[old].currency, by_id[new].currency) == ("UAH", "EUR")
+    assert store.tariff_on(date(2027, 1, 1)).currency == "EUR"
+    assert store.tariff_on(date(2026, 1, 1)).currency == "UAH"
+    store.update_spool(old, remaining_g=500)  # no price: the currency stays
+    assert store.spools()[0].currency == "UAH"
+    store.update_spool(old, price_uah=25)  # a new price is in the current currency
+    assert store.spools()[0].currency == "EUR"
+
+
+def test_amortization_rate_and_history(store: Store):
+    from bambu_mcp.cost import Money, amortization_cost
+
+    store.add_amortization(date(2027, 1, 1), printer_price=30000, life_hours=5000, upkeep_per_hour=2)
+    store.set_currency("EUR", "€")
+    store.add_amortization(date(2027, 6, 1), printer_price=600, life_hours=3000)
+
+    assert store.amortization_on(date(2026, 12, 31)) is None
+    first = store.amortization_on(date(2027, 3, 1))
+    assert (first.valid_from, first.currency, first.rate_per_hour) == (date(2027, 1, 1), "UAH", 8.0)
+    second = store.amortization_on(date(2027, 7, 1))
+    assert (second.upkeep_per_hour, second.currency) == (0, "EUR")
+    assert second.rate_per_hour == pytest.approx(0.2)
+
+    before = amortization_cost(52, store.amortization_on(date(2027, 5, 31)))
+    after = amortization_cost(52, store.amortization_on(date(2027, 6, 1)))
+    assert before.currency == "UAH" and round(before.amount, 2) == 6.93
+    assert after == Money(pytest.approx(52 / 60 * 0.2), "EUR")
+
+    store.add_amortization(date(2027, 6, 1), printer_price=900, life_hours=3000)  # replaces
+    assert store.amortization_on(date(2027, 6, 1)).rate_per_hour == pytest.approx(0.3)
+
+
+def test_print_money_fields(store: Store):
+    print_id = store.open_print(("a", "1", "s"), datetime(2027, 1, 1, tzinfo=timezone.utc), "job")
+    store.set_print_fields(print_id, cost_amort=6.93, currency="EUR")
+    row = store.print_by_id(print_id)
+    assert (row.cost_amort, row.currency) == (6.93, "EUR")

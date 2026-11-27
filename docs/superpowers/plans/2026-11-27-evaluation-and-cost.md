@@ -10,7 +10,7 @@
 
 The slice-agent adds per-feature extrusion volumes to its `/slice` answer and accepts a few more whitelisted overrides. Money gets one formatter, a per-row currency, and an amortization history next to the tariff history. CAD Workshop's `PRINT_HINTS` gains `goal` and `goal_reason`.
 
-**Tech Stack:** Python 3.12, uv, pytest `-W error`, SQLite (schema v9 and v10), httpx, mcp 2.3.0. CAD Workshop: cadlib, pytest.
+**Tech Stack:** Python 3.12, uv, pytest `-W error`, SQLite (schema v9 to v11), httpx, mcp 2.3.0. CAD Workshop: cadlib, pytest.
 
 **Spec:** `docs/superpowers/specs/2026-11-27-evaluation-and-cost-design.md`. Context: the main design `docs/superpowers/specs/2026-11-22-bambu-mcp-design.md` (sections 7, 11) and rulings R5 and R6 of phase 2 (`.superpowers/sdd/2026-11-23-phase2-slicing/progress.md`).
 
@@ -124,7 +124,7 @@ Before coding, check each key name and value spelling against a flattened P2S pr
 
 ### Task 5: Goals, base points and settings layers
 
-**Files:** Modify `src/bambu_mcp/evaluation.py` (the goal table: per goal the label, the grid, the base point, the score and the limits, all in one table), `proposal.py` (`resolve_settings` with `goal_base` and `variant` layers), `manifest.py` (accept the `goal` and `goal_reason` hints), `store/db.py` (schema v10: `jobs.goal_json`, `jobs.variant_json`, `jobs.variants_json`), `service.py` (the proposal goal line and goal buttons `job:<id>:goal:<key>`), `messages.py`, `mcp_server.py` (`goal` on `propose_job` and `slice_job`). Test `tests/test_evaluation.py`, `tests/test_proposal.py`, `tests/test_service.py`, `tests/test_manifest.py`, `tests/test_mcp_server.py`.
+**Files:** Modify `src/bambu_mcp/evaluation.py` (the goal table: per goal the label, the grid, the base point, the score and the limits, all in one table), `proposal.py` (`resolve_settings` with `goal_base` and `variant` layers), `manifest.py` (accept the `goal` and `goal_reason` hints), `store/db.py` (schema v11: `jobs.goal_json`, `jobs.variant_json`, `jobs.variants_json`), `service.py` (the proposal goal line and goal buttons `job:<id>:goal:<key>`), `messages.py`, `mcp_server.py` (`goal` on `propose_job` and `slice_job`). Test `tests/test_evaluation.py`, `tests/test_proposal.py`, `tests/test_service.py`, `tests/test_manifest.py`, `tests/test_mcp_server.py`.
 
 **Interfaces:**
 - `GOALS: dict[str, Goal]`.
@@ -180,7 +180,7 @@ Before coding, check each key name and value spelling against a flattened P2S pr
 
 ### Task 8: Deploy and live check (controller, the owner present)
 
-1. Back up `bambu.db`. Deploy the service and restart through `workshop-admin` (migrations v9 and v10). Restart the PC slice-agent task.
+1. Back up `bambu.db`. Deploy the service and restart through `workshop-admin` (migrations v9 to v12). Restart the PC slice-agent task.
 2. Set the owner's amortization (they give the printer price and life hours) and check the currency and country defaults.
-3. `example-bracket`: press «Прочно», check the base point and the cost lines, then press «Подобрать». Expect 4-6 variants, a table and a winner, with the walls kept when said in words. Pick «Вариант 2», then «Резать». The file is reused.
+3. `example-bracket`: press «Прочно», check the base point and the cost lines, then press «Подобрать». Expect up to 6 variants, the balanced baseline first, a table and a winner, with the walls kept when said in words (slice_job or evaluate_job settings). Pick «Вариант 2», then «Резать»: it slices that variant (ruling R5, no file reuse).
 4. Record the results in `docs/evaluation-notes.md`.

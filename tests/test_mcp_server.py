@@ -15,6 +15,7 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
+from bambu_mcp import mcp_server
 from bambu_mcp.camera import CameraBusy
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.events import Event, EventKind
@@ -55,10 +56,16 @@ TOOL_NAMES = {
     "add_plate",
     "set_default_plate",
     "set_tariff",
+    "set_amortization",
+    "set_currency",
+    "set_country",
     "update_print",
     "create_job",
     "propose_job",
     "slice_job",
+    "evaluate_job",
+    "choose_variant",
+    "reset_settings",
     "job_status",
     "jobs",
     "load_spool",
@@ -567,7 +574,7 @@ def _run_print(store: Store, settings: Settings, name: str, start: datetime, end
 
 def test_set_tariff_then_history_cost(h):
     tariff = h.call("set_tariff", valid_from="2027-01-01", day_uah=4.80)
-    assert tariff == {"valid_from": "2027-01-01", "day_uah": 4.80, "night_uah": None}
+    assert tariff == {"valid_from": "2027-01-01", "day_uah": 4.80, "night_uah": None, "currency": "UAH"}
     start = datetime(2027, 1, 2, 10, 0, tzinfo=KYIV)
     _run_print(h.store, h.settings, "bracket", start, start.replace(hour=11))
 
@@ -580,6 +587,65 @@ def test_set_tariff_then_history_cost(h):
     assert row["duration_min"] == 60
     assert row["ended_at"] == "2027-01-02T11:00:00+02:00"
     assert h.call("print_history", part="nothing")["prints"] == []
+
+
+def test_set_currency_then_new_spool_in_eur(h):
+    old = h.call("add_spool", brand="A", material="PLA", color_name="White",
+                 color_hex="#FFFFFF", price_uah=700, net_g=1000)
+    assert old["currency"] == "UAH"
+    assert h.call("set_currency", code="eur", symbol="€") == {"currency": "EUR", "currency_symbol": "€"}
+    new = h.call("add_spool", brand="B", material="PLA", color_name="Grey",
+                 color_hex="#888888", price_uah=25, net_g=1000)
+    assert new["currency"] == "EUR"
+    assert h.call("set_tariff", valid_from="2027-01-01", day_uah=0.25)["currency"] == "EUR"
+    amort = h.call("set_amortization", valid_from="2027-01-01", printer_price=600, life_hours=3000)
+    assert amort["currency"] == "EUR"
+    by_id = {s["id"]: s["currency"] for s in h.call("spools")["spools"]}
+    assert by_id == {old["id"]: "UAH", new["id"]: "EUR"}  # nothing is converted
+    assert h.call("update_spool", spool_id=old["id"], price_uah=22)["currency"] == "EUR"
+
+
+def test_set_currency_validates(h):
+    for code, symbol in (("EURO", "€"), ("E1R", "€"), ("", "€"), ("EUR", ""), ("EUR", "x" * 9),
+                         ("EUR", "€\n")):
+        result = h.call_raw("set_currency", code=code, symbol=symbol)
+        assert result["isError"], (code, symbol)
+    assert h.store.currency() == ("UAH", "грн")
+
+
+def test_set_amortization(h):
+    amort = h.call("set_amortization", valid_from="2027-01-01", printer_price=30000,
+                   life_hours=5000, upkeep_per_hour=2)
+    assert amort == {
+        "valid_from": "2027-01-01", "printer_price": 30000, "life_hours": 5000,
+        "upkeep_per_hour": 2, "rate_per_hour": 8.0, "currency": "UAH",
+    }
+    for bad in ({"printer_price": -1}, {"life_hours": 0}, {"upkeep_per_hour": -0.5}):
+        args = {"valid_from": "2027-02-01", "printer_price": 30000, "life_hours": 5000, **bad}
+        assert h.call_raw("set_amortization", **args)["isError"], bad
+    assert h.store.amortization_on(datetime(2027, 3, 1).date()).valid_from.isoformat() == "2027-01-01"
+
+
+def test_set_country(h):
+    assert h.call("set_country", code="pl") == {
+        "country": "PL", "timezone": "Europe/Warsaw", "tariff_reminder": False,
+        "note": "the timezone applies after a service restart",
+    }
+    assert h.store.country() == "PL"
+    assert h.call("set_country", code="UA") == {
+        "country": "UA", "timezone": "Europe/Kyiv", "tariff_reminder": True,
+    }
+    assert h.call_raw("set_country", code="UKR")["isError"]
+    assert h.store.country() == "UA"
+
+
+def test_print_history_shows_amortization_and_currency(h):
+    start = datetime(2027, 1, 2, 10, 0, tzinfo=KYIV)
+    print_id = _run_print(h.store, h.settings, "bracket", start, start.replace(hour=11))
+    h.store.set_print_fields(print_id, cost_amort=8.0)
+    (row,) = h.call("print_history")["prints"]
+    assert (row["cost_amort"], row["currency"]) == (8.0, "UAH")
+    assert row["cost_total_uah"] == round(row["cost_power_uah"] + 8.0, 2)
 
 
 def test_update_print_deducts_and_moves_grams(h):
@@ -784,6 +850,7 @@ class GatedSlicer:
     def __init__(self) -> None:
         self.hold = threading.Event()
         self.requests: list = []
+        self.detail: str | None = None  # set: every slice fails with this detail
 
     async def health(self) -> bool:
         return True
@@ -792,6 +859,8 @@ class GatedSlicer:
         self.requests.append(job)
         while self.hold.is_set():
             await asyncio.sleep(0.01)
+        if self.detail is not None:
+            return SliceOutcome("failed", detail=self.detail)
         return SliceOutcome("ok", file=job.out_file, plates=SLICED_PLATES, slicer_version="02.08.02.61")
 
     async def fetch_png(self, name, plate):
@@ -974,6 +1043,7 @@ def test_job_status_has_no_paths_outside_names(jh):
     assert status["sliced_file"] == f"lamp-arm-{job_id}-p1.gcode.3mf"
     assert status["settings"]["curr_bed_type"] == "Cool Plate"
     assert status["settings"]["wall_loops"] == 4
+    assert status["goal"] == {"primary": "balanced", "secondary": None, "source": "fallback", "reason": None}
     assert (status["plate_type"], status["nozzle"]) == ("Cool Plate", "0.4")
     assert status["slot"] == {
         "ams": 0, "slot": 0, "number": 1, "material": "PETG", "color": "white",
@@ -1016,6 +1086,31 @@ def test_override_keys_match_the_slice_agent_whitelist():
             Overrides.parse({key: object()}, "0.4")
         assert _allowed_values(key, "0.4")
     assert {k for values in NAMED_SETS.values() for k in values} <= set(OVERRIDE_KEYS)
+
+
+def test_mcp_allowed_values_from_runner():
+    from bambu_mcp.mcp_server import OVERRIDE_KEYS, _allowed_values
+    from slice_agent import runner
+
+    new = ("top_shell_layers", "bottom_shell_layers", "outer_wall_speed", "seam_position", "ironing_type")
+    assert set(new) <= set(OVERRIDE_KEYS)
+    assert _allowed_values("top_shell_layers", "0.4") == "an integer {}..{}".format(*runner.SHELL_LAYERS_RANGE)
+    assert _allowed_values("bottom_shell_layers", "0.4") == "an integer {}..{}".format(*runner.SHELL_LAYERS_RANGE)
+    assert _allowed_values("outer_wall_speed", "0.4") == "a number {}..{} (mm/s)".format(*runner.OUTER_WALL_SPEED_RANGE)
+    assert _allowed_values("seam_position", "0.4") == ", ".join(runner.SEAM_POSITIONS)
+    assert _allowed_values("ironing_type", "0.4") == ", ".join(runner.IRONING_TYPES)
+    assert _allowed_values("wall_generator", "0.4") == ", ".join(runner.WALL_GENERATORS)
+
+
+def test_slice_job_settings_refuse_bad_new_values():
+    from bambu_mcp.mcp_server import ToolError, explicit_settings
+
+    explicit, _ = explicit_settings({"outer_wall_speed": 60, "seam_position": "back", "top_shell_layers": 6}, "0.4")
+    assert explicit == {"outer_wall_speed": 60, "seam_position": "back", "top_shell_layers": 6}
+    with pytest.raises(ToolError, match=r"seam_position: 'rear' is not allowed .*aligned, back, nearest, random"):
+        explicit_settings({"seam_position": "rear"}, "0.4")
+    with pytest.raises(ToolError, match=r"outer_wall_speed: 400 is not allowed .*20\.\.300"):
+        explicit_settings({"outer_wall_speed": 400}, "0.4")
 
 
 PATH_RUN = re.compile(r"[A-Za-z]:[\\/]|[^\s\\/<>]+[\\/]+[^\s\\/<>]+")
@@ -1132,6 +1227,36 @@ def test_propose_job_with_a_slot_is_stored_and_shown_by_job_status(jh):
     assert "слот 1 PETG white" in result["text"]
     assert jh.call("job_status", job_id=job_id)["chosen_slot"] == 1
 
+def test_propose_and_slice_job_take_the_owners_goal(jh):
+    job_id = jh.add_job(hints={})
+    text = jh.call("propose_job", job_id=job_id, goal="strength")["text"]
+    assert "цель: прочно (выбрал ты)" in text and "4 стенки, 40% gyroid" in text
+    assert json.loads(jh.store.job(job_id).goal_json)["primary"] == "strength"
+    assert jh.waker.calls == 0 and jh.slicer.requests == []
+    # slice_job: explicit settings win over the goal's base point, the goal is stored.
+    jh.call("slice_job", job_id=job_id, settings={"wall_loops": 6}, goal=["watertight", "quality"])
+    jh.wait_status(job_id, "sliced")
+    sent = dict(jh.slicer.requests[0].overrides)
+    assert sent["wall_loops"] == 6 and (sent["top_shell_layers"], sent["bottom_shell_layers"]) == (6, 6)
+    assert sent["layer_height"] == 0.16  # the secondary goal fills what the primary leaves
+    stored = json.loads(jh.store.job(job_id).goal_json)
+    assert stored == {"primary": "watertight", "secondary": "quality", "source": "owner"}
+    goal = jh.call("job_status", job_id=job_id)["goal"]
+    assert goal == {"primary": "watertight", "secondary": "quality", "source": "owner", "reason": None}
+
+
+def test_goal_parameter_is_checked(jh):
+    job_id = jh.add_job()
+    for tool in ("propose_job", "slice_job"):
+        for goal in ("ultra", ["fit", "fit"], ["fit", "quality", "speed"], []):
+            text = jh.error(tool, job_id=job_id, goal=goal)
+            assert "goal" in text and "balanced, speed, strength" in text, (tool, goal)
+    tools = {t["name"]: t for t in jh.rpc("tools/list")["tools"]}
+    for name in ("propose_job", "slice_job"):
+        assert "goal" in tools[name]["inputSchema"]["properties"], name
+    assert jh.waker.calls == 0 and jh.slicer.requests == [] and jh.store.outbox_count() == 0
+    assert jh.store.job(job_id).goal_json is None
+
 
 def test_slot_tool_descriptions_name_the_owners_choice(jh):
     tools = {t["name"]: t for t in jh.rpc("tools/list")["tools"]}
@@ -1139,3 +1264,140 @@ def test_slot_tool_descriptions_name_the_owners_choice(jh):
         description = tools[name]["description"]
         assert "owner" in description and "material" in description, name
         assert "slot" in tools[name]["inputSchema"]["properties"], name
+
+
+def test_set_tariff_and_amortization_refuse_non_finite_numbers(h):
+    # JSON has no infinity: a client sends it as a string, which the tool's lax validation takes.
+    inf, nan = "inf", "nan"
+    for args in ({"day_uah": inf}, {"day_uah": "-inf"}, {"day_uah": nan}, {"day_uah": 4.32, "night_uah": inf}):
+        result = h.call_raw("set_tariff", valid_from="2027-01-01", **args)
+        assert result["isError"], args
+    assert h.store.tariff_on(datetime(2027, 2, 1).date()).valid_from.isoformat() == "2024-06-01"
+    base = {"valid_from": "2027-01-01", "printer_price": 30000, "life_hours": 5000, "upkeep_per_hour": 2}
+    for bad in ({"printer_price": inf}, {"life_hours": inf}, {"upkeep_per_hour": inf},
+                {"printer_price": nan}, {"printer_price": 1e308, "life_hours": 1e-300}):
+        result = h.call_raw("set_amortization", **{**base, **bad})
+        assert result["isError"], bad
+    assert h.store.amortization_on(datetime(2027, 2, 1).date()) is None
+
+
+def test_set_country_without_a_timezone_says_so(h):
+    result = h.call("set_country", code="US")
+    assert result["country"] == "US" and result["timezone"] == h.settings.timezone
+    assert result["note"] == "no default timezone for US: set timezone in config.toml"
+
+
+# -- the evaluation run (Task 6) -------------------------------------------------------
+
+EVAL_HINTS = {"walls": 4, "infill_pct": 25, "infill_pattern": "gyroid", "material": "PETG", "goal": "strength"}
+
+
+def _rows(text: str) -> list[str]:
+    lines = text.split("\n")
+    return lines[lines.index("📊 Варианты:") + 1:]
+
+
+def test_evaluate_job_tool_returns_table(jh):
+    job_id = jh.add_job(hints=EVAL_HINTS)
+    result = jh.call("evaluate_job", job_id=job_id)
+    assert result["job_id"] == job_id and result["status"] == "done"
+    rows = _rows(result["text"])
+    assert rows[0].startswith("1️⃣ ") and all("💪 ?" in r for r in rows[:6])
+    # An agent without features: strength is unknown, the strength base point is kept (variant 4).
+    assert result["chosen"] == 4
+    assert [v["n"] for v in result["variants"]] == [1, 2, 3, 4, 5, 6]
+    assert all(v["status"] == "ok" and v["minutes"] == 100.0 for v in result["variants"])
+    assert len(jh.slicer.requests) == 6 and jh.waker.calls == 1
+    assert jh.store.job(job_id).status == "new"
+    status = jh.call("job_status", job_id=job_id)["evaluation"]
+    assert status["state"] == "done" and status["chosen"] == 4 and status["table"] == rows
+
+    chosen = jh.call("choose_variant", job_id=job_id, n=2)
+    assert chosen["job_id"] == job_id and "3 стенки, 25% gyroid" in chosen["text"].split("\n")[0]
+    assert json.loads(jh.store.job(job_id).variants_json)["chosen"] == 2
+    assert "out of range" in jh.error("choose_variant", job_id=job_id, n=9)
+    assert jh.error("choose_variant", job_id=999, n=1) == "job 999 not found"
+
+    # A goal in the call is the owner's: stored, and the run uses it.
+    again = jh.call("evaluate_job", job_id=job_id, goal="speed")
+    assert "цель: быстро (выбрал ты)" in again["text"]
+    assert "goal" in jh.error("evaluate_job", job_id=job_id, goal="ultra")
+    raw = json.loads((MANIFESTS / "kit.print.json").read_text(encoding="utf-8"))
+    raw["file_sha256"] = hashlib.sha256(THREE_MF).hexdigest()
+    kit = create_job_from_bytes(jh.store, jh.settings, json.dumps(raw).encode("utf-8"), THREE_MF).id
+    assert "parts only" in jh.error("evaluate_job", job_id=kit)
+    tools = {t["name"]: t for t in jh.rpc("tools/list")["tools"]}
+    assert set(tools["evaluate_job"]["inputSchema"]["properties"]) == {"job_id", "goal", "settings"}
+    assert set(tools["choose_variant"]["inputSchema"]["properties"]) == {"job_id", "n"}
+
+
+def test_evaluate_job_settings_are_explicit(jh):
+    job_id = jh.add_job(hints=EVAL_HINTS)
+    jh.call("evaluate_job", job_id=job_id, settings={"wall_loops": 4})
+    assert {dict(r.overrides)["wall_loops"] for r in jh.slicer.requests} == {4}
+    assert json.loads(jh.store.job(job_id).explicit_json) == {"wall_loops": 4}
+    assert "1..10" in jh.error("evaluate_job", job_id=job_id, settings={"wall_loops": 99})
+
+
+def test_evaluate_job_returns_while_the_run_goes_on(jh, monkeypatch):
+    monkeypatch.setattr(mcp_server, "EVAL_WAIT_S", 0.2)
+    job_id = jh.add_job(hints=EVAL_HINTS)
+    jh.slicer.hold.set()
+    result = jh.call("evaluate_job", job_id=job_id)
+    assert result["status"] == "evaluating" and result["job_id"] == job_id
+    assert jh.call("job_status", job_id=job_id)["evaluation"] == {"state": "running"}
+    assert "already" in jh.error("evaluate_job", job_id=job_id)
+    jh.slicer.hold.clear()
+    jh.wait_status(job_id, "new")
+    evaluation = jh.call("job_status", job_id=job_id)["evaluation"]
+    assert evaluation["state"] == "done" and len(evaluation["table"]) == 7
+
+
+def test_a_failed_background_run_shows_in_job_status(jh, monkeypatch):
+    job_id = jh.add_job(hints=EVAL_HINTS)
+    assert jh.call("evaluate_job", job_id=job_id)["status"] == "done"  # an earlier run's table
+    monkeypatch.setattr(mcp_server, "EVAL_WAIT_S", 0.2)
+    jh.slicer.hold.set()
+    assert jh.call("evaluate_job", job_id=job_id)["status"] == "evaluating"
+    jh.slicer.detail = "no filament preset"
+    jh.slicer.hold.clear()
+    jh.wait_status(job_id, "new")
+    status = jh.call("job_status", job_id=job_id)
+    assert status["error"] == "no filament preset"
+    evaluation = status["evaluation"]
+    assert (evaluation["state"], evaluation["error"]) == ("failed", "no filament preset")
+    assert evaluation["failed_at"]
+    # The earlier table is there, marked as not this run's.
+    assert evaluation["previous"]["chosen"] == 4 and len(evaluation["previous"]["table"]) == 7
+    # A first run that fails has no table at all.
+    other = jh.add_job(hints=EVAL_HINTS)
+    assert "no filament preset" in jh.error("evaluate_job", job_id=other)
+    failed = jh.call("job_status", job_id=other)["evaluation"]
+    assert failed["state"] == "failed" and "previous" not in failed
+
+
+def test_rate_caps(jh):
+    for args in ({"day_uah": 1000.01}, {"day_uah": 4.32, "night_uah": 1001}):
+        assert "1000" in jh.error("set_tariff", valid_from="2027-01-01", **args)
+    assert jh.call("set_tariff", valid_from="2027-01-01", day_uah=1000)["day_uah"] == 1000
+    text = jh.error("set_amortization", valid_from="2027-01-01", printer_price=2e6, life_hours=1)
+    assert "1000000" in text
+    assert jh.store.amortization_on(datetime(2027, 2, 1).date()) is None
+
+
+def test_reset_settings_tool(jh):
+    job_id = jh.add_job()
+    jh.store.update_job(job_id, explicit_json=json.dumps({"wall_loops": 2, "sparse_infill_density": 40}))
+    some = jh.call("reset_settings", job_id=job_id, keys=["wall_loops"])
+    assert some["explicit"] == {"sparse_infill_density": 40}
+    assert (some["settings"]["wall_loops"], some["settings"]["sparse_infill_density"]) == (4, 40)
+    text = jh.error("reset_settings", job_id=job_id, keys=["walls"])
+    assert text.startswith("walls: unknown setting, allowed: ") and "wall_loops" in text
+    assert json.loads(jh.store.job(job_id).explicit_json) == {"sparse_infill_density": 40}
+    every = jh.call("reset_settings", job_id=job_id)
+    assert every["explicit"] == {} and every["settings"]["sparse_infill_density"] == 25
+    assert jh.store.job(job_id).explicit_json is None
+    jh.store.update_job(job_id, status="slicing")
+    assert "being sliced or evaluated" in jh.error("reset_settings", job_id=job_id)
+    assert jh.error("reset_settings", job_id=999) == "job 999 not found"
+    assert jh.waker.calls == 0 and jh.slicer.requests == []

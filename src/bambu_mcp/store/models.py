@@ -23,6 +23,7 @@ class Spool:
     tray_info_idx: str | None = None  # Bambu filament_id of the preset, e.g. "GFA00"
     nozzle_temp_min: int | None = None  # nozzle_temperature_range_low
     nozzle_temp_max: int | None = None  # nozzle_temperature_range_high
+    currency: str = "UAH"  # ISO code of price_uah (the name predates currencies)
 
     @property
     def price_per_kg_uah(self) -> float:
@@ -42,6 +43,22 @@ class Tariff:
     valid_from: date
     day_uah: float
     night_uah: float | None
+    currency: str = "UAH"  # ISO code of both rates (the names predate currencies)
+
+
+@dataclass(frozen=True)
+class Amortization:
+    """The printer's wear per hour of printing, valid from ``valid_from`` on."""
+
+    valid_from: date
+    printer_price: float
+    life_hours: float  # expected service life in hours of printing
+    upkeep_per_hour: float  # nozzles, belts, plates
+    currency: str
+
+    @property
+    def rate_per_hour(self) -> float:
+        return self.printer_price / self.life_hours + self.upkeep_per_hour
 
 
 @dataclass(frozen=True)
@@ -63,6 +80,8 @@ class PrintRow:
     deducted_g: float | None = None  # grams actually removed (after the floor at 0)
     job_id: int | None = None  # the sliced job the print's file name matched
     plate: int | None = None  # its plate, None when the printer did not say
+    cost_amort: float | None = None  # amortization for the actual minutes
+    currency: str = "UAH"  # ISO code the row's costs are in
 
 
 @dataclass(frozen=True)
@@ -76,6 +95,7 @@ class OutboxRow:
     created_at: float  # epoch seconds
     attempts: int
     next_attempt_at: float
+    expires_at: float | None = None  # epoch seconds the buttons stop working (a confirmation's)
 
 
 @dataclass(frozen=True)
@@ -92,6 +112,10 @@ class Job:
     sliced_file: str | None  # a file name, never a path
     error: str | None
     slot: int | None = None  # the owner's AMS slot choice (1..16), None: chosen by material
+    goal_json: str | None = None  # the owner's goal {"primary", "secondary", "source"}, None: not chosen
+    variant_json: str | None = None  # the chosen evaluation variant's settings (a settings layer)
+    variants_json: str | None = None  # the evaluated variants of the last run
+    explicit_json: str | None = None  # the owner's explicit settings (ruling R2), a settings layer
 
 
 @dataclass(frozen=True)

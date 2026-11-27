@@ -18,14 +18,15 @@ from mcp.server.mcpserver.exceptions import ToolError
 from bambu_mcp import jobs as jobs_module
 from bambu_mcp import mcp_server
 from bambu_mcp.config import Secrets, Settings
-from bambu_mcp.messages import render_proposal, render_sliced
+from bambu_mcp.evaluation import GOALS
+from bambu_mcp.messages import render_cost, render_proposal, render_sliced
 from bambu_mcp.names import slug
 from bambu_mcp.notify import Button, LogNotifier, Press, SendError, ServiceNotifyClient
 from bambu_mcp.printer.ftps import UploadError
 from bambu_mcp.printer.link import LinkStatus, PrinterNotConnected, tray_setting
 from bambu_mcp.printer.state import PrinterState, Tray
 from bambu_mcp.printgate import gate_hash
-from bambu_mcp.proposal import SlotChoice, SlotUnusable, estimate_cost
+from bambu_mcp.proposal import SlotChoice, SlotUnusable, predict_cost
 from bambu_mcp.service import (
     AUTH_FAILED_TEXT,
     CHANGE_TEXT,
@@ -100,7 +101,7 @@ class RecordingNotifier:
         if self.fail:
             raise SendError(503, "telegram_unreachable")
         self.sent.append(
-            {"text": text, "buttons": buttons or [], "files": files or [], "dedupe": dedupe}
+            {"text": text, "buttons": buttons or [], "files": files or [], "dedupe": dedupe, "expires_in": expires_in}
         )
         return f"m{len(self.sent)}"
 
@@ -222,7 +223,7 @@ async def test_lifecycle_notifies_once_each(harness):
     assert first_layer["files"] == [("snapshot.jpg", JPEG)]
     assert finished["text"].startswith("✅ Печать завершена")
     assert "Длительность: 2 ч 30 мин" in finished["text"]  # layer0 -> finish: 1+30+60+59
-    assert "Электричество" in finished["text"]
+    assert "\n⚡ свет " in finished["text"] and "\n💰 итого " in finished["text"]
     assert finished["files"] == [("snapshot.jpg", JPEG)]
     for message in (started, first_layer, finished):
         assert message["dedupe"] and message["dedupe"].startswith("cube|1795385329|")
@@ -359,6 +360,26 @@ async def test_tariff_reminder_quarterly(tmp_path):
     assert texts(notifier)[-1] == (
         "Проверь тариф на электроэнергию: сейчас день 4.80 / ночь 2.40 грн/кВт·ч с 01.12.2026"
     )
+    store.close()
+
+
+async def test_country_ua_keeps_reminder_other_disables(tmp_path):
+    store = Store(tmp_path / "bambu.db")
+    store.migrate()
+    notifier = RecordingNotifier()
+
+    async def camera():
+        return None
+
+    service = Service(
+        SECRETS, Settings(data_dir=tmp_path), store, notifier, FakeLink, camera, clock=Clock(T0)
+    )
+    assert store.country() == "UA"
+    store.set_country("PL")
+    assert await service.check_tariff() is False
+    assert store.get_meta(TARIFF_META_KEY) is None
+    store.set_country("UA")
+    assert await service.check_tariff() is True
     store.close()
 
 
@@ -768,7 +789,7 @@ async def test_cost_failure_still_sends_finished_and_questions(tmp_path):
     heads = [m["text"].splitlines()[0] for m in h.notifier.sent]
     assert "✅ Печать завершена" in heads
     finished = next(m for m in h.notifier.sent if m["text"].startswith("✅"))
-    assert "Длительность" in finished["text"] and "Электричество" not in finished["text"]
+    assert "Длительность" in finished["text"] and "итого" not in finished["text"]
     assert any(m["text"].startswith("Как села деталь") for m in h.notifier.sent)
     await h.stop()
     store.close()
@@ -945,6 +966,7 @@ TRAYS = (
 )
 PLATES = ({"index": 1, "minutes": 100.0, "grams": {"PETG": 14.0}},)
 OVERRIDES = {"wall_loops": 4, "sparse_infill_density": 25, "sparse_infill_pattern": "gyroid", "enable_support": False}
+FALLBACK_GOAL = ("balanced", None, "fallback", None)
 
 
 def ok(file: str = "lamp-arm-1-p1.gcode.3mf", plates=PLATES) -> SliceOutcome:
@@ -1042,11 +1064,75 @@ async def test_propose_sends_the_summary_with_slice_and_change_buttons(tmp_path)
     await service.propose(job.id)
     await drain(service)
     choice = SlotChoice(0, 0, spool, None, tray_type="PETG", color_name="белый", remaining_g=1000.0)
-    assert notifier.sent[0]["text"] == render_proposal(job, OVERRIDES, choice, "Textured PEI Plate", None)
-    assert notifier.button_ids(0) == [f"job:{job.id}:slice", f"job:{job.id}:change", f"job:{job.id}:slot:1"]
+    spool_row = next(s for s in store.spools() if s.id == spool)
+    cost = predict_cost(14.2, None, spool_row, "PETG", store.tariff_on(T0.date()), None, service._settings, T0,
+                        currency="UAH")
+    assert notifier.sent[0]["text"] == render_proposal(
+        job, OVERRIDES, choice, "Textured PEI Plate", None, cost, goal=FALLBACK_GOAL
+    )
+    goals = [f"job:{job.id}:goal:{key}" for key in GOALS]
+    assert notifier.button_ids(0) == [
+        f"job:{job.id}:slice", f"job:{job.id}:change", f"job:{job.id}:slot:1", *goals, f"job:{job.id}:eval"
+    ]
     # Only slot 1 has a spool with a preset: slots 2 and 3 are loaded but not mapped.
-    assert notifier.sent[0]["buttons"][1] == [Button(f"job:{job.id}:slot:1", "✓ 1 petg белый")]
+    assert notifier.sent[0]["buttons"][1] == [Button(f"job:{job.id}:slot:1", "✅ 1️⃣ petg белый")]
     assert store.job(job.id).status == "new"
+    store.close()
+
+
+async def test_proposal_summary_and_confirmation_show_breakdown(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)
+    store.add_amortization(date(2026, 1, 1), 30000.0, 5000.0, 2.0)  # 8.00 an hour
+    job = add_job(store, service._settings)
+
+    proposal = (await service.propose(job.id)).split("\n")
+    # The manifest's 14.2 g at the slot spool's 550 a kg, and no time before the first slice.
+    assert proposal[1:4] == ["🧵 пластик 7.81 грн (14 г × 550 грн/кг)", "⏱ время неизвестно до нарезки", "💰 итого 7.81 грн"]
+
+    await service.slice_job(job.id)
+    await drain(service)
+    summary = notifier.sent[-1]["text"].split("\n")
+    # 100 min at 230 W + 0.05 kWh heat-up = 0.43 kWh at 4.32, 100 min at 8.00 an hour.
+    assert summary[1:] == [
+        "🧵 пластик 7.70 грн (14 г × 550 грн/кг)",
+        "⚡ свет 1.87 грн (0.43 кВт·ч × 4.32)",
+        "🛠 амортизация 13.33 грн (100 мин × 8.00 грн/ч)",
+        "💰 итого 22.91 грн",
+    ]
+    assert json.loads(store.job(job.id).result_json)["costs"][0]["amort"] == pytest.approx(100 / 60 * 8)
+
+    # A proposal after a slice takes the minutes of the last one.
+    again = (await service.propose(job.id)).split("\n")
+    assert again[1:5] == [
+        "🧵 пластик 7.81 грн (14 г × 550 грн/кг)",
+        "⚡ свет 1.87 грн (0.43 кВт·ч × 4.32)",
+        "🛠 амортизация 13.33 грн (100 мин × 8.00 грн/ч)",
+        "💰 итого 23.02 грн",
+    ]
+    store.close()
+
+
+async def test_costs_use_the_current_currency_symbol(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    store.set_currency("EUR", "<€>")
+    store.add_tariff(date(2026, 1, 1), 0.25, None)
+    store.add_spool("Elegoo", "petg", "белый", "#FFFFFF", PRESET, 25.0, 1000.0)
+    store.map_slot(0, 0, store.spools()[-1].id)
+    job = add_job(store, service._settings)
+    text = await service.propose(job.id)
+    assert "&lt;€&gt; (14 г × 25 &lt;€&gt;/кг)" in text and "<€>" not in text
+    store.close()
+
+
+async def test_proposal_says_when_a_price_is_in_another_currency(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)  # priced in UAH
+    store.set_currency("EUR", "€")
+    store.add_tariff(date(2026, 1, 1), 0.25, None)
+    job = add_job(store, service._settings)
+    text = await service.propose(job.id)
+    assert "Стоимость не посчитана: катушка 1 в UAH" in text
     store.close()
 
 
@@ -1084,11 +1170,12 @@ async def test_slice_job_happy_path_stores_result_and_enqueues_summary(tmp_path)
     result = json.loads(done.result_json)
     spool = next(s for s in store.spools() if s.id == spool_id)
     # Canonical material: the spool says "petg", the power table has "PETG".
-    cost = estimate_cost(100.0, 14.0, spool, "PETG", store.tariff_on(T0.date()), service._settings, T0)
+    cost = predict_cost(14.0, 100.0, spool, "PETG", store.tariff_on(T0.date()), None, service._settings, T0,
+                        currency="UAH")
     assert result["plates"] == list(PLATES)
     assert result["costs"] == [{
-        "index": 1, "filament_uah": cost.filament_uah, "power_uah": cost.power_uah,
-        "kwh": cost.kwh, "total_uah": cost.total_uah,
+        "index": 1, "filament_uah": cost.plastic.amount, "power_uah": cost.power.amount, "amort": None,
+        "kwh": cost.kwh, "total_uah": cost.total.amount, "currency": "UAH",
     }]
     assert result["slot"]["spool_id"] == spool_id and (result["slot"]["ams"], result["slot"]["slot"]) == (0, 0)
     assert result["slot"]["color"] == "белый"
@@ -1148,7 +1235,7 @@ async def test_missing_png_sends_the_text_alone(tmp_path):
     await service.slice_job(job.id)
     await drain(service)
     assert notifier.sent[0]["files"] == []
-    assert notifier.sent[0]["text"].startswith("lamp-arm, пластина 1:")
+    assert notifier.sent[0]["text"].startswith("🖨 lamp-arm, пластина 1:")
     store.close()
 
 
@@ -1365,7 +1452,7 @@ async def test_slice_press_starts_job_once(harness):
     gate.set()
     await until(lambda: harness.store.job(job.id).status == "sliced")
     await until(lambda: harness.store.outbox_count() == 0)
-    assert harness.notifier.sent[-1]["text"].startswith("lamp-arm, пластина 1:")
+    assert harness.notifier.sent[-1]["text"].startswith("🖨 lamp-arm, пластина 1:")
     assert len(harness.slicer.requests) == 1
 
 
@@ -1521,7 +1608,7 @@ async def test_long_summary_sends_the_picture_then_the_text(tmp_path):
     assert picture["files"] == [("plate-1.png", PNG)]
     assert len(picture["text"]) <= 1024 and picture["text"] == "desk-kit: пластина 1"
     assert summary["files"] == [] and len(summary["text"]) > 1024
-    assert summary["text"].startswith("desk-kit, 30 пластин:")
+    assert summary["text"].startswith("🖨 desk-kit, 30 пластин:")
     assert not any((tmp_path / "outbox-files").glob("*"))
     store.close()
 
@@ -1562,7 +1649,9 @@ async def test_propose_with_a_slot_stores_it_and_marks_its_button(tmp_path):
     assert "слот 2 PETG синий" in text
     await drain(service)
     assert notifier.sent[0]["text"] == text
-    assert [b.text for b in flat_buttons(notifier.sent[0]["buttons"][1:])] == ["1 petg белый", "✓ 2 PETG синий"]
+    assert [b.text for b in flat_buttons(notifier.sent[0]["buttons"][1:]) if ":slot:" in b.id] == [
+        "1️⃣ petg белый", "✅ 2️⃣ PETG синий"
+    ]
     # A later proposal without a slot keeps the stored one.
     assert "слот 2 PETG синий" in await service.propose(job.id)
     store.close()
@@ -1632,9 +1721,9 @@ async def test_slot_press_edits_the_proposal_and_a_later_slice_press_uses_it(har
     assert message_id == "m4" and "слот 2 PETG синий" in text
     rows = harness.notifier.edit_buttons[0]
     assert [b.id for b in rows[0]] == [f"job:{job.id}:slice", f"job:{job.id}:change"]
-    assert [(b.id, b.text) for b in flat_buttons(rows[1:])] == [
-        (f"job:{job.id}:slot:1", "1 petg белый"),
-        (f"job:{job.id}:slot:2", "✓ 2 PETG синий"),
+    assert [(b.id, b.text) for b in flat_buttons(rows[1:]) if ":slot:" in b.id] == [
+        (f"job:{job.id}:slot:1", "1️⃣ petg белый"),
+        (f"job:{job.id}:slot:2", "✅ 2️⃣ PETG синий"),
     ]
     assert harness.store.job(job.id).slot == 2
     assert harness.store.outbox_count() == 0  # edited in place, nothing new sent
@@ -1652,7 +1741,7 @@ async def test_slot_press_sends_a_new_proposal_when_the_edit_fails(harness):
     await until(lambda: harness.notifier.sent)
     sent = harness.notifier.sent[0]
     assert sent["text"] == harness.notifier.edits[0][1]
-    assert "✓ 2 PETG синий" in [b.text for b in flat_buttons(sent["buttons"])]
+    assert "✅ 2️⃣ PETG синий" in [b.text for b in flat_buttons(sent["buttons"])]
     assert harness.store.job(job.id).slot == 2
 
 
@@ -1677,6 +1766,765 @@ async def test_slot_press_while_slicing_is_ignored_like_the_slice_button(harness
     assert harness.notifier.edits == [("m4", "Уже режу «lamp-arm»")]
     assert harness.store.job(job.id).slot is None
     assert harness.store.outbox_count() == 0
+
+
+# -- goals and base points (evaluation Task 5) -----------------------------------------
+
+GOAL_LABELS = ["⚖️ Обычно", "⚡ Быстро", "💪 Прочно", "✨ Красиво", "💸 Дёшево", "🪶 Легко", "🎯 Точно", "💧 Герметично"]
+STRENGTH_BASE = {
+    "wall_loops": 4, "sparse_infill_density": 40, "sparse_infill_pattern": "gyroid",
+    "top_shell_layers": 7, "bottom_shell_layers": 5,
+}
+
+
+def goal_rows(rows) -> list[list[tuple[str, str]]]:
+    return [[(b.id, b.text) for b in row] for row in rows or [] if any(":goal:" in b.id for b in row)]
+
+
+async def test_proposal_names_the_goal_and_its_source(tmp_path):
+    service, store, _ = job_service(tmp_path)
+    add_spool(store)
+    fallback = add_job(store, service._settings)
+    assert "цель: обычно (по умолчанию)" in await service.propose(fallback.id)
+    hinted = add_job(store, service._settings, hints={
+        "goal": ["strength", "quality"], "goal_reason": "несущий кронштейн_1", "material": "PETG",
+    })
+    text = await service.propose(hinted.id)
+    assert r"цель: прочно, затем красиво (от ассистента: несущий кронштейн\_1)" in text
+    assert "4 стенки, 40% gyroid" in text  # the assistant's goal applies its base point
+    owner = await service.propose(hinted.id, goal="speed")
+    assert "цель: быстро (выбрал ты)" in owner
+    assert json.loads(store.job(hinted.id).goal_json) == {"primary": "speed", "secondary": None, "source": "owner"}
+    store.close()
+
+
+async def test_fallback_goal_keeps_the_hints(tmp_path):
+    # No goal in PRINT_HINTS: no base point, hints walls 4 / 25 % slice as 4 / 25 %.
+    slicer = FakeSlicer()
+    service, store, _ = job_service(tmp_path, slicer)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    text = await service.propose(job.id)
+    assert "цель: обычно (по умолчанию)" in text and "4 стенки, 25% gyroid" in text
+    await service.slice_job(job.id)
+    sent = dict(slicer.requests[0].overrides)
+    assert (sent["wall_loops"], sent["sparse_infill_density"]) == (4, 25)
+    store.close()
+
+
+async def test_explicit_setting_breaking_the_goal_rule_is_warned(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    assert "⚠️" not in await service.propose(job.id, goal="fit")
+    await drain(service)
+    await service.slice_job(job.id, {"wall_loops": 2})  # the owner's words win over the base point
+    await drain(service)
+    summary = notifier.sent[-1]["text"]
+    assert "⚠️ Цель «Точно» требует: стенок не меньше 3" in summary
+    store.close()
+
+
+async def test_goal_press_sets_base_point_no_slice(harness):
+    service, job, _blue = await slot_harness(harness)
+    queue = harness.notifier.press_queue
+    harness.store.update_job(job.id, variant_json=json.dumps({"wall_loops": 2}))
+
+    await queue.put(Press(1, "m4", f"job:{job.id}:goal:strength", T0))
+    await until(lambda: harness.notifier.edits)
+    message_id, text = harness.notifier.edits[0]
+    assert message_id == "m4" and "цель: прочно (выбрал ты)" in text
+    assert "4 стенки, 40% gyroid" in text and "верх/низ 7/5" in text
+    rows = goal_rows(harness.notifier.edit_buttons[0])
+    assert [len(r) for r in rows] == [4, 4]
+    assert [t for r in rows for _, t in r] == [("✅ " if t == "💪 Прочно" else "") + t for t in GOAL_LABELS]
+    assert rows[0][2][0] == f"job:{job.id}:goal:strength"
+    stored = harness.store.job(job.id)
+    assert json.loads(stored.goal_json) == {"primary": "strength", "secondary": None, "source": "owner"}
+    assert stored.variant_json is None  # the old variant no longer hides the new base point
+    # No slice, no wake, nothing new sent: the proposal is edited in place.
+    assert harness.slicer.requests == [] and harness.waker.budgets == []
+    assert harness.store.outbox_count() == 0 and stored.status == "new"
+
+    await queue.put(Press(2, "m4", f"job:{job.id}:slice", T0))
+    await until(lambda: harness.store.job(job.id).status == "sliced")
+    sent = dict(harness.slicer.requests[0].overrides)
+    assert {k: sent[k] for k in STRENGTH_BASE} == STRENGTH_BASE
+
+
+async def test_goal_press_while_slicing_or_unknown_changes_nothing(harness):
+    _service, job, _blue = await slot_harness(harness)
+    queue = harness.notifier.press_queue
+    for seq, button in enumerate((f"job:{job.id}:goal:ultra", f"job:{job.id}:goal:", "job:x:goal:speed"), 1):
+        await queue.put(Press(seq, "m4", button, T0))
+    harness.store.update_job(job.id, status="slicing")
+    await queue.put(Press(9, "m4", f"job:{job.id}:goal:speed", T0))
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits == [("m4", "Уже режу «lamp-arm»")]
+    assert harness.store.job(job.id).goal_json is None
+    assert harness.slicer.requests == [] and harness.waker.budgets == []
+
+
+async def test_kit_has_no_podobrat_button(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)
+    part = add_job(store, service._settings)
+    kit = add_job(store, service._settings, kind="kit")
+    await service.propose(part.id)
+    await service.propose(kit.id)
+    await drain(service)
+    part_ids, kit_ids = notifier.button_ids(0), notifier.button_ids(1)
+    assert part_ids[-1] == f"job:{part.id}:eval"
+    assert notifier.sent[0]["buttons"][-1] == [Button(f"job:{part.id}:eval", "🔍 Подобрать")]
+    assert not any(i.endswith(":eval") for i in kit_ids)
+    # The goal buttons still set the kit's goal for the record.
+    assert sum(":goal:" in i for i in kit_ids) == 8
+    store.close()
+
+
+async def test_button_count_within_24(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    trays = []
+    for number in range(1, 17):
+        ams, slot = divmod(number - 1, 4)
+        trays.append(Tray(ams, slot, "PETG", "FFFFFFFF", None))
+        spool = store.add_spool("Elegoo", "PETG", f"цвет{number}", "#FFFFFF", PRESET, 550.0, 1000.0)
+        store.map_slot(ams, slot, spool)
+    service._state = replace(PrinterState.empty(), trays=tuple(trays))
+    part = add_job(store, service._settings)
+    kit = add_job(store, service._settings, kind="kit")
+    await service.propose(part.id, slot=16)
+    await service.propose(kit.id)
+    await drain(service)
+    for index in (0, 1):
+        ids = notifier.button_ids(index)
+        assert len(ids) <= 24, len(ids)
+        assert sum(":goal:" in i for i in ids) == 8
+        assert ids[:2][1].endswith(":change")
+    part_slots = [i for i in notifier.button_ids(0) if ":slot:" in i]
+    assert f"job:{part.id}:slot:16" in part_slots  # the chosen slot is always shown
+    assert len(notifier.button_ids(0)) == 24 and notifier.button_ids(0)[-1].endswith(":eval")
+    store.close()
+
+
+# -- the evaluation run: «Подобрать» (evaluation Task 6) -------------------------------
+
+STRENGTH_HINTS = {
+    "infill_pattern": "gyroid", "infill_pct": 25, "material": "PETG", "walls": 4, "goal": "strength",
+}
+EVAL_FEATURE_KEYS = (
+    "outer_wall", "inner_wall", "top_surface", "bottom_surface", "sparse_infill", "internal_solid_infill",
+    "support", "other",
+)
+# A strength run on the fixture: the balanced baseline (3 walls, 15 %), then the strength grid.
+STRENGTH_RUN = [(3, 15), (3, 25), (4, 30), (4, 40), (5, 50), (6, 60)]
+
+
+class EvalSlicer:
+    """slice-agent fake for evaluation runs: the result follows the overrides.
+
+    minutes = 40 + 10 x walls + infill %, grams = 4 + walls + infill / 10, and the features give
+    S = 100 x walls + 50 + k x 10 x infill %. Each answer has its own sha256.
+    """
+
+    def __init__(self, *, fail=None, features=True, gate: asyncio.Event | None = None) -> None:
+        self.fail = fail or (lambda overrides: None)
+        self.features, self.gate = features, gate
+        self.requests: list = []
+        self.shas: list[str | None] = []
+        self.active = self.max_active = 0
+
+    async def health(self) -> bool:
+        return True
+
+    async def slice(self, job, file_bytes):
+        self.requests.append(job)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            await asyncio.sleep(0)
+            o = dict(job.overrides)
+            reason = self.fail(o)
+            if reason:
+                self.shas.append(None)
+                return SliceOutcome("failed", detail=reason)
+            walls, infill = o.get("wall_loops", 3), o.get("sparse_infill_density", 15)
+            minutes = float(40 + 10 * walls + infill)
+            plate = {"index": 1, "minutes": minutes, "grams": {"PETG": 4 + walls + infill / 10}}
+            if self.features:
+                volumes = dict.fromkeys(EVAL_FEATURE_KEYS, 0.0)
+                volumes.update(
+                    outer_wall=100.0, inner_wall=100.0 * (walls - 1), top_surface=20.0, bottom_surface=20.0,
+                    internal_solid_infill=10.0, sparse_infill=10.0 * infill,
+                )
+                plate["features"] = volumes
+            sha = f"{len(self.requests):064x}"
+            self.shas.append(sha)
+            return SliceOutcome("ok", file=job.out_file, plates=(plate,), slicer_version="02.08.02.61", sha256=sha)
+        finally:
+            self.active -= 1
+
+    async def fetch_png(self, name, plate):
+        return None
+
+
+def table(text: str) -> list[str]:
+    lines = text.split("\n")
+    return lines[lines.index("📊 Варианты:") + 1:]
+
+
+def variant_ids(rows) -> list[tuple[str, str]]:
+    return [(b.id, b.text) for row in rows or [] for b in row if ":variant:" in b.id]
+
+
+def walls_infill(requests) -> list[tuple[int, int]]:
+    return [(dict(r.overrides)["wall_loops"], dict(r.overrides)["sparse_infill_density"]) for r in requests]
+
+
+async def eval_harness(harness, slicer):
+    harness.slicer, harness.waker = slicer, FakeWaker()
+    harness.settings = job_settings(harness.settings.data_dir)
+    service = await harness.start()
+    service._state = replace(PrinterState.empty(), trays=TRAYS)
+    add_spool(harness.store)
+    job = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
+    return service, job
+
+
+async def test_evaluation_slices_baseline_then_variants_sequentially(tmp_path):
+    slicer, waker = EvalSlicer(), FakeWaker()
+    service, store, notifier = job_service(tmp_path, slicer, waker)
+    add_spool(store)
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+
+    text = await service.evaluate(job.id)
+
+    assert waker.budgets == [120]  # woken once for the whole run
+    assert slicer.max_active == 1  # one slice at a time
+    # The balanced base point first (spec 5.1), then the strength grid with its base point.
+    assert walls_infill(slicer.requests) == STRENGTH_RUN
+    sent = [dict(r.overrides) for r in slicer.requests]
+    assert {k: sent[3][k] for k in STRENGTH_BASE} == STRENGTH_BASE
+    assert all(r.name == "lamp-arm" and r.job_id == job.id for r in slicer.requests)
+    rows = table(text)
+    assert len(rows) == 6
+    assert rows[0].startswith("1️⃣ 3 стенки 15% gyroid · ⏱ 85 мин · ⚖️ 8 г · 💰 ")
+    assert rows[0].endswith(" · 💪 1.0×")
+    assert rows[3].startswith("4️⃣ 4 стенки 40% gyroid, верх/низ 7/5 · ⏱ 120 мин · ⚖️ 12 г · 💰 ")
+    assert rows[3].endswith(" · 💪 1.7×")  # 850 / 500: against the balanced baseline
+    # The strongest within 2.5 x the baseline's time wins, and is shown as the proposal.
+    assert rows[5].startswith("6️⃣ ✅ 6 стенок 60% gyroid, верх/низ 7/5 · ⏱ 160 мин · ⚖️ 16 г · 💰 ")
+    assert rows[5].endswith(" грн · 💪 2.5×")  # 1250 / 500
+    assert text.startswith("🖨 lamp-arm, пластина 1: ") and "6 стенок, 60% gyroid" in text.split("\n")[0]
+    stored = store.job(job.id)
+    assert stored.status == "new"  # the run gives the job back as it was
+    assert json.loads(stored.variant_json)["wall_loops"] == 6
+    variants = json.loads(stored.variants_json)
+    assert [v["n"] for v in variants["variants"]] == [1, 2, 3, 4, 5, 6] and variants["chosen"] == 6
+    await drain(service)
+    assert notifier.sent[-1]["text"] == text
+    assert variant_ids(notifier.sent[-1]["buttons"]) == [
+        (f"job:{job.id}:variant:{n}", f"{'✅ ' if n == 6 else ''}{n}\ufe0f\u20e3") for n in range(1, 7)
+    ]
+    store.close()
+
+
+async def test_explicit_walls_stay_in_every_variant(harness):
+    # «4 стенки» (the owner's words through slice_job), then «Подобрать»: every variant has 4 walls.
+    slicer = EvalSlicer()
+    service, job = await eval_harness(harness, slicer)
+    await service.slice_job(job.id, {"wall_loops": 4})
+    stored = harness.store.job(job.id)
+    assert json.loads(stored.explicit_json) == {"wall_loops": 4}
+    await until(lambda: harness.store.outbox_count() == 0)
+
+    await harness.notifier.press_queue.put(Press(1, "m7", f"job:{job.id}:eval", T0))
+    await until(lambda: len(slicer.requests) == 7 and harness.store.job(job.id).status == "new")
+    run = slicer.requests[1:]
+    assert len(run) == 6 and {dict(r.overrides)["wall_loops"] for r in run} == {4}
+    assert [dict(r.overrides)["sparse_infill_density"] for r in run] == [15, 25, 30, 40, 50, 60]
+    # The explicit layer still wins after the run, and in a later slice.
+    await service.slice_job(job.id)
+    assert dict(slicer.requests[-1].overrides)["wall_loops"] == 4
+
+
+async def test_failed_variant_skipped_failed_baseline_restores(harness):
+    slicer = EvalSlicer(fail=lambda o: "boom" if o["wall_loops"] == 5 else None)
+    service, job = await eval_harness(harness, slicer)
+
+    text = await service.evaluate(job.id)
+    rows = table(text)
+    assert rows[4] == "5️⃣ ❌ 5 стенок 50% adaptivecubic, верх/низ 7/5 · не нарезан"
+    assert len(slicer.requests) == 6  # the run went on after the failure
+    await until(lambda: harness.store.outbox_count() == 0)
+    assert f"job:{job.id}:variant:5" not in [i for i, _ in variant_ids(harness.notifier.sent[-1]["buttons"])]
+
+    # A failed baseline fails the run: the proposal goes back to its text, nothing is stored.
+    other = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
+    slicer.fail = lambda o: "агент: no preset" if o["sparse_infill_density"] == 15 else None
+    before = await service.propose(other.id)
+    await until(lambda: harness.store.outbox_count() == 0)
+    count = len(slicer.requests)
+    await harness.notifier.press_queue.put(Press(1, "m9", f"job:{other.id}:eval", T0))
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert harness.notifier.edits[0][1].endswith("🔍 Подбираю варианты…")
+    assert harness.notifier.edits[1] == ("m9", before)
+    assert len(slicer.requests) == count + 1  # nothing after the baseline
+    stored = harness.store.job(other.id)
+    assert stored.status == "new" and stored.variant_json is None and stored.error == "агент: no preset"
+    # The failure is recorded for job_status: no table, state failed with the reason.
+    assert json.loads(stored.variants_json) == {
+        "state": "failed", "error": "агент: no preset", "failed_at": T0.isoformat()
+    }
+    await until(lambda: harness.store.outbox_count() == 0)
+    assert harness.notifier.sent[-1]["text"] == "❌ Подбор вариантов для «lamp-arm» не удался: агент: no preset"
+
+
+async def test_all_variants_fail_baseline_only(tmp_path):
+    slicer = EvalSlicer(fail=lambda o: None if o["sparse_infill_density"] == 15 else "boom")
+    service, store, notifier = job_service(tmp_path, slicer)
+    add_spool(store)
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    rows = table(await service.evaluate(job.id))
+    assert rows[0].startswith("1️⃣ ✅ 3 стенки 15% gyroid · ⏱ 85 мин")
+    assert all(r.endswith("не нарезан") for r in rows[1:6])
+    assert rows[6] == "Нарезался только базовый вариант, остальные не нарезались"
+    await drain(service)
+    assert variant_ids(notifier.sent[-1]["buttons"]) == [(f"job:{job.id}:variant:1", "✅ 1️⃣")]
+    store.close()
+
+
+async def test_no_features_strength_unknown(tmp_path):
+    service, store, _ = job_service(tmp_path, EvalSlicer(features=False))
+    add_spool(store)
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    rows = table(await service.evaluate(job.id))
+    assert len(rows) == 7 and all(r.endswith(" · 💪 ?") for r in rows[:6])
+    # Strength unknown: the strength goal keeps its base point, not the fastest variant.
+    assert rows[3].startswith("4️⃣ ✅ 4 стенки 40% gyroid")
+    assert rows[6] == "Прочность неизвестна: агент на ПК её не измерил, выбран базовый вариант цели"
+    assert json.loads(store.job(job.id).variants_json)["chosen"] == 4
+    store.close()
+
+
+async def test_evaluation_is_for_parts_only(tmp_path):
+    slicer = EvalSlicer()
+    service, store, _ = job_service(tmp_path, slicer)
+    add_spool(store)
+    kit = add_job(store, service._settings, kind="kit")
+    with pytest.raises(ValueError, match="parts only"):
+        await service.evaluate(kit.id)
+    assert slicer.requests == [] and store.job(kit.id).status == "new"
+    store.close()
+
+
+async def test_second_press_and_goal_press_during_run_refused(harness):
+    gate = asyncio.Event()
+    service, job = await eval_harness(harness, EvalSlicer(gate=gate))
+    queue = harness.notifier.press_queue
+
+    await queue.put(Press(1, "m4", f"job:{job.id}:eval", T0))
+    await until(lambda: harness.notifier.edits and harness.slicer.requests)
+    assert harness.notifier.edits[0][0] == "m4"
+    assert harness.notifier.edits[0][1].endswith("\n🔍 Подбираю варианты…")
+    busy = "Уже подбираю варианты для «lamp-arm»"
+    presses = (f"job:{job.id}:eval", f"job:{job.id}:goal:speed", f"job:{job.id}:slice",
+               f"job:{job.id}:slot:1", f"job:{job.id}:variant:1")
+    for seq, button in enumerate(presses, 2):
+        await queue.put(Press(seq, "m4", button, T0))
+        await until(lambda seq=seq: len(harness.notifier.edits) == seq)
+        assert harness.notifier.edits[-1] == ("m4", busy), button
+    with pytest.raises(JobBusy):
+        await service.evaluate(job.id)
+    assert harness.store.job(job.id).goal_json is None
+    assert len(harness.slicer.requests) == 1
+
+    gate.set()
+    await until(lambda: len(harness.notifier.edits) == 7)
+    message_id, text = harness.notifier.edits[-1]
+    assert message_id == "m4" and "Варианты:" in text
+    assert len(variant_ids(harness.notifier.edit_buttons[-1])) == 6
+    assert harness.store.job(job.id).status == "new"
+    assert len(harness.slicer.requests) == 6
+
+
+async def test_choose_variant_then_slice_slices_it_fresh(harness):
+    # Ruling R5: no file reuse, «Резать» after «Вариант N» always slices that variant.
+    slicer = EvalSlicer()
+    service, job = await eval_harness(harness, slicer)
+    await service.evaluate(job.id)
+    queue = harness.notifier.press_queue
+
+    await queue.put(Press(1, "m5", f"job:{job.id}:variant:5", T0))
+    await until(lambda: harness.notifier.edits)
+    message_id, text = harness.notifier.edits[0]
+    assert message_id == "m5" and "5 стенок, 50% adaptivecubic" in text.split("\n")[0]
+    assert table(text)[4].startswith("5️⃣ ✅ ")
+    assert "✅ 5️⃣" in [t for _, t in variant_ids(harness.notifier.edit_buttons[0])]
+    stored = harness.store.job(job.id)
+    assert json.loads(stored.variant_json)["wall_loops"] == 5 and stored.goal_json is None
+    assert json.loads(stored.variants_json)["chosen"] == 5
+
+    # Even «Вариант 6», the last one sliced, is sliced again.
+    for seq, n in ((2, 6), (4, 5)):
+        await queue.put(Press(seq, "m5", f"job:{job.id}:variant:{n}", T0))
+        await until(lambda seq=seq: len(harness.notifier.edits) == seq)
+        count = len(slicer.requests)
+        await queue.put(Press(seq + 1, "m5", f"job:{job.id}:slice", T0))
+        await until(lambda count=count: len(slicer.requests) == count + 1)
+        await until(lambda: harness.store.job(job.id).status == "sliced")
+        assert dict(slicer.requests[-1].overrides)["wall_loops"] == n
+        result = json.loads(harness.store.job(job.id).result_json)
+        assert result["file_sha256"] == slicer.shas[-1]
+
+
+async def test_evaluating_a_sliced_job_drops_its_result_and_expires_its_confirmations(harness):
+    slicer = EvalSlicer()
+    service, job = await eval_harness(harness, slicer)
+    await service.slice_job(job.id)
+    assert harness.store.job(job.id).status == "sliced"
+    confirm = harness.store.add_confirmation(
+        None, "start", job_id=job.id, plate=1, gate_hash="x", payload_json="{}", now=T0.timestamp()
+    )
+    other_job = add_job(harness.store, harness.settings)
+    other = harness.store.add_confirmation(
+        None, "start", job_id=other_job.id, plate=1, gate_hash="x", payload_json="{}", now=T0.timestamp()
+    )
+
+    await service.evaluate(job.id)
+
+    stored = harness.store.job(job.id)
+    assert stored.status == "new" and stored.result_json is None and stored.sliced_file is None
+    expired = harness.store.confirmation(confirm.id)
+    assert (expired.state, expired.outcome) == ("expired", "reevaluated")
+    assert harness.store.confirmation(other.id).state == "pending"  # another job's stays
+    await harness.notifier.press_queue.put(Press(1, "m8", f"start:{confirm.id}:go", T0))
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits[-1] == ("m8", "⌛ Настройки подбираются заново, подготовь печать после подбора")
+
+
+async def test_chosen_variant_is_inherited_by_the_next_job_with_the_same_goal(harness):
+    # Ruling R4: the same primary goal inherits the last job's settings over the base point.
+    service, job = await eval_harness(harness, EvalSlicer())
+    await service.evaluate(job.id)
+    await service.choose_variant(job.id, 5)  # 5 walls, 50 % adaptivecubic
+    await service.slice_job(job.id)
+    assert json.loads(harness.store.job(job.id).settings_json)["wall_loops"] == 5
+
+    again = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
+    text = await service.propose(again.id)
+    assert "5 стенок, 50% adaptivecubic" in text and "цель: прочно (от ассистента)" in text
+    # Another goal: its base point wins over the last job, as before.
+    speed = add_job(harness.store, harness.settings, hints={**STRENGTH_HINTS, "goal": "speed"})
+    assert "2 стенки, 10% grid" in await service.propose(speed.id)
+
+
+async def test_goal_change_after_a_sliced_variant_applies_the_new_base_point(harness):
+    # Live bug on job 1: strength, «Вариант 1», «Резать», «Герметично», «Резать» sliced variant 1
+    # again. The job's own earlier slice must never be its "last job" layer.
+    slicer = EvalSlicer()
+    service, job = await eval_harness(harness, slicer)
+    await service.evaluate(job.id)
+    await service.choose_variant(job.id, 1)  # the balanced baseline: 3 walls, 15 %
+    await service.slice_job(job.id)
+    assert dict(slicer.requests[-1].overrides)["wall_loops"] == 3
+
+    queue = harness.notifier.press_queue
+    await queue.put(Press(1, "m4", f"job:{job.id}:goal:watertight", T0))
+    await until(lambda: harness.notifier.edits)
+    proposal = harness.notifier.edits[0][1]
+    assert "цель: герметично (выбрал ты)" in proposal and "требует" not in proposal
+    count = len(slicer.requests)
+    await queue.put(Press(2, "m4", f"job:{job.id}:slice", T0))
+    await until(lambda: len(slicer.requests) == count + 1)
+    await until(lambda: harness.store.job(job.id).status == "sliced")
+    sent = dict(slicer.requests[-1].overrides)
+    assert sent["wall_loops"] >= 4
+    assert sent["top_shell_layers"] >= 5 and sent["bottom_shell_layers"] >= 5
+    await until(lambda: harness.store.outbox_count() == 0)
+    summary = harness.notifier.sent[-1]["text"]
+    assert summary.startswith("🖨 lamp-arm, пластина 1:") and "требует" not in summary
+
+
+async def test_choose_variant_refusals(tmp_path):
+    slicer = EvalSlicer(fail=lambda o: "boom" if o["wall_loops"] == 5 else None)
+    service, store, _ = job_service(tmp_path, slicer)
+    add_spool(store)
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    with pytest.raises(ValueError, match="no evaluation"):
+        await service.choose_variant(job.id, 1)
+    await service.evaluate(job.id)
+    for n in (0, 7, 5):  # out of range, and the failed one
+        with pytest.raises(ValueError, match="variant"):
+            await service.choose_variant(job.id, n)
+    assert json.loads(store.job(job.id).variants_json)["chosen"] == 6
+    store.close()
+
+
+async def test_chosen_variant_prices_the_proposal_header(tmp_path):
+    service, store, _ = job_service(tmp_path, EvalSlicer())
+    spool_id = add_spool(store)
+    store.add_amortization(date(2026, 1, 1), 30000.0, 5000.0, 2.0)  # 8.00 an hour
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    await service.evaluate(job.id)
+    text = await service.choose_variant(job.id, 2)  # 3 walls, 25 %: 95 min, 9.5 g
+    lines = text.split("\n")
+    spool = next(s for s in store.spools() if s.id == spool_id)
+    cost = predict_cost(9.5, 95.0, spool, "PETG", store.tariff_on(T0.date()), store.amortization_on(T0.date()),
+                        service._settings, T0, currency="UAH")
+    assert lines[1:5] == render_cost(cost, "грн", start_now=True)
+    assert lines[3] == "🛠 амортизация 12.67 грн (95 мин × 8.00 грн/ч)"
+    assert "⏱ время неизвестно до нарезки" not in text and "по прошлой нарезке" not in text
+    store.close()
+
+
+async def test_goal_change_drops_the_evaluation(tmp_path):
+    service, store, _ = job_service(tmp_path, EvalSlicer())
+    add_spool(store)
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    await service.evaluate(job.id)
+    text = await service.propose(job.id, goal="speed")
+    assert "Варианты:" not in text
+    stored = store.job(job.id)
+    assert stored.variants_json is None and stored.variant_json is None
+    store.close()
+
+
+async def test_button_count_within_24_after_an_evaluation(tmp_path):
+    service, store, notifier = job_service(tmp_path, EvalSlicer())
+    trays = []
+    for number in range(1, 17):
+        ams, slot = divmod(number - 1, 4)
+        trays.append(Tray(ams, slot, "PETG", "FFFFFFFF", None))
+        spool = store.add_spool("Elegoo", "PETG", f"цвет{number}", "#FFFFFF", PRESET, 550.0, 1000.0)
+        store.map_slot(ams, slot, spool)
+    service._state = replace(PrinterState.empty(), trays=tuple(trays))
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    await service.propose(job.id, slot=16)
+    await service.evaluate(job.id)
+    await drain(service)
+    ids = notifier.button_ids(-1)
+    assert len(ids) == 24, len(ids)
+    assert not any(":goal:" in i for i in ids)  # the variant row replaces the goal rows (spec 5.8)
+    assert sum(":variant:" in i for i in ids) == 6
+    assert f"job:{job.id}:slot:16" in ids and f"job:{job.id}:eval" in ids
+    store.close()
+    # With one AMS everything fits: the goal rows stay.
+    (tmp_path / "one").mkdir()
+    small, small_store, small_notifier = job_service(tmp_path / "one", EvalSlicer())
+    add_spool(small_store)
+    other = add_job(small_store, small._settings, hints=STRENGTH_HINTS)
+    await small.evaluate(other.id)
+    await drain(small)
+    ids = small_notifier.button_ids(-1)
+    assert sum(":goal:" in i for i in ids) == 8 and sum(":variant:" in i for i in ids) == 6
+    assert len(ids) <= 24
+    small_store.close()
+
+
+def _running_marker(job_id: int, previous: str | None) -> str:
+    marker = {
+        "state": "running", "prev_status": "new", "message_id": "m4", "previous": previous,
+        "before_text": "BEFORE", "before_buttons": [[{"id": f"job:{job_id}:eval", "text": "🔍 Подобрать"}]],
+    }
+    return json.dumps(marker, ensure_ascii=False)
+
+
+INTERRUPTED_NOTICE = (
+    "Подбор вариантов для «lamp-arm» не закончен: подбор прерван перезапуском сервиса. "
+    "Нажми «🔍 Подобрать» ещё раз"
+)
+
+
+async def test_interrupted_evaluation_is_restored_at_startup(harness):
+    harness.slicer, harness.waker = EvalSlicer(), FakeWaker()
+    harness.settings = job_settings(harness.settings.data_dir)
+    harness.service_kwargs = {"restore_wait_s": 0.3}
+    add_spool(harness.store)
+    job = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
+    entry = {"n": 1, "status": "ok", "settings": {"wall_loops": 3}, "minutes": 85.0, "grams": 8.5,
+             "cost": 5.0, "currency": "UAH", "strength": None, "strength_ratio": None}
+    previous = json.dumps({"state": "done", "chosen": 1, "variants": [entry]})
+    # The run was started with the owner's new goal: the restored proposal must name it.
+    harness.store.update_job(
+        job.id, status="slicing", variants_json=_running_marker(job.id, previous),
+        goal_json=json.dumps({"primary": "speed", "secondary": None, "source": "owner"}),
+    )
+
+    service = await harness.start()
+    service._state = replace(PrinterState.empty(), trays=TRAYS)
+    await until(lambda: harness.notifier.edits)
+    await until(lambda: harness.store.outbox_count() == 0 and harness.notifier.sent)
+
+    stored = harness.store.job(job.id)
+    assert stored.status == "new" and stored.error == "evaluation interrupted by a service restart"
+    record = json.loads(stored.variants_json)
+    # The earlier table is kept, but the state says this run failed: it is not the result.
+    assert (record["state"], record["error"], record["chosen"]) == (
+        "failed", "evaluation interrupted by a service restart", 1
+    )
+    status = mcp_server._job_evaluation(harness.store, stored)
+    assert status["state"] == "failed" and status["error"] == "evaluation interrupted by a service restart"
+    assert status["previous"]["chosen"] == 1 and len(status["previous"]["table"]) == 1
+    # The proposal is rendered from the job as it is now (its goal), not the old text.
+    message_id, text = harness.notifier.edits[0]
+    assert message_id == "m4" and text != "BEFORE"
+    assert text.startswith("🖨 lamp-arm, пластина 1:") and "цель: быстро (выбрал ты)" in text
+    assert texts(harness.notifier) == [INTERRUPTED_NOTICE]
+
+
+async def test_one_failed_recovery_does_not_leave_other_jobs_running(harness, monkeypatch):
+    harness.slicer, harness.waker = EvalSlicer(), FakeWaker()
+    harness.settings = job_settings(harness.settings.data_dir)
+    harness.service_kwargs = {"restore_wait_s": 0.1}
+    add_spool(harness.store)
+    broken = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
+    fine = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
+    for job in (broken, fine):
+        harness.store.update_job(job.id, status="slicing", variants_json=_running_marker(job.id, None))
+    original = Service._recover_evaluation
+
+    def recover(self, job):
+        if job.id == broken.id:
+            raise RuntimeError("store error")
+        return original(self, job)
+
+    monkeypatch.setattr(Service, "_recover_evaluation", recover)
+    await harness.start()
+    await until(lambda: harness.store.outbox_count() == 0 and len(harness.notifier.sent) == 2)
+
+    assert harness.store.job(fine.id).status == "new"
+    stuck = harness.store.job(broken.id)
+    # _fail_interrupted_jobs marks it, and drops the running marker: never "running" forever.
+    assert stuck.status == "slice_failed"
+    assert json.loads(stuck.variants_json)["state"] == "failed"
+    assert mcp_server._job_evaluation(harness.store, stuck)["state"] == "failed"
+    assert INTERRUPTED_NOTICE in texts(harness.notifier)
+
+
+async def test_a_failed_edit_after_the_run_is_not_reported_as_a_failure(harness):
+    gate = asyncio.Event()
+    service, job = await eval_harness(harness, EvalSlicer(gate=gate))
+    await harness.notifier.press_queue.put(Press(1, "m4", f"job:{job.id}:eval", T0))
+    await until(lambda: harness.notifier.edits and harness.slicer.requests)
+
+    async def broken_edit(message_id, text=None, buttons=None):
+        raise RuntimeError("telegram is down")
+
+    harness.notifier.edit = broken_edit
+    gate.set()
+    await until(lambda: harness.store.job(job.id).status == "new")
+    await until(lambda: harness.store.outbox_count() == 0 and len(harness.notifier.sent) >= 1)
+    sent = texts(harness.notifier)
+    assert not any("не удался" in t for t in sent)
+    assert "Варианты:" in sent[-1]
+    assert json.loads(harness.store.job(job.id).variants_json)["chosen"] == 6
+
+
+async def test_proposal_marks_minutes_from_an_older_slice(tmp_path):
+    service, store, _ = job_service(tmp_path, EvalSlicer())
+    add_spool(store)
+    job = add_job(store, service._settings)
+    await service.slice_job(job.id)
+    same = await service.propose(job.id)
+    assert "по прошлой нарезке" not in same
+    changed = await service.propose(job.id, goal="strength")
+    assert "⚡ свет " in changed and "время и свет по прошлой нарезке, настройки с тех пор изменились" in changed
+    store.close()
+
+
+async def test_finished_print_with_a_currency_refusal_says_so(harness):
+    harness.store.set_currency("EUR", "€")  # the tariff stays in UAH: the close refuses the cost
+    await harness.start()
+    await harness.feed("running_layer0", "running_layer2", "finish")
+    finished = next(t for t in texts(harness.notifier) if t.startswith("✅ Печать завершена"))
+    assert finished.split("\n")[-1] == "Стоимость не посчитана: тариф с 01.06.2024 в UAH, а печать в EUR"
+
+
+# -- resetting the owner's explicit settings ------------------------------------------
+
+
+def reset_ids(rows) -> list[tuple[str, str]]:
+    return [(b.id, b.text) for row in rows or [] for b in row if b.id.endswith(":reset")]
+
+
+async def test_proposal_names_the_explicit_settings_and_offers_a_reset(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    assert "твои настройки" not in await service.propose(job.id)
+    store.update_job(job.id, explicit_json=json.dumps({"wall_loops": 2, "sparse_infill_density": 25}))
+    text = await service.propose(job.id)
+    assert "твои настройки: 2 стенки, 25% заполнение" in text
+    await drain(service)
+    assert reset_ids(notifier.sent[0]["buttons"]) == []
+    assert reset_ids(notifier.sent[1]["buttons"]) == [(f"job:{job.id}:reset", "♻️ Сбросить мои настройки")]
+    store.close()
+
+
+async def test_reset_press_clears_the_layer_without_slicing(harness):
+    _service, job, _blue = await slot_harness(harness)
+    harness.store.update_job(job.id, explicit_json=json.dumps({"wall_loops": 2}))
+    await harness.notifier.press_queue.put(Press(1, "m4", f"job:{job.id}:reset", T0))
+    await until(lambda: harness.notifier.edits)
+    message_id, text = harness.notifier.edits[0]
+    assert message_id == "m4" and "твои настройки" not in text
+    assert "4 стенки, 25% gyroid" in text  # the hints again, not the owner's 2 walls
+    assert reset_ids(harness.notifier.edit_buttons[0]) == []
+    assert harness.store.job(job.id).explicit_json is None
+    assert harness.slicer.requests == [] and harness.waker.budgets == []
+    assert harness.store.outbox_count() == 0 and harness.store.job(job.id).status == "new"
+    # While the job is slicing the press changes nothing.
+    harness.store.update_job(job.id, explicit_json=json.dumps({"wall_loops": 2}), status="slicing")
+    await harness.notifier.press_queue.put(Press(2, "m4", f"job:{job.id}:reset", T0))
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert harness.notifier.edits[1] == ("m4", "Уже режу «lamp-arm»")
+    assert json.loads(harness.store.job(job.id).explicit_json) == {"wall_loops": 2}
+
+
+async def test_reset_settings_all_or_some_keys(tmp_path):
+    service, store, _ = job_service(tmp_path)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    store.update_job(job.id, explicit_json=json.dumps({"wall_loops": 2, "sparse_infill_density": 40}))
+    settings = await service.reset_settings(job.id, ["wall_loops"])
+    assert json.loads(store.job(job.id).explicit_json) == {"sparse_infill_density": 40}
+    assert (settings["wall_loops"], settings["sparse_infill_density"]) == (4, 40)
+    settings = await service.reset_settings(job.id)
+    assert store.job(job.id).explicit_json is None
+    assert (settings["wall_loops"], settings["sparse_infill_density"]) == (4, 25)
+    store.update_job(job.id, status="slicing")
+    with pytest.raises(JobBusy):
+        await service.reset_settings(job.id)
+    store.close()
+
+
+async def test_reset_button_takes_a_goal_place_with_16_slots(tmp_path):
+    service, store, notifier = job_service(tmp_path, EvalSlicer())
+    trays = []
+    for number in range(1, 17):
+        ams, slot = divmod(number - 1, 4)
+        trays.append(Tray(ams, slot, "PETG", "FFFFFFFF", None))
+        spool = store.add_spool("Elegoo", "PETG", f"цвет{number}", "#FFFFFF", PRESET, 550.0, 1000.0)
+        store.map_slot(ams, slot, spool)
+    service._state = replace(PrinterState.empty(), trays=tuple(trays))
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    store.update_job(job.id, explicit_json=json.dumps({"wall_loops": 4}))
+    await service.propose(job.id, slot=16)
+    await drain(service)
+    ids = notifier.button_ids(-1)
+    assert len(ids) == 24 and f"job:{job.id}:reset" in ids and f"job:{job.id}:slot:16" in ids
+    goals = [i for i in ids if ":goal:" in i]
+    assert len(goals) == 7 and f"job:{job.id}:goal:strength" in goals  # the current goal stays
+    # After an evaluation the variant row replaces the goal rows, the reset button stays.
+    await service.evaluate(job.id)
+    await drain(service)
+    ids = notifier.button_ids(-1)
+    assert len(ids) <= 24 and f"job:{job.id}:reset" in ids and not any(":goal:" in i for i in ids)
+    assert sum(":variant:" in i for i in ids) == 6
+    store.close()
 
 
 # -- phase 3: prepare, confirm and start a print -------------------------------------------
@@ -1901,6 +2749,20 @@ async def test_prepare_sends_confirmation_and_starts_nothing(harness):
     assert harness.waker.budgets == [120]
     assert link.full_reports == reports + 1  # the checks ran on a fresh report
     assert link.projects == [] and harness.uploader.calls == []
+
+
+async def test_print_confirmation_shows_breakdown(harness):
+    service, job, _printer = await print_harness(harness)
+    result = await service.prepare_print(job.id)
+    lines = result.text.split("\n")
+    start = lines.index("🧵 пластик 7.70 грн (14 г × 550 грн/кг)")
+    assert lines[start:start + 4] == [
+        "🧵 пластик 7.70 грн (14 г × 550 грн/кг)",
+        "⚡ свет 1.87 грн (0.43 кВт·ч × 4.32)",
+        "🛠 амортизация: не задана",
+        "💰 итого 9.57 грн",
+    ]
+    assert lines[-1].startswith("Проверь, что стол чистый")
 
 
 async def test_prepare_refused_lists_reasons_and_sends_nothing(harness):
@@ -2406,6 +3268,120 @@ async def test_start_and_stop_confirmations_do_not_cross(harness):
     assert harness.store.confirmation(start_cid).state == "pending"
     assert harness.store.confirmation(stop_cid).state == "pending"
     assert harness.events == []
+
+
+# -- Task X1: confirmation buttons expire in the add-in ---------------------------------------
+
+START_EXPIRED = "⌛ Подтверждение истекло, подготовь печать заново"
+STOP_EXPIRED = "⌛ Подтверждение истекло, остановка не отправлена. Запроси её заново, если нужно"
+
+
+async def _confirm(harness, service, job, printer, kind: str) -> str:
+    """Ask for a start or stop confirmation (a stop needs a running print), return its id."""
+    if kind == "start":
+        return (await service.prepare_print(job.id)).confirm_id
+    return (await service.request_stop()).confirm_id
+
+
+@pytest.mark.parametrize("kind", ["start", "stop"])
+async def test_confirmation_sent_with_expires_in(harness, kind):
+    service, job, printer = await print_harness(harness)
+    if kind == "stop":
+        await running(harness, printer)
+    sent = len(harness.notifier.sent)
+    attempts = harness.notifier.attempts
+    harness.notifier.fail = True  # the first attempt fails, the retry goes out 3 minutes later
+    cid = await _confirm(harness, service, job, printer, kind)
+    await until(lambda: harness.notifier.attempts > attempts)
+    assert harness.store.outbox_head().expires_at == harness.store.confirmation(cid).expires_at
+    harness.clock.advance(minutes=3)
+    harness.notifier.fail = False
+    await drain(service)
+    (message,) = harness.notifier.sent[sent:]
+    assert message["expires_in"] == 420
+    assert [b.id for row in message["buttons"] for b in row] == [f"{kind}:{cid}:go", f"{kind}:{cid}:cancel"]
+
+
+async def test_other_messages_have_no_expires_in(harness):
+    _service, _job, printer = await print_harness(harness)
+    await running(harness, printer)
+    assert harness.notifier.sent
+    assert all(m["expires_in"] is None for m in harness.notifier.sent)
+
+
+@pytest.mark.parametrize("kind", ["start", "stop"])
+async def test_late_outbox_send_drops_buttons_and_says_expired(harness, kind):
+    service, job, printer = await print_harness(harness)
+    if kind == "stop":
+        await running(harness, printer)
+    sent = len(harness.notifier.sent)
+    attempts = harness.notifier.attempts
+    harness.notifier.fail = True
+    cid = await _confirm(harness, service, job, printer, kind)
+    await until(lambda: harness.notifier.attempts > attempts)
+    text = harness.store.outbox_head().text
+    harness.clock.advance(seconds=596)  # 4 s left, under the 5 s minimum
+    harness.notifier.fail = False
+    await drain(service)
+    (message,) = harness.notifier.sent[sent:]
+    expired = START_EXPIRED if kind == "start" else STOP_EXPIRED
+    assert message["text"] == f"{text}\n\n{expired}"
+    assert message["buttons"] == [] and message["expires_in"] is None
+    assert harness.store.confirmation(cid).state == "pending"  # nothing else is marked
+    assert harness.store.outbox_count() == 0
+
+
+async def test_outbox_send_with_five_seconds_left_keeps_the_buttons(harness):
+    service, job, _printer = await print_harness(harness)
+    sent = len(harness.notifier.sent)
+    attempts = harness.notifier.attempts
+    harness.notifier.fail = True
+    await service.prepare_print(job.id)
+    await until(lambda: harness.notifier.attempts > attempts)
+    harness.clock.advance(seconds=595.5)  # 4.5 s left: ceil gives 5
+    harness.notifier.fail = False
+    await drain(service)
+    (message,) = harness.notifier.sent[sent:]
+    assert message["expires_in"] == 5 and message["buttons"]
+
+
+@pytest.mark.parametrize("kind", ["start", "stop"])
+async def test_expired_press_edit_failure_sends_new_message(harness, kind, caplog):
+    service, job, printer = await print_harness(harness)
+    if kind == "stop":
+        await running(harness, printer)
+    cid = await _confirm(harness, service, job, printer, kind)
+    await until(lambda: harness.store.outbox_count() == 0)
+    sent = len(harness.notifier.sent)
+    harness.clock.advance(minutes=10)
+    harness.notifier.edit_ok = False
+    with caplog.at_level(logging.INFO, logger="bambu_mcp"):
+        await press(harness, f"{kind}:{cid}:go", "m7")
+        await until(lambda: len(harness.notifier.sent) > sent)
+    expired = START_EXPIRED if kind == "start" else STOP_EXPIRED
+    assert harness.notifier.edits == [("m7", expired)]
+    (message,) = harness.notifier.sent[sent:]
+    assert message["text"] == expired and message["buttons"] == []
+    assert harness.store.confirmation(cid).state == "expired"
+    assert cid not in caplog.text and "m7" not in caplog.text
+    assert "spent" in caplog.text or "new message" in caplog.text
+    assert harness.uploader.calls == [] and "stop" not in harness.events
+
+
+async def test_spent_press_edit_that_raises_sends_new_message(harness):
+    service, job, _printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await until(lambda: harness.store.outbox_count() == 0)
+    sent = len(harness.notifier.sent)
+    harness.clock.advance(minutes=10)
+
+    async def broken(message_id, text=None, buttons=None):
+        raise RuntimeError("add-in client bug")
+
+    harness.notifier.edit = broken
+    await press(harness, f"start:{cid}:go", "m7")
+    await until(lambda: len(harness.notifier.sent) > sent)
+    assert harness.notifier.sent[-1]["text"] == START_EXPIRED
 
 
 # -- Task 5 review fixes -------------------------------------------------------------------

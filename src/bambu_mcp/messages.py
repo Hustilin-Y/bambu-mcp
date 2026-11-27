@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
-from datetime import tzinfo
+from datetime import date, tzinfo
 from zoneinfo import ZoneInfo
 
-from bambu_mcp.cost import CostLine
+from bambu_mcp.cost import CostBreakdown, CurrencyMismatch, sum_costs
+from bambu_mcp.evaluation import GOALS, broken_rules
 from bambu_mcp.events import Event, EventKind
 from bambu_mcp.manifest import Manifest, PlateInfo, parse_manifest
 from bambu_mcp.notify import Button
@@ -21,16 +22,70 @@ from bambu_mcp.proposal import (
     job_material,
     slot_number,
 )
-from bambu_mcp.store.models import Job, Spool
+from bambu_mcp.store.db import DEFAULT_CURRENCY
+from bambu_mcp.store.models import Job, Spool, Tariff
 
 DEFAULT_TZ = ZoneInfo("Europe/Kyiv")  # the service passes settings.timezone
+DEFAULT_SYMBOL = DEFAULT_CURRENCY[1]  # the service passes the store's currency symbol
 NO_NAME = "без названия"
 END_UNKNOWN_TEXT = "Точное время окончания неизвестно: сервис не видел конец печати"
 LOST_TITLE = "❌ Печать прервана, пока сервис не видел"
 _BUTTON_TEXT_MAX = 64
 _SPOOLS_PER_ROW = 2
 _SLOTS_PER_ROW = 4
-CHOSEN_MARK = "✓ "
+_GOALS_PER_ROW = 4
+MAX_BUTTONS = 24  # per Telegram message (global constraints)
+# The owner's emoji markup, one table: marks, line prefixes, goal buttons and the keycap
+# digits that number the variants and the AMS slots (above 10: plain digits).
+EMOJI: dict[str, str] = {
+    "chosen": "✅",
+    "failed": "❌",
+    "printer": "🖨",
+    "goal": "🎯",
+    "explicit": "✍️",
+    "variants": "📊",
+    "time": "⏱",
+    "weight": "⚖️",
+    "money": "💰",
+    "strength": "💪",
+    "plastic": "🧵",
+    "power": "⚡",
+    "amort": "🛠",
+    "evaluate": "🔍",
+    "reset": "♻️",
+    # goal buttons
+    "balanced": "⚖️",
+    "speed": "⚡",
+    "quality": "✨",
+    "cheap": "💸",
+    "light": "🪶",
+    "fit": "🎯",
+    "watertight": "💧",
+    # keycap digits
+    "1": "1️⃣",
+    "2": "2️⃣",
+    "3": "3️⃣",
+    "4": "4️⃣",
+    "5": "5️⃣",
+    "6": "6️⃣",
+    "7": "7️⃣",
+    "8": "8️⃣",
+    "9": "9️⃣",
+    "10": "🔟",
+}
+_GOAL_EMOJI = {"strength": EMOJI["strength"]}  # "strength" is also the table's strength mark
+EVAL_BUTTON_TEXT = f"{EMOJI['evaluate']} Подобрать"
+RESET_BUTTON_TEXT = f"{EMOJI['reset']} Сбросить мои настройки"
+CHOSEN_MARK = f"{EMOJI['chosen']} "
+
+
+def keycap(n: int) -> str:
+    """1️⃣ .. 🔟 for 1..10, the plain number above."""
+    return EMOJI.get(str(n), str(n)) if 1 <= n <= 10 else str(n)
+
+
+def goal_emoji(key: str) -> str:
+    return _GOAL_EMOJI.get(key) or EMOJI[key]
 # Characters the add-in's rich Markdown reads as formatting (multiclaude telegram.markdown_literal).
 _MARKDOWN_SPECIAL = re.compile(r"([\\`*_~=|\[\]$])")
 
@@ -66,24 +121,109 @@ def spool_question(name: str | None) -> str:
     )
 
 
-def _money(value: float) -> str:
-    return f"{value:.2f} грн"
+# -- money: the one cost formatter ------------------------------------------------
+
+_MISMATCH_WORDS = {"spool": "катушка", "tariff": "тариф", "amortization": "амортизация"}
 
 
-def _cost_lines(cost: CostLine) -> list[str]:
-    if cost.filament_uah is None:
-        costs = f"Электричество {_money(cost.power_uah)}"
-    else:
-        costs = (
-            f"Пластик {_money(cost.filament_uah)}, электричество {_money(cost.power_uah)}, "
-            f"всего {_money(cost.total_uah)}"
+def money_text(amount: float, symbol: str) -> str:
+    """``amount`` with two decimals and the escaped currency symbol: '14.45 €'."""
+    return f"{amount:.2f} {md_literal(symbol)}"
+
+
+def _number(value: float) -> str:
+    """At most two decimals, no trailing zeros: 700, 733.33."""
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _mismatch_input(m: CurrencyMismatch) -> str:
+    word = _MISMATCH_WORDS.get(m.kind)
+    if word is None:
+        return md_literal(m.input_name)
+    if m.kind == "spool":
+        return f"{word} {md_literal(m.ref)}"
+    try:
+        when = date.fromisoformat(m.ref).strftime("%d.%m.%Y")
+    except ValueError:
+        when = md_literal(m.ref)
+    return f"{word} с {when}"
+
+
+def render_cost_refused(m: CurrencyMismatch) -> str:
+    return (
+        f"Стоимость не посчитана: {_mismatch_input(m)} в {md_literal(m.currency)}, "
+        f"а валюта сейчас {md_literal(m.expected)}. Пересчёта нет, задай это заново в {md_literal(m.expected)}"
+    )
+
+
+def render_cost_refused_short(m: CurrencyMismatch) -> str:
+    """A refusal at a print's close: 'Стоимость не посчитана: тариф с 01.06.2024 в UAH, а печать в EUR'."""
+    return (
+        f"Стоимость не посчитана: {_mismatch_input(m)} в {md_literal(m.currency)}, "
+        f"а печать в {md_literal(m.expected)}"
+    )
+
+
+def currency_label(currency: str | None, symbol: str, code: str | None) -> str:
+    """The symbol to show for an amount in ``currency``: the current ``symbol``, or the amount's
+    own ISO code when it is not the current currency ``code`` (nothing is converted)."""
+    if code is not None and currency and currency != code:
+        return currency
+    return symbol
+
+
+def render_cost(
+    cost: CostBreakdown | CurrencyMismatch, symbol: str, *, start_now: bool = False, code: str | None = None
+) -> list[str]:
+    """The Russian cost lines: plastic, electricity, amortization, total. Markdown-escaped.
+
+    ``start_now``: a predicted cost priced as if the print started now, which the
+    electricity line says under a two-zone tariff. ``code``: the current currency. A cost
+    recorded in another one shows its own ISO code, never the current ``symbol``.
+    """
+    if isinstance(cost, CurrencyMismatch):
+        return [render_cost_refused(cost)]
+    symbol = currency_label(cost.currency, symbol, code)
+    sym = md_literal(symbol)
+    lines = []
+    if cost.plastic is None:
+        lines.append(f"{EMOJI['plastic']} пластик: цена неизвестна")
+    elif cost.grams is not None and cost.price_per_kg is not None:
+        lines.append(
+            f"{EMOJI['plastic']} пластик {money_text(cost.plastic.amount, symbol)} "
+            f"({_grams(cost.grams)} × {_number(cost.price_per_kg)} {sym}/кг)"
         )
-    t = cost.tariff
-    if t.night_uah is None:
-        rate = f"{t.day_uah:.2f} грн/кВт·ч"
     else:
-        rate = f"день {t.day_uah:.2f} / ночь {t.night_uah:.2f} грн/кВт·ч"
-    return [costs, f"({cost.kwh:.2f} кВт·ч, тариф {rate} с {t.valid_from:%d.%m.%Y})"]
+        lines.append(f"{EMOJI['plastic']} пластик {money_text(cost.plastic.amount, symbol)}")
+    if cost.power is None:
+        lines.append(f"{EMOJI['time']} время неизвестно до нарезки")
+    else:
+        power = f"{EMOJI['power']} свет {money_text(cost.power.amount, symbol)}"
+        if cost.kwh is not None and cost.power_rate is not None:
+            rate = f"{cost.power_rate:.2f}" + (" в среднем" if cost.two_zone else "")
+            when = ", если начать сейчас" if cost.two_zone and start_now else ""
+            power += f" ({cost.kwh:.2f} кВт·ч × {rate}{when})"
+        lines.append(power)
+        if cost.amort is None:
+            lines.append(f"{EMOJI['amort']} амортизация: не задана")
+        elif cost.minutes is not None and cost.amort_rate is not None:
+            lines.append(
+                f"{EMOJI['amort']} амортизация {money_text(cost.amort.amount, symbol)} "
+                f"({round(cost.minutes)} мин × {cost.amort_rate:.2f} {sym}/ч)"
+            )
+        else:
+            lines.append(f"{EMOJI['amort']} амортизация {money_text(cost.amort.amount, symbol)}")
+    lines.append(f"{EMOJI['money']} итого {money_text(cost.total.amount, symbol)}")
+    return lines
+
+
+def tariff_reminder(tariff: Tariff, symbol: str) -> str:
+    sym = md_literal(symbol)
+    if tariff.night_uah is None:
+        rate = f"{tariff.day_uah:.2f} {sym}/кВт·ч"
+    else:
+        rate = f"день {tariff.day_uah:.2f} / ночь {tariff.night_uah:.2f} {sym}/кВт·ч"
+    return f"Проверь тариф на электроэнергию: сейчас {rate} с {tariff.valid_from:%d.%m.%Y}"
 
 
 def _duration(minutes: int) -> str:
@@ -94,11 +234,15 @@ def _duration(minutes: int) -> str:
 def render_event(
     event: Event,
     texts: HmsTexts,
-    cost: CostLine | None,
+    cost: CostBreakdown | CurrencyMismatch | None,
     duration_min: int | None = None,
     *,
     tz: tzinfo = DEFAULT_TZ,
+    symbol: str = DEFAULT_SYMBOL,
+    code: str | None = None,
 ) -> str:
+    """``cost``: the closed print's, a ``CurrencyMismatch`` when it was refused at the close.
+    ``code``: the current currency (a cost recorded in another shows its ISO code)."""
     state = event.state
     name = job_name(state.subtask_name)
     when = event.at.astimezone(tz).strftime("%H:%M")
@@ -127,8 +271,10 @@ def render_event(
         EventKind.CANCELLED,
     ):
         lines.append(f"Длительность: {_duration(duration_min)}")
-    if event.kind is EventKind.FINISHED and cost is not None:
-        lines.extend(_cost_lines(cost))
+    if event.kind is EventKind.FINISHED and isinstance(cost, CurrencyMismatch):
+        lines.append(render_cost_refused_short(cost))
+    elif event.kind is EventKind.FINISHED and cost is not None:
+        lines.extend(render_cost(cost, symbol, code=code))
     return "\n".join(lines)
 
 
@@ -156,16 +302,176 @@ def spool_buttons(print_id: int, spools: Sequence[Spool]) -> list[list[Button]]:
     return rows
 
 
-def slot_buttons(job_id: int, usable: Sequence[UsableSlot], chosen: int | None) -> list[list[Button]]:
-    """The proposal's slot rows: ``job:<id>:slot:<n>``, the ``chosen`` number marked."""
+def slot_buttons(
+    job_id: int, usable: Sequence[UsableSlot], chosen: int | None, limit: int = MAX_SLOT_NUMBER
+) -> list[list[Button]]:
+    """The proposal's slot rows: ``job:<id>:slot:<n>``, the ``chosen`` number marked.
+
+    At most ``limit`` slots, in slot order. The chosen one is always among them.
+    """
+    shown = list(usable[: max(limit, 0)])
+    if limit > 0 and chosen is not None and all(u.number != chosen for u in shown):
+        extra = [u for u in usable if u.number == chosen]
+        if extra:
+            shown = sorted([*shown[:-1], extra[0]], key=lambda u: u.number)
     buttons = [
         Button(
             f"job:{job_id}:slot:{u.number}",
-            f"{CHOSEN_MARK if u.number == chosen else ''}{u.label}"[:_BUTTON_TEXT_MAX],
+            f"{CHOSEN_MARK if u.number == chosen else ''}{keycap(u.number)} "
+            f"{u.spool.material} {u.spool.color_name}"[:_BUTTON_TEXT_MAX],
         )
-        for u in usable[:MAX_SLOT_NUMBER]
+        for u in shown
     ]
     return [buttons[i : i + _SLOTS_PER_ROW] for i in range(0, len(buttons), _SLOTS_PER_ROW)]
+
+
+def goal_buttons(job_id: int, current: str) -> list[list[Button]]:
+    """The proposal's goal rows: ``job:<id>:goal:<key>``, two rows of 4, the ``current`` one marked."""
+    buttons = [
+        Button(
+            f"job:{job_id}:goal:{g.key}",
+            f"{CHOSEN_MARK if g.key == current else ''}{goal_emoji(g.key)} {g.label}",
+        )
+        for g in GOALS.values()
+    ]
+    return [buttons[i : i + _GOALS_PER_ROW] for i in range(0, len(buttons), _GOALS_PER_ROW)]
+
+
+def reset_buttons(job_id: int) -> list[list[Button]]:
+    """«♻️ Сбросить мои настройки» (``job:<id>:reset``): clears the owner's explicit settings."""
+    return [[Button(f"job:{job_id}:reset", RESET_BUTTON_TEXT)]]
+
+
+def explicit_line(explicit: Mapping) -> str | None:
+    """'твои настройки: 4 стенки, 25% gyroid': what «Сбросить мои настройки» clears. None: none."""
+    if not explicit:
+        return None
+    parts = _setting_parts(explicit)
+    covered = {
+        "wall_loops", "sparse_infill_density", "sparse_infill_pattern", "enable_support", "brim_type",
+        "layer_height", "wall_generator", "top_shell_layers", "bottom_shell_layers", "outer_wall_speed",
+        "seam_position", "ironing_type",
+    }
+    if "enable_support" in explicit and explicit.get("enable_support"):
+        covered.add("support_type")
+    parts += [md_literal(f"{k} {v}") for k, v in explicit.items() if k not in covered]
+    return f"{EMOJI['explicit']} твои настройки: {', '.join(parts)}"
+
+
+def eval_buttons(job_id: int) -> list[list[Button]]:
+    """«🔍 Подобрать»: a part's evaluation run (``job:<id>:eval``). A kit has none."""
+    return [[Button(f"job:{job_id}:eval", EVAL_BUTTON_TEXT)]]
+
+
+_VARIANTS_PER_ROW = 3
+EVALUATING_TEXT = "🔍 Подбираю варианты…"
+VARIANTS_TITLE = f"{EMOJI['variants']} Варианты:"
+# Settings a table line names only when they differ from the run's baseline.
+_SHORT_EXTRA_KEYS = (
+    "layer_height", "wall_generator", "top_shell_layers", "bottom_shell_layers", "outer_wall_speed",
+    "seam_position", "ironing_type",
+)
+
+
+def variant_buttons(job_id: int, variants: Sequence[Mapping], chosen: int | None) -> list[list[Button]]:
+    """«1️⃣», «✅ 2️⃣», … for each variant that sliced (``job:<id>:variant:<n>``), the chosen one marked."""
+    buttons = [
+        Button(f"job:{job_id}:variant:{v['n']}", f"{CHOSEN_MARK if v['n'] == chosen else ''}{keycap(v['n'])}")
+        for v in variants
+        if v.get("status") == "ok"
+    ]
+    return [buttons[i : i + _VARIANTS_PER_ROW] for i in range(0, len(buttons), _VARIANTS_PER_ROW)]
+
+
+def _short_settings(settings: Mapping, baseline: Mapping) -> str:
+    """'3 стенки 25% gyroid, верх/низ 7/5': walls and infill, then the settings this variant
+    changes against the baseline."""
+    core = ["wall_loops", "sparse_infill_density", "sparse_infill_pattern"]
+    extra = [k for k in _SHORT_EXTRA_KEYS if settings.get(k) != baseline.get(k) and k in settings]
+    if "top_shell_layers" in extra or "bottom_shell_layers" in extra:
+        extra += [k for k in ("top_shell_layers", "bottom_shell_layers") if k in settings and k not in extra]
+    head = " ".join(_setting_parts({k: settings[k] for k in core if k in settings}))
+    tail = _setting_parts({k: settings[k] for k in extra if k in settings})
+    return ", ".join([head, *tail]) if head else ", ".join(tail)
+
+
+ONLY_BASELINE_TEXT = "Нарезался только базовый вариант, остальные не нарезались"
+STRENGTH_UNKNOWN_TEXT = "Прочность неизвестна: агент на ПК её не измерил, выбран базовый вариант цели"
+
+
+def render_variants(
+    variants: Sequence[Mapping],
+    chosen: int | None,
+    symbol: str,
+    *,
+    code: str | None = None,
+    strength_unknown: bool = False,
+) -> list[str]:
+    """The evaluation table, at most 6 lines after its title:
+    '2️⃣ ✅ 3 стенки 25% gyroid, верх/низ 7/5 · ⏱ 49 мин · ⚖️ 8 г · 💰 12.80 <symbol> · 💪 1.2×'.
+
+    Strength is against the first (the balanced baseline). A variant priced in another
+    currency than ``code`` (the current one) shows its ISO code. Then a sentence when only
+    the baseline sliced, and one when ``strength_unknown`` kept the goal's base point.
+    """
+    if not variants:
+        return []
+    baseline = variants[0].get("settings") or {}
+    lines = [VARIANTS_TITLE]
+    for v in variants[:6]:
+        n, short = v["n"], _short_settings(v.get("settings") or {}, baseline)
+        if v.get("status") != "ok":
+            lines.append(f"{keycap(n)} {EMOJI['failed']} {short} · не нарезан")
+            continue
+        mark = CHOSEN_MARK if n == chosen else ""
+        cost = v.get("cost")
+        label = currency_label(v.get("currency") if isinstance(v.get("currency"), str) else None, symbol, code)
+        money = money_text(cost, label) if isinstance(cost, int | float) else f"? {md_literal(label)}"
+        ratio = v.get("strength_ratio")
+        strength = f"{ratio:.1f}×" if isinstance(ratio, int | float) else "?"
+        lines.append(
+            f"{keycap(n)} {mark}{short} · {EMOJI['time']} {round(v['minutes'])} мин · "
+            f"{EMOJI['weight']} {v['grams']:.0f} г · {EMOJI['money']} {money} · {EMOJI['strength']} {strength}"
+        )
+    shown = variants[:6]
+    if len(shown) > 1 and shown[0].get("status") == "ok" and all(v.get("status") != "ok" for v in shown[1:]):
+        lines.append(ONLY_BASELINE_TEXT)
+    if strength_unknown:
+        lines.append(STRENGTH_UNKNOWN_TEXT)
+    return lines
+
+
+_GOAL_SOURCES = {"owner": "выбрал ты", "fallback": "по умолчанию"}
+
+
+def goal_warning(primary: str, settings: Mapping) -> str | None:
+    """A line when ``settings`` (an explicit setting wins over the base point) break the
+    goal's rules: '⚠️ Цель «Точно» требует: стенок не меньше 3, ...'. None when they hold."""
+    goal = GOALS[primary]
+    lim = goal.limits
+    words = {
+        "wall_loops": f"стенок не меньше {lim.min_walls}",
+        "wall_generator": f"генератор стенок {lim.wall_generator}",
+        "outer_wall_speed": f"внешняя стенка не быстрее {lim.max_outer_wall_speed or 0:g} мм/с",
+        "top_shell_layers": f"верх не меньше {lim.min_top_bottom} слоёв",
+        "bottom_shell_layers": f"низ не меньше {lim.min_top_bottom} слоёв",
+    }
+    broken = broken_rules(goal, settings)
+    if not broken:
+        return None
+    return f"⚠️ Цель «{goal.label}» требует: {', '.join(words[k] for k in broken)}"
+
+
+def goal_line(primary: str, secondary: str | None, source: str, reason: str | None) -> str:
+    """'цель: прочно, затем красиво (от ассистента: <reason>)'."""
+    words = GOALS[primary].label.lower()
+    if secondary is not None:
+        words += f", затем {GOALS[secondary].label.lower()}"
+    if source == "assistant":
+        why = f"от ассистента: {md_literal(reason)}" if reason else "от ассистента"
+    else:
+        why = _GOAL_SOURCES[source]
+    return f"{EMOJI['goal']} цель: {words} ({why})"
 
 
 # -- job proposal and slice summary ------------------------------------------------
@@ -178,8 +484,12 @@ _HINT_WORDS = {
     "brim": "кайма",
     "material": "материал",
     "material_reason": "причина материала",
+    "goal": "цель",
+    "goal_reason": "причина цели",
 }
 _BRIM_WORDS = {"no_brim": "без каймы", "auto_brim": "кайма авто", "outer_only": "кайма снаружи"}
+_SEAM_WORDS = {"back": "шов сзади", "aligned": "шов по линии", "nearest": "шов ближайший", "random": "шов случайный"}
+_IRONING_WORDS = {"no ironing": "без разглаживания", "top": "разглаживание", "topmost": "разглаживание верха"}
 _PLATE_SUFFIX = " Plate"
 
 
@@ -229,7 +539,29 @@ def _setting_parts(settings: Mapping) -> list[str]:
         parts.append(f"слой {settings['layer_height']} мм")
     if "wall_generator" in settings:
         parts.append(f"стенки {md_literal(str(settings['wall_generator']))}")
+    parts += _shell_parts(settings)
+    if "outer_wall_speed" in settings:
+        speed = settings["outer_wall_speed"]
+        shown = f"{speed:g}" if isinstance(speed, int | float) else md_literal(str(speed))
+        parts.append(f"внешняя стенка {shown} мм/с")
+    if "seam_position" in settings:
+        seam = str(settings["seam_position"])
+        parts.append(_SEAM_WORDS.get(seam, f"шов {md_literal(seam)}"))
+    if "ironing_type" in settings:
+        ironing = str(settings["ironing_type"])
+        parts.append(_IRONING_WORDS.get(ironing, f"разглаживание {md_literal(ironing)}"))
     return parts
+
+
+def _shell_parts(settings: Mapping) -> list[str]:
+    top, bottom = settings.get("top_shell_layers"), settings.get("bottom_shell_layers")
+    if top is not None and bottom is not None:
+        return [f"верх/низ {md_literal(str(top))}/{md_literal(str(bottom))}"]
+    for word, value in (("верх", top), ("низ", bottom)):
+        if value is not None:
+            n = int(value)
+            return [f"{word} {n} {_plural(n, 'слой', 'слоя', 'слоёв')}"]
+    return []
 
 
 def _slot_text(choice: SlotChoice) -> str:
@@ -253,7 +585,7 @@ def _job_head(manifest: Manifest, settings: Mapping, choice: SlotChoice, plate_t
         where = f"{n} {_plural(n, 'пластина', 'пластины', 'пластин')}"
     else:
         where = f"пластина {manifest.plates[0].index}"
-    return f"{job_name(manifest.name)}, {where}: {body}."
+    return f"{EMOJI['printer']} {job_name(manifest.name)}, {where}: {body}."
 
 
 def _support_words(settings: Mapping) -> str:
@@ -336,10 +668,21 @@ def render_proposal(
     slot_choice: SlotChoice,
     plate_type: str,
     estimate: Mapping[int, float] | None,
+    cost: CostBreakdown | CurrencyMismatch | None = None,
+    *,
+    symbol: str = DEFAULT_SYMBOL,
+    goal: tuple[str, str | None, str, str | None] | None = None,
+    stale_minutes: bool = False,
+    explicit: Mapping | None = None,
 ) -> str:
     """What the service is about to slice. ``estimate``: grams per plate index (None: the manifest's).
 
     Plain text, no buttons. ``plate_type`` is the bed when ``settings`` has no ``curr_bed_type``.
+    ``cost``: the predicted cost of the whole job (its lines follow the grams), priced as
+    if the print started now. ``stale_minutes``: its time comes from a slice made with other
+    settings, which a line says. ``goal``: (primary, secondary, source, reason) from
+    ``evaluation.job_goal``, its line follows the cost. ``explicit``: the owner's stored
+    settings, named on their own line after the goal.
     """
     manifest = _job_manifest(job)
     grams = dict(estimate) if estimate is not None else {p.index: p.estimate_g for p in manifest.plates}
@@ -348,6 +691,15 @@ def render_proposal(
         lines = [head, *(f"Пластина {i}: {_about(_grams(g))}" for i, g in sorted(grams.items()))]
     else:
         lines = [f"{head} {_about(_grams(sum(grams.values())))}"]
+    if cost is not None:
+        lines += render_cost(cost, symbol, start_now=True)
+        if stale_minutes:
+            lines.append(STALE_MINUTES_TEXT)
+    if goal is not None:
+        lines.append(goal_line(*goal))
+    owner_line = explicit_line(explicit or {})
+    if owner_line:
+        lines.append(owner_line)
     material, reason = job_material(manifest)
     if reason:
         lines.append(f"Почему {md_literal(material)}: {md_literal(reason)}")
@@ -358,51 +710,50 @@ def render_proposal(
     return "\n".join(lines)
 
 
-def _result_text(minutes: float, grams: float, cost: CostLine) -> str:
-    money = _about(_money(cost.total_uah))
-    if cost.filament_uah is None:
-        money += " без пластика"
-    return f"{_about(_duration(round(minutes)))}, {_grams(grams)}, {money}"
+STALE_MINUTES_TEXT = "время и свет по прошлой нарезке, настройки с тех пор изменились"
+
+
+def _result_text(minutes: float, grams: float) -> str:
+    return f"{_about(_duration(round(minutes)))}, {_grams(grams)}"
 
 
 def render_sliced(
     job: Job,
     plate_results: Sequence[Mapping],
-    cost_lines: Sequence[CostLine],
+    costs: Sequence[CostBreakdown | CurrencyMismatch],
     *,
     settings: Mapping,
     slot_choice: SlotChoice,
     plate_type: str,
+    symbol: str = DEFAULT_SYMBOL,
 ) -> str:
     """The slice summary, plain text.
 
     ``plate_results`` are the slice-agent's plates (``{"index", "minutes", "grams":
-    {filament: g}}``), ``cost_lines`` one per plate in the same order. The slot's
-    warning (a material mismatch) ends the text, as in the proposal: a job sliced
-    without a proposal shows it only here.
+    {filament: g}}``), ``costs`` one per plate in the same order, priced as if the print
+    started now. A kit lists each plate with its total, then the cost lines of the sum.
+    The slot's warning (a material mismatch) ends the text, as in the proposal: a job
+    sliced without a proposal shows it only here.
     """
-    if not plate_results or len(plate_results) != len(cost_lines):
-        raise ValueError("render_sliced needs one cost line per plate result")
+    if not plate_results or len(plate_results) != len(costs):
+        raise ValueError("render_sliced needs one cost per plate result")
     manifest = _job_manifest(job)
     head = _job_head(manifest, settings, slot_choice, plate_type)
     rows = [
         (int(p["index"]), float(p["minutes"]), sum(float(g) for g in p["grams"].values()), c)
-        for p, c in zip(plate_results, cost_lines, strict=True)
+        for p, c in zip(plate_results, costs, strict=True)
     ]
     warning = [slot_choice.warning] if slot_choice.warning else []
     if manifest.kind != "kit":
         _index, minutes, grams, cost = rows[0]
-        return "\n".join([f"{head} {_result_text(minutes, grams, cost)}", *warning])
-    costs = [c for *_, c in rows]
-    known = all(c.filament_uah is not None for c in costs)
-    total = CostLine(
-        filament_uah=sum(c.filament_uah or 0.0 for c in costs) if known else None,
-        power_uah=sum(c.power_uah for c in costs),
-        kwh=sum(c.kwh for c in costs),
-        tariff=costs[0].tariff,
-    )
-    lines = [head, *(f"Пластина {i}: {_result_text(m, g, c)}" for i, m, g, c in rows)]
-    lines.append(f"Всего: {_result_text(sum(r[1] for r in rows), sum(r[2] for r in rows), total)}")
+        cost_lines = render_cost(cost, symbol, start_now=True)
+        return "\n".join([f"{head} {_result_text(minutes, grams)}", *cost_lines, *warning])
+    lines = [head]
+    for i, m, g, c in rows:
+        money = f", {_about(money_text(c.total.amount, symbol))}" if isinstance(c, CostBreakdown) else ""
+        lines.append(f"Пластина {i}: {_result_text(m, g)}{money}")
+    lines.append(f"Всего: {_result_text(sum(r[1] for r in rows), sum(r[2] for r in rows))}")
+    lines += render_cost(sum_costs(costs), symbol, start_now=True)
     return "\n".join([*lines, *warning])
 
 
@@ -462,12 +813,18 @@ def render_start_confirmation(
     grams: float,
     plate_type: str,
     warnings: Sequence[str],
+    cost: CostBreakdown | CurrencyMismatch | None = None,
+    symbol: str = DEFAULT_SYMBOL,
 ) -> str:
-    """The question the start button answers. ``plate`` None for a part (always plate 1)."""
+    """The question the start button answers. ``plate`` None for a part (always plate 1).
+
+    ``cost``: the plate's predicted cost, priced as if the print started now.
+    """
     where = f", пластина {plate}" if plate is not None else ""
     lines = [
         f"🖨 Печатать «{job_name(name)}»{where}?",
         f"{_slot_text(slot_choice)}, {_about(_duration(round(minutes)))}, {_grams(grams)}",
+        *(render_cost(cost, symbol, start_now=True) if cost is not None else ()),
         f"На столе должна лежать {md_literal(plate_type)}",
         *(f"⚠️ {w}" for w in warnings),
         "Проверь, что стол чистый и пустой. Кнопка действует 10 минут.",

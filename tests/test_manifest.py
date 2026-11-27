@@ -175,3 +175,18 @@ def test_bad_hint_conflicts_rejected(tmp_path, conflicts):
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ManifestError, match="hint_conflicts"):
         load_manifest(path)
+
+
+def test_manifest_accepts_goal_hints_and_rejects_unknown_goal(tmp_path):
+    from bambu_mcp.manifest import parse_manifest
+
+    for goal in ("strength", ["fit", "quality"], ["watertight"]):
+        hints = {"goal": goal, "goal_reason": "несущий кронштейн"}
+        assert parse_manifest(_part(hints=hints)).hints == hints
+    assert parse_manifest(_part(hints={"goal_reason": "x" * 200})).hints["goal_reason"] == "x" * 200
+    for bad in ("ultra", ["fit", "ultra"], ["fit", "fit"], ["fit", "quality", "speed"], [], 3, None):
+        with pytest.raises(ManifestError, match="hint 'goal' must be"):
+            parse_manifest(_part(hints={"goal": bad}))
+    for bad in ("x" * 201, 5):
+        with pytest.raises(ManifestError, match="hint 'goal_reason' must be"):
+            parse_manifest(_part(hints={"goal_reason": bad}))

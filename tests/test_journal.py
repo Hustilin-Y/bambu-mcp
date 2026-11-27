@@ -459,3 +459,73 @@ def test_end_unknown_closes_without_duration_or_cost(store):
     row = store.print_by_id(print_id)
     assert row.outcome == "finished" and row.ended_at is not None
     assert row.actual_min is None and row.kwh is None and row.cost_power_uah is None
+
+
+# -- full cost: amortization and currency (evaluation Task 2) -------------------
+
+
+def test_journal_row_stores_amort_and_currency(store):
+    # 22:30 UTC is 00:30 in Kyiv the next day: the local date picks the entries.
+    start = datetime(2026, 11, 22, 22, 30, tzinfo=UTC)
+    store.add_amortization(datetime(2026, 11, 23).date(), 30000.0, 5000.0, 2.0)  # 8.00 an hour
+    journal = Journal(store, Settings())
+    print_id = journal.on_event(ev(EventKind.STARTED, start))
+    journal.on_event(ev(EventKind.FINISHED, start + timedelta(hours=1)))
+
+    row = store.print_by_id(print_id)
+    assert row.currency == "UAH"
+    assert row.kwh == pytest.approx(0.25)  # 60 min at 200 W + 0.05 heat-up
+    assert row.cost_power_uah == pytest.approx(0.25 * 4.32)
+    assert row.cost_amort == pytest.approx(8.0)  # the actual minutes
+    cost = journal.cost_line(row)
+    assert cost.amort.amount == pytest.approx(8.0) and cost.amort_rate == pytest.approx(8.0)
+    assert cost.minutes == pytest.approx(60) and cost.power_rate == pytest.approx(4.32)
+    assert cost.total.amount == pytest.approx(0.25 * 4.32 + 8.0)
+
+
+def test_journal_amortization_before_its_date_is_not_applied(store):
+    start = datetime(2026, 11, 22, 21, 30, tzinfo=UTC)  # 23:30 Kyiv, still the 22nd
+    store.add_amortization(datetime(2026, 11, 23).date(), 30000.0, 5000.0, 2.0)
+    journal = Journal(store, Settings())
+    print_id = journal.on_event(ev(EventKind.STARTED, start))
+    journal.on_event(ev(EventKind.FINISHED, start + timedelta(hours=1)))
+    row = store.print_by_id(print_id)
+    assert row.cost_amort is None and row.cost_power_uah is not None
+    assert journal.cost_line(row).amort is None
+
+
+def test_journal_row_in_another_currency(store):
+    store.set_currency("EUR", "€")
+    store.add_tariff(datetime(2026, 1, 1).date(), 0.25, None)
+    store.add_amortization(datetime(2026, 1, 1).date(), 600.0, 3000.0, 0.0)
+    spool = store.add_spool("A", "PLA", "White", "#FFFFFF", None, 25.0, 1000.0)
+    store.map_slot(0, 1, spool)
+    journal = Journal(store, Settings())
+    print_id = journal.on_event(ev(EventKind.STARTED, T0))
+    rebook_grams(store, print_id, None, 20.0)
+    journal.on_event(ev(EventKind.FINISHED, T0 + timedelta(hours=1)), slot=(0, 1))
+    row = store.print_by_id(print_id)
+    assert row.currency == "EUR"
+    assert row.cost_power_uah == pytest.approx(0.25 * 0.25)
+    assert row.cost_amort == pytest.approx(0.2)
+    assert row.cost_filament_uah == pytest.approx(0.5)
+
+
+def test_journal_refuses_a_cost_in_mixed_currencies(store, caplog):
+    store.set_currency("EUR", "€")  # the tariff and the spool stay in UAH
+    spool = store.add_spool("A", "PLA", "White", "#FFFFFF", None, 600.0, 1000.0)
+    store._conn().execute("UPDATE spools SET currency = 'UAH' WHERE id = ?", (spool,))
+    store.map_slot(0, 1, spool)
+    journal = Journal(store, Settings())
+    print_id = journal.on_event(ev(EventKind.STARTED, T0))
+    rebook_grams(store, print_id, None, 20.0)
+    with caplog.at_level(logging.WARNING):
+        journal.on_event(ev(EventKind.FINISHED, T0 + timedelta(hours=1)), slot=(0, 1))
+    row = store.print_by_id(print_id)
+    assert row.currency == "EUR"
+    assert row.kwh == pytest.approx(0.25)  # the energy is still recorded
+    assert row.cost_power_uah is None and row.cost_amort is None and row.cost_filament_uah is None
+    assert row.deducted_g == pytest.approx(20.0)  # the grams are deducted all the same
+    assert "tariff from 2024-06-01 is in UAH" in caplog.text
+    refused = journal.cost_line(row)  # the finished message says why there is no cost
+    assert (refused.kind, refused.currency, refused.expected) == ("tariff", "UAH", "EUR")

@@ -165,3 +165,18 @@ def test_settings_power_w_must_have_pla(tmp_path):
     toml.write_text("[power_w]\nPETG = 220\n")
     with pytest.raises(ValueError, match="PLA"):
         Settings.load(toml)
+
+
+def test_country_sets_the_default_timezone_only(tmp_path):
+    from bambu_mcp.config import country_timezone, with_country
+
+    empty = tmp_path / "empty.toml"
+    empty.write_text("")
+    explicit = tmp_path / "tz.toml"
+    explicit.write_text('timezone = "Europe/Kyiv"\n')
+    assert country_timezone("PL") == "Europe/Warsaw"
+    assert country_timezone("UA") == "Europe/Kyiv"
+    assert country_timezone("ZZ") is None
+    assert with_country(Settings.load(empty), "PL").timezone == "Europe/Warsaw"
+    assert with_country(Settings.load(empty), "ZZ").timezone == "Europe/Kyiv"  # unknown: kept
+    assert with_country(Settings.load(explicit), "PL").timezone == "Europe/Kyiv"  # the config wins

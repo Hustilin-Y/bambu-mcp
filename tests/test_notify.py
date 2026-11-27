@@ -69,6 +69,21 @@ async def test_send_minimal_body():
     assert seen["json"] == {"text": "hi"}
 
 
+async def test_single_newlines_become_paragraph_breaks_on_send_and_edit():
+    # The add-in renders rich Markdown: only a blank line splits paragraphs.
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"message_id": "5"})
+
+    client = make(handler)
+    await client.send("пластик 5.60 грн\nсвет 1.92 грн\nитого 7.52 грн")
+    assert await client.edit("5", text="one\ntwo\n\nthree") is True
+    assert seen[0]["text"] == "пластик 5.60 грн\n\nсвет 1.92 грн\n\nитого 7.52 грн"
+    assert seen[1]["text"] == "one\n\ntwo\n\nthree"  # a break already double stays double
+
+
 async def test_service_notify_duplicate():
     def handler(request):
         return httpx.Response(200, json={"message_id": "7", "duplicate": True})

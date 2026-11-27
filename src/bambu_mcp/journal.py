@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from bambu_mcp.config import Settings
-from bambu_mcp.cost import CostLine, filament_cost, power_cost, print_kwh
+from bambu_mcp.cost import CostBreakdown, CurrencyMismatch, Money, full_cost, plastic_cost, print_kwh
 from bambu_mcp.events import Event, EventKind
 from bambu_mcp.messages import post_print_buttons
 from bambu_mcp.names import slug
@@ -87,6 +87,8 @@ class Journal:
     def _open_row(self, event: Event, started_at: datetime) -> int:
         """A new row, matched to the sliced job its file name names (booked to the job's spool)."""
         print_id = self._store.open_print(event.identity, _utc(started_at), "external")
+        # The row's costs are in the currency of its start: a later switch does not relabel them.
+        self._store.set_print_fields(print_id, currency=self._store.currency()[0])
         try:
             with self._store.transaction():
                 match = match_job(self._store, event.state)
@@ -172,7 +174,7 @@ class Journal:
         if minutes is None:
             return row.id  # no duration, so no energy or cost either
         try:
-            self._record_power(row.id, started, ended, minutes, spool, slot, event)
+            self._record_power(row.id, started, minutes, spool, slot, event)
         except Exception:
             log.exception("print cost for a %s print failed, recorded without cost", event.kind)
         return row.id
@@ -181,7 +183,6 @@ class Journal:
         self,
         print_id: int,
         started: datetime,
-        ended: datetime,
         minutes: float,
         spool: Spool | None,
         slot: Slot | None,
@@ -195,16 +196,83 @@ class Journal:
             if tray is not None and tray.tray_type:
                 material = tray.tray_type
         kwh = print_kwh(minutes, material, self._settings)
-        tariff = self._store.tariff_on(started.astimezone(self._tz).date())
-        cost = power_cost(started, max(ended, started), kwh, tariff, self._settings)
-        self._store.set_print_fields(print_id, kwh=kwh, cost_power_uah=cost)
+        self._store.set_print_fields(print_id, kwh=kwh)  # the energy, even when no cost can be given
+        # The entries valid on the local date of the start, as the tariff always was.
+        day = started.astimezone(self._tz).date()
+        row = self._store.print_by_id(print_id)
+        currency = row.currency if row is not None else self._store.currency()[0]
+        cost = full_cost(
+            None,
+            None,  # the plastic is booked with the grams (rebook_grams)
+            minutes,
+            kwh,
+            self._store.tariff_on(day),
+            self._store.amortization_on(day),
+            currency=currency,
+            start=started,
+            settings=self._settings,
+        )
+        if isinstance(cost, CurrencyMismatch):
+            log.warning("print %d recorded without cost: %s", print_id, cost.reason)
+            return
+        assert cost.power is not None
+        self._store.set_print_fields(
+            print_id,
+            cost_power_uah=cost.power.amount,
+            cost_amort=cost.amort.amount if cost.amort is not None else None,
+        )
 
-    def cost_line(self, row: PrintRow) -> CostLine | None:
-        """Power cost of a closed row as computed at close (filament unknown in phase 1)."""
+    def cost_line(self, row: PrintRow) -> CostBreakdown | CurrencyMismatch | None:
+        """The cost of a closed row as recorded, for the finished message. None: no power cost.
+
+        A row whose cost was refused at the close (an input in another currency) gives the
+        refusal, so the message can say why there is no cost.
+        """
+        if row.kwh is not None and row.cost_power_uah is None and row.actual_min is not None:
+            return self._refusal(row)
         if row.kwh is None or row.cost_power_uah is None:
             return None
-        tariff = self._store.tariff_on(_utc(row.started_at).astimezone(self._tz).date())
-        return CostLine(filament_uah=None, power_uah=row.cost_power_uah, kwh=row.kwh, tariff=tariff)
+        currency = row.currency
+        day = _utc(row.started_at).astimezone(self._tz).date()
+        try:
+            two_zone = self._store.tariff_on(day).night_uah is not None
+        except LookupError:
+            two_zone = False
+        spool = self._spool_by_id(row.spool_id)
+        plastic = None if row.cost_filament_uah is None else Money(row.cost_filament_uah, currency)
+        power = Money(row.cost_power_uah, currency)
+        amort = None if row.cost_amort is None else Money(row.cost_amort, currency)
+        minutes = row.actual_min
+        hours = minutes / 60 if minutes else 0.0
+        total = sum(m.amount for m in (plastic, power, amort) if m is not None)
+        return CostBreakdown(
+            plastic=plastic,
+            power=power,
+            amort=amort,
+            total=Money(total, currency),
+            currency=currency,
+            grams=row.grams if plastic is not None else None,
+            price_per_kg=spool.price_per_kg_uah if plastic is not None and spool is not None else None,
+            kwh=row.kwh,
+            power_rate=row.cost_power_uah / row.kwh if row.kwh > 0 else None,
+            two_zone=two_zone,
+            minutes=minutes,
+            amort_rate=row.cost_amort / hours if row.cost_amort is not None and hours > 0 else None,
+        )
+
+    def _refusal(self, row: PrintRow) -> CurrencyMismatch | None:
+        """Why a closed row with energy has no power cost, when a currency refused it."""
+        started = _utc(row.started_at)
+        day = started.astimezone(self._tz).date()
+        try:
+            cost = full_cost(
+                None, None, row.actual_min, row.kwh, self._store.tariff_on(day), self._store.amortization_on(day),
+                currency=row.currency, start=started, settings=self._settings,
+            )
+        except Exception:
+            log.exception("print %d: checking why it has no cost failed", row.id)
+            return None
+        return cost if isinstance(cost, CurrencyMismatch) else None
 
     # -- presses -------------------------------------------------------------
 
@@ -315,5 +383,10 @@ def _grams_ok(value: object) -> bool:
 
 def rebook_grams(store: Store, print_id: int, spool: Spool | None, grams: float | None) -> None:
     """Point a print at ``spool`` with ``grams`` and move its spool deduction to match."""
-    cost = filament_cost(grams, spool, {}, spool.material) if spool and grams is not None else None
-    store.rebook_print_grams(print_id, spool.id if spool else None, grams, cost)
+    row = store.print_by_id(print_id)
+    currency = row.currency if row is not None else store.currency()[0]
+    cost = plastic_cost(grams, spool, currency)
+    if isinstance(cost, CurrencyMismatch):
+        log.warning("print %d: plastic recorded without cost: %s", print_id, cost.reason)
+        cost = None
+    store.rebook_print_grams(print_id, spool.id if spool else None, grams, cost.amount if cost else None)

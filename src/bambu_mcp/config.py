@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, get_args
 
@@ -11,6 +11,40 @@ TlsMode = Literal["ca", "ca-no-hostname", "pin"]
 CameraBackend = Literal["pyav"]
 
 _CLIENT_PREFIX = "CLIENT_TOKEN_"
+
+# The default timezone of a country (store meta "country"), when config.toml names none.
+# One zone per country: countries with several zones set `timezone` in config.toml.
+COUNTRY_TIMEZONES = {
+    "AT": "Europe/Vienna",
+    "BE": "Europe/Brussels",
+    "BG": "Europe/Sofia",
+    "CH": "Europe/Zurich",
+    "CZ": "Europe/Prague",
+    "DE": "Europe/Berlin",
+    "DK": "Europe/Copenhagen",
+    "EE": "Europe/Tallinn",
+    "ES": "Europe/Madrid",
+    "FI": "Europe/Helsinki",
+    "FR": "Europe/Paris",
+    "GB": "Europe/London",
+    "GE": "Asia/Tbilisi",
+    "GR": "Europe/Athens",
+    "HU": "Europe/Budapest",
+    "IE": "Europe/Dublin",
+    "IT": "Europe/Rome",
+    "LT": "Europe/Vilnius",
+    "LV": "Europe/Riga",
+    "MD": "Europe/Chisinau",
+    "NL": "Europe/Amsterdam",
+    "NO": "Europe/Oslo",
+    "PL": "Europe/Warsaw",
+    "PT": "Europe/Lisbon",
+    "RO": "Europe/Bucharest",
+    "SE": "Europe/Stockholm",
+    "SK": "Europe/Bratislava",
+    "TR": "Europe/Istanbul",
+    "UA": "Europe/Kyiv",
+}
 
 
 def _parse_env(path: Path) -> dict[str, str]:
@@ -81,6 +115,8 @@ class Settings:
     gateway_url: str | None = None
     slice_agent_url: str | None = None
     service_url: str | None = None  # default --url of `bambu-mcp upload`
+    # True when config.toml names the timezone: the country's default then does not apply.
+    timezone_explicit: bool = field(default=False, compare=False, repr=False)
 
     @classmethod
     def load(cls, toml_path: Path) -> Settings:
@@ -89,7 +125,7 @@ class Settings:
             tomllib.loads(toml_path.read_text(encoding="utf-8")) if toml_path.exists() else {}
         )
         defaults = cls()
-        unknown = set(raw) - set(cls.__dataclass_fields__)
+        unknown = set(raw) - (set(cls.__dataclass_fields__) - {"timezone_explicit"})
         if unknown:
             raise ValueError(f"unknown settings keys: {', '.join(sorted(unknown))}")
 
@@ -134,6 +170,7 @@ class Settings:
             power_w=power_w,
             heatup_kwh=float(raw.get("heatup_kwh", defaults.heatup_kwh)),
             timezone=raw.get("timezone", defaults.timezone),
+            timezone_explicit="timezone" in raw,
             jobs_root_allowed=Path(jobs_root) if jobs_root else None,
             **urls,
         )
@@ -146,3 +183,16 @@ def _url(raw: dict[str, Any], key: str) -> str | None:
     if not isinstance(value, str) or not value.startswith(("http://", "https://")):
         raise ValueError(f"{key} must be an http:// or https:// URL")
     return value
+
+
+def country_timezone(country: str) -> str | None:
+    """The country's default timezone, None for a country not in the table."""
+    return COUNTRY_TIMEZONES.get(country)
+
+
+def with_country(settings: Settings, country: str) -> Settings:
+    """Settings with the country's default timezone, unless config.toml names one."""
+    tz = country_timezone(country)
+    if settings.timezone_explicit or tz is None:
+        return settings
+    return replace(settings, timezone=tz)

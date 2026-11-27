@@ -66,6 +66,67 @@ def test_overrides_values():
     assert Overrides.parse({"enable_support": False}, "0.4").args() == ["--enable-support=0"]
 
 
+STUDIO_KEYS = Path(__file__).parent.parent / "fixtures" / "studio" / "project_settings_keys.json"
+
+
+def test_whitelist_keys_and_values_match_studio_spelling():
+    """Key names and the default values come from a real Studio 02.08 P2S project_settings.config."""
+    studio = json.loads(STUDIO_KEYS.read_text(encoding="utf-8"))
+    assert set(runner.OVERRIDE_KEYS) <= set(studio)
+    assert studio["seam_position"] in runner.SEAM_POSITIONS
+    assert studio["ironing_type"] in runner.IRONING_TYPES
+    assert studio["wall_generator"] in runner.WALL_GENERATORS
+    for key in ("top_shell_layers", "bottom_shell_layers"):
+        Overrides.parse({key: int(studio[key])}, "0.4")
+
+
+def test_new_overrides_parse_and_reject_out_of_range():
+    ok = Overrides.parse(
+        {"top_shell_layers": 0, "bottom_shell_layers": 20, "outer_wall_speed": 20, "seam_position": "back",
+         "ironing_type": "topmost", "wall_generator": "classic"}, "0.4")
+    assert ok.values["bottom_shell_layers"] == 20
+    for value in (20, 60, 300, 45.5, 300.0):
+        Overrides.parse({"outer_wall_speed": value}, "0.4")
+    for seam in ("aligned", "back", "nearest", "random"):
+        Overrides.parse({"seam_position": seam}, "0.4")
+    for iron in ("no ironing", "top", "topmost"):
+        Overrides.parse({"ironing_type": iron}, "0.4")
+    for raw in (
+        {"top_shell_layers": -1},
+        {"top_shell_layers": 21},
+        {"top_shell_layers": 5.0},
+        {"top_shell_layers": True},
+        {"bottom_shell_layers": 21},
+        {"bottom_shell_layers": "5"},
+        {"outer_wall_speed": 19.9},
+        {"outer_wall_speed": 301},
+        {"outer_wall_speed": float("nan")},
+        {"outer_wall_speed": float("inf")},
+        {"outer_wall_speed": True},
+        {"outer_wall_speed": "60"},
+        {"seam_position": "rear"},
+        {"seam_position": "Back"},
+        {"ironing_type": "solid"},
+        {"ironing_type": "no_ironing"},
+        {"wall_generator": "Arachne"},
+    ):
+        with pytest.raises(ValueError, match=next(iter(raw))):
+            Overrides.parse(raw, "0.4")
+
+
+def test_argv_for_new_keys():
+    o = Overrides.parse(
+        {"top_shell_layers": 6, "bottom_shell_layers": 4, "outer_wall_speed": 60, "seam_position": "back",
+         "ironing_type": "no ironing", "wall_generator": "classic"}, "0.4")
+    assert o.args() == [
+        "--top-shell-layers=6", "--bottom-shell-layers=4", "--outer-wall-speed=60", "--seam-position=back",
+        "--ironing-type=no ironing", "--wall-generator=classic",
+    ]
+    assert Overrides.parse({"outer_wall_speed": 45.5}, "0.4").args() == ["--outer-wall-speed=45.5"]
+    argv = cmd(make_cfg(Path("C:/x")), overrides=Overrides.parse({"ironing_type": "top"}, "0.4"))
+    assert "--ironing-type=top" in argv  # one argv item, no shell: the space in "no ironing" is safe
+
+
 def test_build_command_matches_recipe(tmp_path):
     cfg = make_cfg(tmp_path)
     prof = cfg.profiles_dir

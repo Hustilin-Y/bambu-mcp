@@ -19,6 +19,9 @@ INFILL_PATTERNS = (
     "grid", "gyroid", "honeycomb", "cubic", "line",
     "rectilinear", "zig-zag", "adaptivecubic", "lightning",
 )
+# Print goals CAD Workshop may set in PRINT_HINTS["goal"]: one key or [primary, secondary].
+# bambu_mcp.evaluation.GOALS holds their labels, base points and limits, in this order.
+GOAL_KEYS = ("balanced", "speed", "strength", "quality", "cheap", "light", "fit", "watertight")
 CHECK_BOOLS = ("failed", "overhang_warn", "base_warn", "supports_suggested")
 CHECK_INTS = ("islands", "bodies_above_bed")
 MAX_MANIFEST_BYTES = 1024 * 1024
@@ -45,6 +48,18 @@ def _is_num(v: object) -> bool:
         return False
 
 
+def is_goal(v: object) -> bool:
+    """One goal key, or a list of one or two different keys (primary, secondary)."""
+    if isinstance(v, str):
+        return v in GOAL_KEYS
+    return (
+        isinstance(v, list)
+        and 1 <= len(v) <= 2
+        and all(isinstance(k, str) and k in GOAL_KEYS for k in v)
+        and len(set(v)) == len(v)
+    )
+
+
 HINT_VALIDATORS = {
     "walls": (lambda v: _is_int(v) and 1 <= v <= 10, "an integer 1..10"),
     "infill_pct": (lambda v: _is_int(v) and 0 <= v <= 100, "an integer 0..100"),
@@ -53,6 +68,8 @@ HINT_VALIDATORS = {
     "brim": (lambda v: v in ("none", "auto", "outer"), "one of none, auto, outer"),
     "material": (lambda v: isinstance(v, str) and bool(v.strip()), "a non-empty string"),
     "material_reason": (lambda v: isinstance(v, str) and len(v) <= 200, "a string of at most 200 characters"),
+    "goal": (is_goal, "one of " + ", ".join(GOAL_KEYS) + ", or a list of two different ones"),
+    "goal_reason": (lambda v: isinstance(v, str) and len(v) <= 200, "a string of at most 200 characters"),
 }
 
 

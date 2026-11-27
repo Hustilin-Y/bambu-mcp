@@ -22,7 +22,7 @@ import secrets as _secrets
 import shutil
 import signal
 import uuid
-from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -34,21 +34,46 @@ import httpx
 from bambu_mcp import camera as camera_module
 from bambu_mcp import jobs as jobs_module
 from bambu_mcp import mcp_server
-from bambu_mcp.config import Secrets, Settings
-from bambu_mcp.cost import tariff_check_due
+from bambu_mcp.config import Secrets, Settings, with_country
+from bambu_mcp.cost import (
+    CostBreakdown,
+    CurrencyMismatch,
+    sum_costs,
+    tariff_check_due,
+    tariff_reminder_enabled,
+)
 from bambu_mcp.events import CANCEL_ERROR, Event, EventDetector, EventKind, event_identity
-from bambu_mcp.jobs import JobBusy, SliceStart
+from bambu_mcp.evaluation import (
+    DEFAULT_GOAL,
+    GOALS,
+    VariantMetrics,
+    base_variant,
+    candidates,
+    first_metric_unknown,
+    goal_base,
+    goal_record,
+    job_goal,
+    parse_goal,
+    score,
+    strength_proxy,
+)
+from bambu_mcp.jobs import EvaluationFailed, JobBusy, SliceStart
 from bambu_mcp.journal import NO_SPOOL, TERMINAL_KINDS, Journal, Slot
 from bambu_mcp.logthrottle import Throttle
-from bambu_mcp.manifest import Manifest, ManifestError, parse_manifest, verify_file
+from bambu_mcp.manifest import GOAL_KEYS, Manifest, ManifestError, parse_manifest, verify_file
 from bambu_mcp.messages import (
+    EVALUATING_TEXT,
+    MAX_BUTTONS,
+    eval_buttons,
     fit_question,
+    goal_buttons,
     job_name,
     md_literal,
     plate_buttons,
     plate_question,
     post_print_buttons,
     print_buttons,
+    reset_buttons,
     render_event,
     render_print_refused,
     render_print_started,
@@ -57,15 +82,19 @@ from bambu_mcp.messages import (
     render_start_confirmation,
     render_start_unconfirmed,
     render_stop_confirmation,
+    render_variants,
+    goal_warning,
     slot_buttons,
     spool_buttons,
     spool_question,
     start_buttons,
     stop_ask_buttons,
     stop_buttons,
+    tariff_reminder,
+    variant_buttons,
 )
 from bambu_mcp.names import slug
-from bambu_mcp.notify import Button, LogNotifier, Notifier, Press, SendError, ServiceNotifyClient
+from bambu_mcp.notify import Button, LogNotifier, Notifier, Press, SendError, ServiceNotifyClient, paragraphs
 from bambu_mcp.printer import ftps
 from bambu_mcp.printer.ftps import UploadError
 from bambu_mcp.printer.hms import HmsTexts
@@ -90,11 +119,11 @@ from bambu_mcp.proposal import (
     SlotChoice,
     SlotUnusable,
     UsableSlot,
-    estimate_cost,
     job_hints,
     job_material,
     last_settings,
     pick_slot,
+    predict_cost,
     resolve_settings,
     slot_number,
     slot_position,
@@ -111,7 +140,7 @@ from bambu_mcp.slicer import (
     WakeError,
 )
 from bambu_mcp.store.db import Store
-from bambu_mcp.store.models import Job, OutboxRow, Spool, Tariff
+from bambu_mcp.store.models import Job, OutboxRow, Spool
 from slice_agent.runner import PLATE_TYPES
 
 log = logging.getLogger(__name__)
@@ -177,6 +206,15 @@ _SPENT_TEXTS = {
     "cancelled": "Печать отменена, подготовь её заново, если нужно",
 }
 NOT_SLICED_TEXT = "Задание «{name}» не нарезано, сначала нарежь его"
+# A start confirmation an evaluation run made stale (ruling R5: the PC file is re-sliced).
+REEVALUATED_OUTCOME = "reevaluated"
+REEVALUATED_TEXT = "⌛ Настройки подбираются заново, подготовь печать после подбора"
+EVAL_INTERRUPTED_ERROR = "evaluation interrupted by a service restart"
+RESTORE_WAIT_S = 60.0  # at start-up, how long a cut-off run's proposal waits for the slots
+EVAL_INTERRUPTED_TEXT = (
+    "Подбор вариантов для «{name}» не закончен: подбор прерван перезапуском сервиса. "
+    "Нажми «🔍 Подобрать» ещё раз"
+)
 JOB_CHANGED_TEXT = "Задание изменилось после подтверждения, подготовь печать заново"
 FILE_GONE_TEXT = "Нарезанного файла уже нет на сервере, подготовь печать заново"
 FILE_CHANGED_TEXT = "Нарезанный файл изменился после подтверждения, подготовь печать заново"
@@ -202,6 +240,9 @@ _STOP_SPENT_TEXTS = {
     "expired": "⌛ Подтверждение истекло, остановка не отправлена. Запроси её заново, если нужно",
     "cancelled": STOP_CANCELLED_TEXT,
 }
+# A confirmation that would reach Telegram with less than this left goes out without buttons.
+MIN_BUTTONS_LIFE_S = 5
+_EXPIRED_ON_SEND = {"print_confirm": _SPENT_TEXTS["expired"], "stop_confirm": _STOP_SPENT_TEXTS["expired"]}
 TLS_TEXT = (
     "Загрузка на принтер идёт по TLS с проверкой сертификата: в настройках нужны "
     + md_literal('tls_mode = "ca"')
@@ -286,6 +327,24 @@ class SlicePlan:
     named_set: str  # its values are in ``settings``, the agent always gets PROCESS_SET
     filament: str | None  # the spool's Bambu Studio filament preset
     usable: tuple[UsableSlot, ...] = ()  # slots the owner may choose instead
+    # (primary, secondary, source, reason) from evaluation.job_goal: its base point is in ``settings``
+    goal: tuple[str, str | None, str, str | None] = ("balanced", None, "fallback", None)
+
+
+@dataclass(frozen=True)
+class _EvalRun:
+    """An evaluation run claimed on a job: what it slices and what a failure restores."""
+
+    job: Job
+    plan: SlicePlan  # the goal's plan: its slot, spool and goal hold for every variant
+    prev_status: str  # the job's status before the run, given back at its end
+    settings: list[dict[str, object]]  # the balanced baseline first (evaluation.candidates)
+    before_text: str  # the proposal before the run: a failed baseline puts it back
+    before_buttons: list[list[Button]]
+    message_id: str | None  # the proposal message pressed, None from a tool call
+    previous: str | None  # the job's variants_json before the run, given back if it fails
+    explicit: dict[str, object]  # the owner's settings, the same in every variant
+    base_index: int | None  # the goal's base point among ``settings``
 
 
 @dataclass(frozen=True)
@@ -367,14 +426,6 @@ def notify_dedupe(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
-def tariff_text(tariff: Tariff) -> str:
-    if tariff.night_uah is None:
-        rate = f"{tariff.day_uah:.2f} грн/кВт·ч"
-    else:
-        rate = f"день {tariff.day_uah:.2f} / ночь {tariff.night_uah:.2f} грн/кВт·ч"
-    return f"Проверь тариф на электроэнергию: сейчас {rate} с {tariff.valid_from:%d.%m.%Y}"
-
-
 def _tray_slot(report: dict) -> Slot | None:
     """AMS slot the printer currently feeds from, if the report says so."""
     p = report.get("print")
@@ -415,6 +466,7 @@ class Service:
         watch_s: float = START_WATCH_S,
         report_wait_s: float = REPORT_WAIT_S,
         upload_timeout_s: float = UPLOAD_TIMEOUT_S,
+        restore_wait_s: float = RESTORE_WAIT_S,
     ) -> None:
         self._secrets = secrets
         self._settings = settings
@@ -449,6 +501,7 @@ class Service:
         self._slicer = slicer
         self._waker = waker
         self._slice_tasks: set[asyncio.Task] = set()
+        self._evaluating: set[int] = set()  # job ids with an evaluation run in flight
         # Printing (phase 3).
         self._uploader = uploader
         self._watch_s = watch_s
@@ -458,6 +511,7 @@ class Service:
         self._press_tasks: set[asyncio.Task] = set()  # starts and prepares run off the press loop
         self._preparing: set[int] = set()  # job ids with a prepare from a button in flight
         self._report_waiters: set[asyncio.Event] = set()
+        self._restore_wait_s = restore_wait_s
         self._watch: _StartWatch | None = None
         self._own_tasks: set[str] = set()  # task ids this process sent: their start gets the stop button
         self._last_task_id = 0
@@ -514,6 +568,10 @@ class Service:
         self._outbox_wake.set()  # messages left from the last run go out first
         self._stop_requested = asyncio.Event()
         try:
+            await self._recover_evaluations()
+        except Exception:
+            log.exception("checking for interrupted evaluations failed")
+        try:
             self._fail_interrupted_jobs()
         except Exception:
             log.exception("checking for interrupted slices failed")
@@ -559,13 +617,18 @@ class Service:
         await self._inbox.join()
 
     async def check_tariff(self) -> bool:
-        """Queue the quarterly tariff reminder when due. Returns True when it was queued."""
+        """Queue the quarterly tariff reminder when due. Returns True when it was queued.
+
+        Runs for the country UA only (`set_country`).
+        """
+        if not tariff_reminder_enabled(self._store.country()):
+            return False
         today = self._clock().astimezone(self._tz).date()
         raw = self._store.get_meta(TARIFF_META_KEY)
         last = date.fromisoformat(raw) if raw else None
         if not tariff_check_due(last, today):
             return False
-        text = tariff_text(self._store.tariff_on(today))
+        text = tariff_reminder(self._store.tariff_on(today), self._store.currency()[1])
         with self._store.transaction():
             self._enqueue("tariff", text, f"tariff-reminder|{today.isoformat()}")
             self._store.set_meta(TARIFF_META_KEY, today.isoformat())
@@ -590,10 +653,15 @@ class Service:
             files = [(SNAPSHOT_NAME, image)] if image else None
         if row.kind == SLICED_KIND:
             files = [*(files or []), *self._attachments(row.dedupe)] or None
+        text, buttons, expires_in = row.text, _rows_buttons(row.buttons), None
+        if row.expires_at is not None:
+            # The add-in takes the buttons off when the confirmation expires.
+            expires_in = math.ceil(row.expires_at - now)
+            if expires_in < MIN_BUTTONS_LIFE_S:
+                expired = _EXPIRED_ON_SEND.get(row.kind, _SPENT_TEXTS["expired"])
+                text, buttons, expires_in = f"{text}\n\n{expired}", None, None
         try:
-            await self._notifier.send(
-                row.text, buttons=_rows_buttons(row.buttons), files=files, dedupe=row.dedupe
-            )
+            await self._notifier.send(text, buttons=buttons, files=files, dedupe=row.dedupe, expires_in=expires_in)
         except SendError as exc:
             return self._delivery_failed(row, exc)
         except Exception as exc:  # a bug in the client must not stop the outbox
@@ -682,7 +750,9 @@ class Service:
         *,
         buttons: list[list[Button]] | None = None,
         snapshot: bool = False,
+        expires_at: float | None = None,
     ) -> None:
+        """Queue a message. ``expires_at`` (epoch seconds): when its buttons stop working."""
         self._store.outbox_add(
             kind,
             text,
@@ -690,6 +760,7 @@ class Service:
             buttons=_rows_json(buttons),
             snapshot=snapshot,
             now=self._clock().timestamp(),
+            expires_at=expires_at,
         )
         if self._outbox_wake is not None:
             self._outbox_wake.set()
@@ -826,6 +897,18 @@ class Service:
             if _slot_press(press.button_id) is not None:
                 await self._on_slot_press(press)
                 return
+            if _goal_press(press.button_id) is not None:
+                await self._on_goal_press(press)
+                return
+            if _eval_press(press.button_id) is not None:
+                await self._on_eval_press(press)
+                return
+            if _variant_press(press.button_id) is not None:
+                await self._on_variant_press(press)
+                return
+            if _reset_press(press.button_id) is not None:
+                await self._on_reset_press(press)
+                return
             if press.button_id.startswith("job:"):
                 text = self._on_job_press(press)
             else:
@@ -935,7 +1018,8 @@ class Service:
             log.exception("journal update for a %s event failed", event.kind)
             print_id = cost = duration = None
 
-        text = render_event(event, self._hms_texts, cost, duration, tz=self._tz)
+        code, symbol = self._store.currency()
+        text = render_event(event, self._hms_texts, cost, duration, tz=self._tz, symbol=symbol, code=code)
         buttons = None
         task_id = event.state.task_id
         if event.kind is EventKind.STARTED and task_id and task_id in self._own_tasks:
@@ -969,21 +1053,27 @@ class Service:
 
     # -- jobs: proposal and slicing ----------------------------------------------
 
-    async def propose(self, job_id: int, slot: int | None = None) -> str:
-        """Queue the job's proposal with the slice, change and slot buttons. Returns its text.
+    async def propose(self, job_id: int, slot: int | None = None, goal: object = None) -> str:
+        """Queue the job's proposal with the slice, change, slot and goal buttons. Returns its text.
 
         ``slot`` (1..16) is the owner's AMS slot: stored with the job, it replaces the one
-        stored before. Raises ``KeyError`` for an unknown job, ``SlotUnusable`` for a slot
-        that cannot be printed from, ``ValueError`` when the settings do not resolve.
+        stored before. ``goal`` (a key or [primary, secondary]) is the owner's goal: stored
+        with the job, it applies its base point and drops a chosen variant. Raises
+        ``KeyError`` for an unknown job, ``SlotUnusable`` for a slot that cannot be printed
+        from, ``ValueError`` for an unknown goal or settings that do not resolve.
         """
+        owner_goal = parse_goal(goal) if goal is not None else None
         job = self._job(job_id)
-        if slot is not None and job.status == "slicing":
-            raise JobBusy(job.id)  # the slot of a running slice never changes under it
-        plan = self._plan(job, None, DEFAULT_NAMED_SET, slot)
-        text, buttons = _proposal(job, plan)
+        if (slot is not None or owner_goal is not None) and job.status == "slicing":
+            raise JobBusy(job.id)  # the slot or goal of a running slice never changes under it
+        plan = self._plan(job, None, DEFAULT_NAMED_SET, slot, owner_goal)
+        chosen = _chosen_fields(slot, owner_goal)
+        if chosen:
+            job = replace(job, **chosen)
+        text, buttons = self._proposal(job, plan)
         with self._store.transaction():
-            if slot is not None:
-                self._store.update_job(job.id, slot=slot)
+            if chosen:
+                self._store.update_job(job.id, **chosen)
             self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
         return text
 
@@ -994,16 +1084,20 @@ class Service:
         *,
         named_set: str = DEFAULT_NAMED_SET,
         slot: int | None = None,
+        goal: object = None,
     ) -> Job:
         """Wake the PC, slice the job, store the result and queue the summary (or the failure).
 
-        ``explicit`` is what the owner asked for (ruling R6). ``slot`` is the owner's AMS
-        slot, stored with the job (None: the stored one, else the material match). Raises
+        ``explicit`` is what the owner asked for (ruling R6): stored with the job
+        (``explicit_json``, merged over what was stored), so later slices and evaluations
+        keep it. ``slot`` is the owner's AMS
+        slot, stored with the job (None: the stored one, else the material match). ``goal``
+        is the owner's goal, stored with the job: its base point is under ``explicit``. Raises
         ``KeyError`` (unknown job), ``ValueError`` (settings outside the whitelist, or
         ``SlotUnusable``) or ``JobBusy`` before anything changes. Every later failure ends
         the job ``slice_failed`` and tells the owner.
         """
-        job, plan = self._claim(job_id, explicit, named_set, slot)
+        job, plan = self._claim(job_id, explicit, named_set, slot, goal)
         await self._slice_claimed(job, plan)
         return self._job(job.id)
 
@@ -1014,12 +1108,13 @@ class Service:
         *,
         named_set: str = DEFAULT_NAMED_SET,
         slot: int | None = None,
+        goal: object = None,
     ) -> SliceStart:
         """``slice_job`` in the background: the job is claimed before this returns.
 
         The slot warning is returned at once, so a caller that skipped the proposal sees it.
         """
-        job, plan = self._claim(job_id, explicit, named_set, slot)
+        job, plan = self._claim(job_id, explicit, named_set, slot, goal)
         task = asyncio.create_task(self._slice_claimed(job, plan), name=f"bambu-slice-{job.id}")
         self._slice_tasks.add(task)
         task.add_done_callback(self._slice_tasks.discard)
@@ -1032,11 +1127,20 @@ class Service:
         return job
 
     def _claim(
-        self, job_id: int, explicit: Mapping | None, named_set: str, slot: int | None = None
+        self,
+        job_id: int,
+        explicit: Mapping | None,
+        named_set: str,
+        slot: int | None = None,
+        goal: object = None,
     ) -> tuple[Job, SlicePlan]:
+        owner_goal = parse_goal(goal) if goal is not None else None
         job = self._job(job_id)
-        plan = self._plan(job, explicit, named_set, slot)
-        chosen = {"slot": slot} if slot is not None else {}
+        plan = self._plan(job, explicit, named_set, slot, owner_goal)
+        chosen = _chosen_fields(slot, owner_goal)
+        if explicit:
+            # The owner's words stay their own layer (ruling R2): an evaluation keeps them fixed.
+            chosen["explicit_json"] = json.dumps({**_explicit(job), **explicit})
         claimed = self._store.transition_job(
             job.id,
             CLAIMABLE,
@@ -1052,17 +1156,53 @@ class Service:
         return job, plan
 
     def _plan(
-        self, job: Job, explicit: Mapping | None, named_set: str, slot: int | None = None
+        self,
+        job: Job,
+        explicit: Mapping | None,
+        named_set: str,
+        slot: int | None = None,
+        goal: tuple[str, str | None] | None = None,
+        *,
+        use_variant: bool = True,
+        base_goal: str | None = None,
     ) -> SlicePlan:
-        """``slot`` (1..16) wins over the job's stored slot, which wins over the material match."""
+        """``slot`` (1..16) wins over the job's stored slot, which wins over the material match.
+
+        ``goal`` (primary, secondary) is the owner's new goal: it replaces the job's and drops
+        its chosen variant. Without it the job's goal (``job_goal``) and variant apply
+        (``use_variant`` False: not the variant, an evaluation run's baseline). The last
+        sliced job of the part (another job, never this one) ranks above the goal's base point when its primary goal was
+        the same (ruling R4), below it otherwise. ``base_goal``: that goal's base point instead
+        of the job goal's (an evaluation's balanced baseline), none for the fallback goal.
+        ``explicit`` goes over the owner's settings stored with the job (``explicit_json``).
+        """
         manifest = parse_manifest(json.loads(job.manifest_json))  # checked at intake
         nozzle = f"{manifest.nozzle_mm:g}"
         history = self._store.jobs(JOB_HISTORY)
+        if goal is not None:
+            goal_now: tuple[str, str | None, str, str | None] = (goal[0], goal[1], "owner", None)
+            variant = None
+        else:
+            goal_now = job_goal(job, manifest)
+            variant = _variant(job) if use_variant else None
+        # The fallback goal applies no base point: the hints and the last job stay as before
+        # goals existed (controller ruling). Only the owner's or the CAD agent's goal sets one.
+        base_key = base_goal or goal_now[0]
+        base = None
+        if goal_now[2] != "fallback":
+            base = goal_base(base_goal, None) if base_goal else goal_base(goal_now[0], goal_now[1])
+        # The last job is another job of the part: the job's own earlier slice is never a layer
+        # (a goal change must not slice the old settings again).
+        last = last_settings(history, job.name, exclude_id=job.id)
+        if base is not None and last is not None and _last_primary(history, job.name, job.id) == base_key:
+            base = {**base, **last}  # R4: the same goal keeps what the last job (or its variant) chose
         settings = resolve_settings(
-            explicit or {},
-            last_settings(history, job.name),
+            {**_explicit(job), **(explicit or {})},
+            last,
             job_hints(manifest),
             named_set,
+            goal_base=base,
+            variant=variant,
             checks=manifest.checks,
             nozzle=nozzle,
         )
@@ -1092,7 +1232,62 @@ class Service:
             named_set=named_set,
             filament=(spool.filament_preset or None) if spool else None,
             usable=tuple(usable_slots(trays, spools)),
+            goal=goal_now,
         )
+
+    def _predict(
+        self, grams: float | None, minutes: float | None, spool: Spool | None, material: str
+    ) -> CostBreakdown | CurrencyMismatch:
+        """A predicted cost, priced as if the print started now with today's tariff and amortization."""
+        now = self._clock()
+        day = now.astimezone(self._tz).date()
+        return predict_cost(
+            grams,
+            minutes,
+            spool,
+            material,
+            self._store.tariff_on(day),
+            self._store.amortization_on(day),
+            self._settings,
+            now,
+            currency=self._store.currency()[0],
+        )
+
+    def _proposal(self, job: Job, plan: SlicePlan) -> tuple[str, list[list[Button]]]:
+        """The proposal's text and buttons: slice and change, then the slot rows.
+
+        The cost: the chosen evaluation variant's sliced grams and minutes when it has them,
+        else the manifest's grams at the slot spool's price and the minutes of the job's last
+        slice when it has one (else no electricity or amortization yet).
+        """
+        sliced = _sliced_minutes(job)
+        plates = plan.manifest.plates
+        stale = False
+        data = _variants(job)
+        entry = _chosen_entry(data) if data is not None else None
+        try:
+            if entry is not None:
+                stale = entry["settings"] != plan.settings
+                cost = self._predict(entry["grams"], entry["minutes"], plan.spool, plan.material)
+            elif sliced is not None and all(p.index in sliced for p in plates):
+                stale = _loads_dict(job.settings_json) != plan.settings
+                # Per plate, as the slice summary does: each plate heats up once.
+                cost = sum_costs(
+                    [self._predict(p.estimate_g, sliced[p.index], plan.spool, plan.material) for p in plates]
+                )
+            else:
+                cost = self._predict(sum(p.estimate_g for p in plates), None, plan.spool, plan.material)
+        except Exception:
+            log.exception("job %d: the proposal's cost failed, sent without it", job.id)
+            cost = None
+        code, symbol = self._store.currency()
+        return _proposal(job, plan, cost, symbol, code=code, stale=stale)
+
+    def _print_material(self, target: _PrintTarget, info: PrintFileInfo) -> str:
+        """The material whose power draw prices the plate: the slot spool's, else the file's."""
+        if target.spool is not None:
+            return self._canonical(target.spool.material)
+        return self._canonical(info.filament_types[0] if info.filament_types else "PLA")
 
     def _canonical(self, material: str) -> str:
         """The material as the power table spells it (``print_kwh`` is case-sensitive)."""
@@ -1122,13 +1317,23 @@ class Service:
             log.exception("slicing job %d failed", job.id)
             self._fail_job(job, "internal error in the service", "внутренняя ошибка сервиса")
 
-    async def _slice(self, job: Job, plan: SlicePlan) -> None:
-        slicer = self._slicer
-        if slicer is None:
+    def _require_slicer(self) -> Slicer:
+        if self._slicer is None:
             raise _SliceFailed(
                 "slice-agent is not configured",
                 f"слайсер не настроен, нужны {md_literal('slice_agent_url')} и {md_literal('SLICE_AGENT_TOKEN')}",
             )
+        return self._slicer
+
+    async def _slice(self, job: Job, plan: SlicePlan) -> None:
+        slicer = self._require_slicer()
+        data = await self._ready_to_slice(job, plan)
+        outcome = await self._slice_once(job, plan, slicer, data)
+        await self._finish(job, plan, outcome)
+
+    async def _ready_to_slice(self, job: Job, plan: SlicePlan) -> bytes:
+        """The job's checked 3MF, once the PC is awake. ``_SliceFailed`` otherwise."""
+        slicer = self._require_slicer()
         data = await asyncio.to_thread(self._stored_file, job)
         problem = _preset_problem(plan)
         if problem is not None:
@@ -1141,6 +1346,11 @@ class Service:
             raise _SliceFailed(
                 "the PC did not wake within 2 minutes", "ПК не проснулся за 2 минуты, нарезка не запускалась"
             )
+        return data
+
+    async def _slice_once(self, job: Job, plan: SlicePlan, slicer: Slicer, data: bytes) -> SliceOutcome:
+        """One ``/slice`` with ``plan.settings`` (one retry when the agent is busy): an ``ok``
+        outcome with a file, else ``_SliceFailed``."""
         request = SliceRequest(
             job_id=job.id,
             name=slug(job.name),
@@ -1167,7 +1377,7 @@ class Service:
         if outcome.status != "ok" or not outcome.file:
             detail = outcome.detail or "slice failed"
             raise _SliceFailed(detail, md_literal(detail))
-        await self._finish(job, plan, outcome)
+        return outcome
 
     def _stored_file(self, job: Job) -> bytes:
         """The job's 3MF, checked again: the intake does not fsync before the rename."""
@@ -1187,14 +1397,8 @@ class Service:
     async def _finish(self, job: Job, plan: SlicePlan, outcome: SliceOutcome) -> None:
         assert self._slicer is not None and outcome.file
         now = self._clock()
-        tariff = self._store.tariff_on(now.astimezone(self._tz).date())
         plates = [dict(p) for p in outcome.plates]
-        costs = [
-            estimate_cost(
-                p["minutes"], sum(p["grams"].values()), plan.spool, plan.material, tariff, self._settings, now
-            )
-            for p in plates
-        ]
+        costs = [self._predict(sum(p["grams"].values()), p["minutes"], plan.spool, plan.material) for p in plates]
         first = min(p["index"] for p in plates)
         try:
             png = await self._slicer.fetch_png(outcome.file, first)
@@ -1202,21 +1406,21 @@ class Service:
             log.exception("job %d: plate picture failed, sending the text alone", job.id)
             png = None
         text = render_sliced(
-            job, plates, costs, settings=plan.settings, slot_choice=plan.choice, plate_type=plan.plate_type
+            job,
+            plates,
+            costs,
+            settings=plan.settings,
+            slot_choice=plan.choice,
+            plate_type=plan.plate_type,
+            symbol=self._store.currency()[1],
         )
+        broken = goal_warning(plan.goal[0], plan.settings)
+        if broken:
+            text = f"{text}\n{broken}"
         choice = plan.choice
         result = {
             "plates": plates,
-            "costs": [
-                {
-                    "index": p["index"],
-                    "filament_uah": c.filament_uah,
-                    "power_uah": c.power_uah,
-                    "kwh": c.kwh,
-                    "total_uah": c.total_uah,
-                }
-                for p, c in zip(plates, costs, strict=True)
-            ],
+            "costs": [_cost_json(p["index"], c) for p, c in zip(plates, costs, strict=True)],
             "slot": {
                 "ams": choice.ams,
                 "slot": choice.slot,
@@ -1237,7 +1441,8 @@ class Service:
         }
         key = _job_key(job.id, "sliced")
         # A photo caption holds 1024 characters: a longer summary follows its picture.
-        split = png is not None and _caption_len(text) > CAPTION_MAX
+        # Counted as sent: the client turns each newline into a blank line.
+        split = png is not None and _caption_len(paragraphs(text)) > CAPTION_MAX
         picture_key = _job_key(job.id, "picture") if split else key
         folder = self._attachments_dir(notify_dedupe(picture_key)) if png else None
         try:
@@ -1268,11 +1473,13 @@ class Service:
             raise
         log.info("job %d sliced: %s", job.id, outcome.file)
 
-    def _fail_job(self, job: Job, error: str, text: str) -> None:
-        """``slicing`` -> ``slice_failed`` with ``error``, and tell the owner ``text``."""
+    def _fail_job(self, job: Job, error: str, text: str, **fields: Any) -> None:
+        """``slicing`` -> ``slice_failed`` with ``error`` (and ``fields``), and tell the owner ``text``."""
         try:
             with self._store.transaction():
-                if self._store.transition_job(job.id, ("slicing",), status="slice_failed", error=error):
+                if self._store.transition_job(
+                    job.id, ("slicing",), status="slice_failed", error=error, **fields
+                ):
                     self._enqueue(
                         "job_failed",
                         f"❌ Нарезка «{job_name(job.name)}» не удалась: {text}",
@@ -1284,7 +1491,12 @@ class Service:
     def _fail_interrupted_jobs(self) -> None:
         """Jobs left ``slicing`` by a stop that could not mark them: no slice runs for them now."""
         for job in self._store.jobs_with_status("slicing"):
-            self._fail_job(job, "interrupted by a service restart", "прервано перезапуском сервиса")
+            fields: dict[str, Any] = {}
+            marker = _eval_marker(job)
+            if marker is not None:  # an evaluation _recover_evaluations could not give back
+                previous = marker.get("previous") if isinstance(marker.get("previous"), str) else None
+                fields["variants_json"] = _failed_record(previous, EVAL_INTERRUPTED_ERROR, self._clock())
+            self._fail_job(job, "interrupted by a service restart", "прервано перезапуском сервиса", **fields)
 
     async def _on_slot_press(self, press: Press) -> None:
         """``job:<id>:slot:<n>``: store the slot and edit the proposal in place with it chosen.
@@ -1301,7 +1513,7 @@ class Service:
             return
         name = job_name(job.name)
         if job.status == "slicing":
-            await self._notifier.edit(press.message_id, f"Уже режу «{name}»")
+            await self._notifier.edit(press.message_id, self._busy_text(job))
             return
         try:
             plan = self._plan(job, None, DEFAULT_NAMED_SET, number)
@@ -1315,9 +1527,44 @@ class Service:
             return
         # A slice claimed in the meantime keeps its own plan: the slot is not changed under it.
         if not self._store.transition_job(job.id, CLAIMABLE, slot=number):
-            await self._notifier.edit(press.message_id, f"Уже режу «{name}»")
+            await self._notifier.edit(press.message_id, self._busy_text(job))
             return
-        text, buttons = _proposal(self._job(job.id), plan)
+        text, buttons = self._proposal(self._job(job.id), plan)
+        if not await self._notifier.edit(press.message_id, text, buttons):
+            log.warning("job %d: editing the proposal failed, sending it again", job.id)
+            self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
+
+    async def _on_goal_press(self, press: Press) -> None:
+        """``job:<id>:goal:<key>``: store the owner's goal and edit the proposal in place.
+
+        The goal's base point replaces the settings shown, a chosen variant is dropped.
+        Nothing is sliced and the PC is not woken. While the job is slicing the press is
+        answered like the slice button and nothing changes.
+        """
+        parsed = _goal_press(press.button_id)
+        assert parsed is not None
+        job_id, key = parsed
+        job = self._store.job(job_id)
+        if job is None:
+            log.warning("goal press for unknown job %d ignored", job_id)
+            return
+        name = job_name(job.name)
+        if job.status == "slicing":
+            await self._notifier.edit(press.message_id, self._busy_text(job))
+            return
+        try:
+            plan = self._plan(job, None, DEFAULT_NAMED_SET, None, (key, None))
+        except ValueError as exc:  # SlotUnusable too: the stored slot was emptied since
+            log.warning("job %d: goal press refused: %s", job.id, exc)
+            text = f"Не получилось выбрать цель для «{name}»: {md_literal(str(exc))}"
+            self._enqueue("job_goal", text, _job_key(job.id, "goal"))
+            return
+        chosen = _chosen_fields(None, (key, None))
+        # A slice claimed in the meantime keeps its own plan: the goal is not changed under it.
+        if not self._store.transition_job(job.id, CLAIMABLE, **chosen):
+            await self._notifier.edit(press.message_id, self._busy_text(job))
+            return
+        text, buttons = self._proposal(self._job(job.id), plan)
         if not await self._notifier.edit(press.message_id, text, buttons):
             log.warning("job %d: editing the proposal failed, sending it again", job.id)
             self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
@@ -1340,11 +1587,11 @@ class Service:
             return CHANGE_TEXT
         name = job_name(job.name)
         if job.status == "slicing":
-            return f"Уже режу «{name}»"
+            return self._busy_text(job)
         try:
             self.start_slice(job.id)
         except JobBusy:
-            return f"Уже режу «{name}»"
+            return self._busy_text(job)
         except ValueError as exc:
             log.warning("job %d: slice press refused: %s", job.id, exc)
             return f"Не получилось начать нарезку «{name}»: {md_literal(str(exc))}"
@@ -1352,6 +1599,480 @@ class Service:
             log.exception("job %d: slice press failed", job.id)
             return f"Не получилось начать нарезку «{name}»: внутренняя ошибка сервиса"
         return f"✂️ Режу «{name}», пришлю результат"
+
+    # -- jobs: the evaluation run («Подобрать») ------------------------------------
+
+    def _busy_text(self, job: Job) -> str:
+        """The answer to a press on a job that is being sliced or evaluated."""
+        name = job_name(job.name)
+        if job.id in self._evaluating or _eval_marker(job) is not None:
+            return f"Уже подбираю варианты для «{name}»"
+        return f"Уже режу «{name}»"
+
+    async def evaluate(self, job_id: int, goal: object = None, explicit: Mapping | None = None) -> str:
+        """``start_evaluate`` and wait for the run: returns the proposal text.
+
+        Raises what ``start_evaluate`` raises, and ``EvaluationFailed`` when the baseline did
+        not slice (the owner is told, nothing is stored). A cancelled caller never
+        interrupts the run.
+        """
+        text, error = await asyncio.shield(self.start_evaluate(job_id, goal, explicit))
+        if error is not None:
+            raise EvaluationFailed(error)
+        assert text is not None
+        return text
+
+    def start_evaluate(self, job_id: int, goal: object = None, explicit: Mapping | None = None) -> asyncio.Task:
+        """Claim the job and run its evaluation in the background. The task gives
+        (proposal text, None) or (None, the English reason of a failed run).
+
+        ``goal`` is the owner's goal and ``explicit`` the owner's settings, both stored with
+        the job first. Wakes the PC once and slices, one at a time: the balanced baseline
+        (the job with the balanced base point and the explicit settings, the ratio limits
+        and «прочность N×» compare with it), then the goal's grid over the goal's settings,
+        its base point among them, at most 6 in all. The winner becomes the job's ``variant``
+        layer. A ``sliced`` job loses its result (ruling R5: the PC file is overwritten) and
+        its pending start confirmations expire. Raises ``KeyError`` (unknown job),
+        ``ValueError`` (a kit, an unknown goal, settings that do not resolve) or ``JobBusy``
+        (slicing or evaluating already) before anything changes.
+        """
+        run = self._claim_eval(job_id, goal, None, explicit)
+        return self._spawn_eval(run)
+
+    def _spawn_eval(self, run: _EvalRun) -> asyncio.Task:
+        task = asyncio.create_task(self._run_eval(run), name=f"bambu-eval-{run.job.id}")
+        self._slice_tasks.add(task)
+        task.add_done_callback(self._slice_tasks.discard)
+        return task
+
+    def _claim_eval(
+        self, job_id: int, goal: object, message_id: str | None, explicit: Mapping | None = None
+    ) -> _EvalRun:
+        owner_goal = parse_goal(goal) if goal is not None else None
+        job = self._job(job_id)
+        if job.kind != "part":
+            raise ValueError(f"job {job.id} is a kit: the evaluation runs for parts only")
+        if job.status not in CLAIMABLE:
+            raise JobBusy(f"job {job.id} is being sliced or evaluated already")
+        fixed = {**_explicit(job), **(explicit or {})}
+        before_text, before_buttons = self._proposal(job, self._plan(job, None, DEFAULT_NAMED_SET))
+        plan = self._plan(job, fixed, DEFAULT_NAMED_SET, None, owner_goal, use_variant=False)
+        balanced = self._plan(
+            job, fixed, DEFAULT_NAMED_SET, None, owner_goal, use_variant=False, base_goal=DEFAULT_GOAL
+        )
+        primary, nozzle = plan.goal[0], plan.nozzle
+        settings = candidates(primary, fixed, plan.settings, plan.manifest.checks, nozzle, baseline=balanced.settings)
+        try:
+            target = base_variant(primary, fixed, plan.settings, nozzle)
+        except ValueError:
+            target = None
+        base_index = settings.index(target) if target in settings else None
+        prev_status = "new" if job.status == "sliced" else job.status
+        marker = {
+            "state": "running",
+            "prev_status": prev_status,
+            "message_id": message_id,
+            "before_text": before_text,
+            "before_buttons": _rows_json(before_buttons),
+            # A new goal drops the old evaluation, as a goal press does.
+            "previous": None if owner_goal is not None else job.variants_json,
+        }
+        fields: dict[str, Any] = {
+            **_chosen_fields(None, owner_goal),
+            "status": "slicing",  # the busy guard of slicing: presses and tools wait for the run
+            "variants_json": json.dumps(marker, ensure_ascii=False),
+            "error": None,
+        }
+        if explicit:
+            fields["explicit_json"] = json.dumps(fixed)
+        if job.status == "sliced":
+            # Ruling R5: every variant is sliced to the job's one PC file name, so the old
+            # result no longer matches the file on the PC.
+            fields.update(result_json=None, sliced_file=None)
+        with self._store.transaction():
+            if not self._store.transition_job(job.id, (job.status,), **fields):
+                raise JobBusy(f"job {job.id} is being sliced or evaluated already")
+            expired = self._store.expire_pending_confirmations(job.id, "start", REEVALUATED_OUTCOME)
+        if expired:
+            log.info("job %d: %d pending start confirmations expired by the evaluation", job.id, expired)
+        self._evaluating.add(job.id)
+        return _EvalRun(
+            job, plan, prev_status, settings, before_text, before_buttons, message_id,
+            marker["previous"], fixed, base_index,
+        )
+
+    async def _run_eval(self, run: _EvalRun) -> tuple[str | None, str | None]:
+        """(proposal text, None) or (None, the English reason). Never raises but on cancel.
+
+        A cancel (the service stops) leaves the job ``slicing`` with its running marker: the
+        next start gives it back (``_recover_evaluations``).
+        """
+        job = run.job
+        try:
+            try:
+                entries = await self._slice_variants(run)
+                data = self._eval_commit(run, entries)
+            except _SliceFailed as exc:
+                log.warning("job %d: evaluation failed: %s", job.id, exc.error)
+                await self._eval_failed(run, exc.text, exc.error)
+                return None, exc.error
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("evaluating job %d failed", job.id)
+                await self._eval_failed(run, INTERNAL_TEXT, "internal error in the service")
+                return None, "internal error in the service"
+            # Stored: whatever happens to the message now, the run did not fail.
+            return await self._eval_announce(run, data), None
+        finally:
+            self._evaluating.discard(job.id)
+
+    async def _slice_variants(self, run: _EvalRun) -> list[dict[str, Any]]:
+        """Slice the run's settings in order. A failed baseline raises ``_SliceFailed``."""
+        job, plan = run.job, run.plan
+        slicer = self._require_slicer()
+        data = await self._ready_to_slice(job, plan)
+        entries: list[dict[str, Any]] = []
+        for n, settings in enumerate(run.settings, 1):
+            variant_plan = replace(plan, settings=settings)
+            try:
+                outcome = await self._slice_once(job, variant_plan, slicer, data)
+            except _SliceFailed as exc:
+                if n == 1:
+                    raise
+                log.info("job %d: variant %d not sliced: %s", job.id, n, exc.error)
+                entries.append({"n": n, "status": "failed", "settings": settings, "error": exc.error})
+                continue
+            entries.append(self._variant_entry(n, settings, plan, outcome))
+        return entries
+
+    def _variant_entry(self, n: int, settings: dict, plan: SlicePlan, outcome: SliceOutcome) -> dict[str, Any]:
+        plates = [dict(p) for p in outcome.plates]
+        costs = [self._predict(sum(p["grams"].values()), p["minutes"], plan.spool, plan.material) for p in plates]
+        cost = sum_costs(costs)
+        pattern = settings.get("sparse_infill_pattern")
+        strength = strength_proxy(plates[0].get("features"), pattern if isinstance(pattern, str) else None)
+        return {
+            "n": n,
+            "status": "ok",
+            "settings": settings,
+            "minutes": sum(p["minutes"] for p in plates),
+            "grams": sum(sum(p["grams"].values()) for p in plates),
+            "cost": cost.total.amount if isinstance(cost, CostBreakdown) else None,
+            "currency": cost.currency if isinstance(cost, CostBreakdown) else cost.expected,
+            "strength": strength,
+        }
+
+    def _eval_commit(self, run: _EvalRun, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        """Score the run, store it with the winner as the job's variant, give the job back."""
+        job, plan = run.job, run.plan
+        primary = plan.goal[0]
+        metrics = [
+            VariantMetrics(
+                settings=e["settings"],
+                minutes=e.get("minutes"),
+                grams=e.get("grams"),
+                cost=e.get("cost"),
+                strength=e.get("strength"),
+                ok=e["status"] == "ok",
+            )
+            for e in entries
+        ]
+        ranking = score(metrics, (primary, plan.goal[1]), fixed=set(run.explicit), base_index=run.base_index)
+        winner = entries[ranking[0] if ranking else 0]
+        strength_unknown = (
+            GOALS[primary].score[0] == "strength"
+            and first_metric_unknown(metrics, primary)
+            and bool(ranking)
+            and ranking[0] == run.base_index
+        )
+        base_strength = entries[0].get("strength")
+        for e in entries:
+            s = e.get("strength")
+            e["strength_ratio"] = s / base_strength if s is not None and base_strength else None
+        data = {
+            "state": "done",
+            "goal": [primary, plan.goal[1]],
+            "chosen": winner["n"],
+            "strength_unknown": strength_unknown,
+            "variants": entries,
+        }
+        done = self._store.transition_job(
+            job.id,
+            ("slicing",),
+            status=run.prev_status,
+            variant_json=json.dumps(winner["settings"]),
+            variants_json=json.dumps(data, ensure_ascii=False),
+        )
+        if not done:
+            raise RuntimeError(f"job {job.id} left the slicing status during its evaluation")
+        log.info("job %d evaluated: %d variants, variant %d chosen", job.id, len(entries), winner["n"])
+        return data
+
+    async def _eval_announce(self, run: _EvalRun, data: dict[str, Any]) -> str:
+        """The proposal with the table: the pressed message edited, else a new message. Never raises."""
+        job = run.job
+        buttons: list[list[Button]] | None = None
+        try:
+            fresh = self._job(job.id)
+            text, buttons = self._proposal(fresh, self._plan(fresh, None, DEFAULT_NAMED_SET))
+        except Exception:
+            log.exception("job %d: the proposal after the evaluation failed, sending the table alone", job.id)
+            code, symbol = self._store.currency()
+            text = "\n".join([
+                job_name(job.name),
+                *render_variants(data["variants"], data["chosen"], symbol, code=code,
+                                 strength_unknown=data["strength_unknown"]),
+            ])
+        edited = False
+        if run.message_id is not None:
+            try:
+                edited = await self._notifier.edit(run.message_id, text, buttons)
+            except Exception:
+                log.exception("job %d: editing the proposal after the evaluation raised", job.id)
+        if not edited:
+            try:
+                self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
+            except Exception:
+                log.exception("job %d: queueing the proposal after the evaluation failed", job.id)
+        return text
+
+    async def _eval_failed(self, run: _EvalRun, reason: str, error: str) -> None:
+        """The job back to its status with the run recorded as ``failed`` (``error`` English, for
+        job_status), the owner told why (``reason``) and the proposal edited back."""
+        job = run.job
+        try:
+            with self._store.transaction():
+                self._store.transition_job(
+                    job.id,
+                    ("slicing",),
+                    status=run.prev_status,
+                    variants_json=_failed_record(run.previous, error, self._clock()),
+                    error=error,
+                )
+                self._enqueue(
+                    "job_failed",
+                    f"❌ Подбор вариантов для «{job_name(job.name)}» не удался: {reason}",
+                    _job_key(job.id, "eval-failed"),
+                )
+        except Exception:
+            log.exception("job %d: recording a failed evaluation did not work", job.id)
+            return
+        if run.message_id is not None:
+            await self._restore_proposal(job.id, run.message_id, run.before_text, run.before_buttons)
+
+    async def _restore_proposal(
+        self, job_id: int, message_id: str | None, before_text: str, before_buttons: list[list[Button]] | None
+    ) -> None:
+        """Edit the pressed proposal back after a run, rendered from the job as it is now (its
+        goal, no minutes of a slice ruling R5 cleared). ``before_text`` when that cannot be
+        rendered or the slots are not known yet. A new message when the edit fails. Never raises.
+        """
+        try:
+            text, buttons = before_text, before_buttons
+            if self._state.trays:
+                try:
+                    fresh = self._job(job_id)
+                    text, buttons = self._proposal(fresh, self._plan(fresh, None, DEFAULT_NAMED_SET))
+                except Exception:
+                    log.exception("job %d: rendering the proposal after a run failed, the old text goes back", job_id)
+            edited = False
+            if message_id is not None:
+                try:
+                    edited = await self._notifier.edit(message_id, text, buttons)
+                except Exception:
+                    log.exception("job %d: editing the proposal back raised", job_id)
+            if not edited:
+                self._enqueue("job_proposal", text, _job_key(job_id, "proposal"), buttons=buttons)
+        except Exception:
+            log.exception("job %d: restoring the proposal failed", job_id)
+
+    async def _recover_evaluations(self) -> None:
+        """Runs a stop or crash cut off: each job back to its status with the run recorded as
+        ``failed``, and the owner told to press «Подобрать» again. Before ``_fail_interrupted_jobs``,
+        which marks a job this could not give back. One job's failure never stops the others.
+        The proposals are edited back once the printer reports its slots (``_restore_later``).
+        """
+        for job in self._store.jobs_with_status("slicing"):
+            if _eval_marker(job) is None:
+                continue
+            try:
+                self._recover_evaluation(job)
+            except Exception:
+                log.exception("job %d: giving back an interrupted evaluation failed", job.id)
+
+    def _recover_evaluation(self, job: Job) -> None:
+        marker = _eval_marker(job)
+        assert marker is not None
+        prev = marker.get("prev_status") if marker.get("prev_status") in CLAIMABLE else "new"
+        previous = marker.get("previous") if isinstance(marker.get("previous"), str) else None
+        with self._store.transaction():
+            if not self._store.transition_job(
+                job.id,
+                ("slicing",),
+                status=prev,
+                variants_json=_failed_record(previous, EVAL_INTERRUPTED_ERROR, self._clock()),
+                error=EVAL_INTERRUPTED_ERROR,
+            ):
+                return
+            self._enqueue(
+                "job_eval_interrupted",
+                EVAL_INTERRUPTED_TEXT.format(name=job_name(job.name)),
+                _job_key(job.id, "eval-interrupted"),
+            )
+        log.info("job %d: an evaluation cut off by a restart was given back", job.id)
+        text = marker.get("before_text")
+        if not isinstance(text, str) or not text:
+            return
+        try:
+            buttons = _rows_buttons(marker.get("before_buttons"))
+        except (KeyError, TypeError):
+            buttons = None
+        message_id = marker.get("message_id") if isinstance(marker.get("message_id"), str) else None
+        task = asyncio.create_task(self._restore_later(job.id, message_id, text, buttons), name="bambu-eval-restore")
+        self._press_tasks.add(task)
+        task.add_done_callback(self._press_tasks.discard)
+
+    async def _restore_later(
+        self, job_id: int, message_id: str | None, before_text: str, before_buttons: list[list[Button]] | None
+    ) -> None:
+        """At start-up the slots are unknown until the printer reports: wait for that (at most
+        ``restore_wait_s``), then restore the proposal."""
+        if not self._state.trays:
+            waiter = asyncio.Event()
+            self._report_waiters.add(waiter)
+            try:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(waiter.wait(), self._restore_wait_s)
+            finally:
+                self._report_waiters.discard(waiter)
+        await self._restore_proposal(job_id, message_id, before_text, before_buttons)
+
+    async def _on_eval_press(self, press: Press) -> None:
+        """``job:<id>:eval``: run the evaluation in the background, the proposal says so meanwhile."""
+        job_id = _eval_press(press.button_id)
+        assert job_id is not None
+        job = self._store.job(job_id)
+        if job is None:
+            log.warning("eval press for unknown job %d ignored", job_id)
+            return
+        if job.status == "slicing":
+            await self._notifier.edit(press.message_id, self._busy_text(job))
+            return
+        try:
+            run = self._claim_eval(job.id, None, press.message_id)
+        except JobBusy:
+            await self._notifier.edit(press.message_id, self._busy_text(self._job(job.id)))
+            return
+        except ValueError as exc:
+            log.warning("job %d: eval press refused: %s", job.id, exc)
+            text = f"Не получилось подобрать варианты для «{job_name(job.name)}»: {md_literal(str(exc))}"
+            self._enqueue("job_eval", text, _job_key(job.id, "eval"))
+            return
+        await self._notifier.edit(press.message_id, f"{run.before_text}\n{EVALUATING_TEXT}", run.before_buttons)
+        self._spawn_eval(run)
+
+    # -- jobs: resetting the owner's explicit settings ---------------------------
+
+    async def reset_settings(self, job_id: int, keys: Sequence[str] | None = None) -> dict[str, object]:
+        """Clear the owner's explicit settings (``explicit_json``): all, or only ``keys``.
+
+        Returns the job's settings resolved after the reset. Nothing is sliced and the PC is
+        not woken. ``KeyError`` (unknown job), ``JobBusy`` (slicing or evaluating),
+        ``ValueError`` when the settings then do not resolve (a stored slot was emptied).
+        """
+        job = self._job(job_id)
+        if job.status not in CLAIMABLE:
+            raise JobBusy(f"job {job.id} is being sliced or evaluated already")
+        remaining = {} if keys is None else {k: v for k, v in _explicit(job).items() if k not in set(keys)}
+        # A slice or a run claimed in the meantime keeps its own plan.
+        if not self._store.transition_job(job.id, CLAIMABLE, explicit_json=json.dumps(remaining) if remaining else None):
+            raise JobBusy(f"job {job.id} is being sliced or evaluated already")
+        return self._plan(self._job(job.id), None, DEFAULT_NAMED_SET).settings
+
+    async def _on_reset_press(self, press: Press) -> None:
+        """``job:<id>:reset``: clear the explicit layer and edit the proposal in place. Never slices."""
+        job_id = _reset_press(press.button_id)
+        assert job_id is not None
+        job = self._store.job(job_id)
+        if job is None:
+            log.warning("reset press for unknown job %d ignored", job_id)
+            return
+        if job.status == "slicing":
+            await self._notifier.edit(press.message_id, self._busy_text(job))
+            return
+        if not self._store.transition_job(job.id, CLAIMABLE, explicit_json=None):
+            await self._notifier.edit(press.message_id, self._busy_text(self._job(job.id)))
+            return
+        try:
+            fresh = self._job(job.id)
+            text, buttons = self._proposal(fresh, self._plan(fresh, None, DEFAULT_NAMED_SET))
+        except ValueError as exc:  # SlotUnusable too: the stored slot was emptied since
+            log.warning("job %d: the proposal after a reset failed: %s", job.id, exc)
+            text = f"Мои настройки для «{job_name(job.name)}» сброшены, но предложение не собралось: {md_literal(str(exc))}"
+            self._enqueue("job_reset", text, _job_key(job.id, "reset"))
+            return
+        if not await self._notifier.edit(press.message_id, text, buttons):
+            log.warning("job %d: editing the proposal failed, sending it again", job.id)
+            self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
+
+    async def choose_variant(self, job_id: int, n: int) -> str:
+        """Make variant ``n`` of the job's last evaluation its ``variant`` layer and queue the
+        proposal. Returns its text. ``KeyError`` (unknown job), ``ValueError`` (no evaluation,
+        no such variant or one that failed), ``JobBusy`` (slicing or evaluating)."""
+        job = self._job(job_id)
+        if job.status not in CLAIMABLE:
+            raise JobBusy(f"job {job.id} is being sliced or evaluated already")
+        text, buttons = self._choose(job, n)
+        self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
+        return text
+
+    def _choose(self, job: Job, n: int) -> tuple[str, list[list[Button]]]:
+        data = _variants(job)
+        if data is None:
+            raise ValueError(f"job {job.id} has no evaluation: run evaluate_job first")
+        entries = data["variants"]
+        if type(n) is not int or not 1 <= n <= len(entries):
+            raise ValueError(f"variant {n} is out of range 1..{len(entries)}")
+        entry = next(v for v in entries if v["n"] == n)
+        if entry.get("status") != "ok" or not isinstance(entry.get("settings"), dict):
+            raise ValueError(f"variant {n} failed to slice and cannot be chosen")
+        data["chosen"] = n
+        fields = {
+            "variant_json": json.dumps(entry["settings"]),
+            "variants_json": json.dumps(data, ensure_ascii=False),
+        }
+        # A slice or a run claimed in the meantime keeps its own plan.
+        if not self._store.transition_job(job.id, CLAIMABLE, **fields):
+            raise JobBusy(f"job {job.id} is being sliced or evaluated already")
+        fresh = self._job(job.id)
+        return self._proposal(fresh, self._plan(fresh, None, DEFAULT_NAMED_SET))
+
+    async def _on_variant_press(self, press: Press) -> None:
+        """``job:<id>:variant:<n>``: choose the variant and edit the proposal in place."""
+        parsed = _variant_press(press.button_id)
+        assert parsed is not None
+        job_id, n = parsed
+        job = self._store.job(job_id)
+        if job is None:
+            log.warning("variant press for unknown job %d ignored", job_id)
+            return
+        if job.status == "slicing":
+            await self._notifier.edit(press.message_id, self._busy_text(job))
+            return
+        try:
+            text, buttons = self._choose(job, n)
+        except JobBusy:
+            await self._notifier.edit(press.message_id, self._busy_text(self._job(job.id)))
+            return
+        except ValueError as exc:  # SlotUnusable too: the stored slot was emptied since
+            log.warning("job %d: variant press refused: %s", job.id, exc)
+            text = f"Не получилось выбрать вариант для «{job_name(job.name)}»: {md_literal(str(exc))}"
+            self._enqueue("job_variant", text, _job_key(job.id, "variant"))
+            return
+        if not await self._notifier.edit(press.message_id, text, buttons):
+            log.warning("job %d: editing the proposal failed, sending it again", job.id)
+            self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
 
     # -- printing: prepare, confirm, start (phase 3) ------------------------------
 
@@ -1404,6 +2125,11 @@ class Service:
         )
         if check.blocking:
             raise PrintRefused(check.blocking)
+        try:
+            cost = self._predict(info.grams, info.minutes, target.spool, self._print_material(target, info))
+        except Exception:
+            log.exception("job %d: the confirmation's cost failed, sent without it", target.job.id)
+            cost = None
         text = render_start_confirmation(
             target.job.name,
             plate=plate if target.job.kind == "kit" else None,
@@ -1412,6 +2138,8 @@ class Service:
             grams=info.grams,
             plate_type=target.plate_type,
             warnings=check.warnings,
+            cost=cost,
+            symbol=self._store.currency()[1],
         )
         with self._store.transaction():
             confirmation = self._store.add_confirmation(
@@ -1424,7 +2152,11 @@ class Service:
                 now=self._clock().timestamp(),
             )
             self._enqueue(
-                "print_confirm", text, f"start|{_id_tag(confirmation.id)}", buttons=start_buttons(confirmation.id)
+                "print_confirm",
+                text,
+                f"start|{_id_tag(confirmation.id)}",
+                buttons=start_buttons(confirmation.id),
+                expires_at=confirmation.expires_at,
             )
         log.info("job %d plate %d: start confirmation sent", target.job.id, plate)
         return PrepareResult(confirmation.id, text, list(check.warnings))
@@ -1650,10 +2382,25 @@ class Service:
         task.add_done_callback(self._press_tasks.discard)
 
     async def _answer_spent(self, press: Press, confirm_id: str, texts: Mapping[str, str] = _SPENT_TEXTS) -> None:
+        """Answer a press on a used, expired or cancelled confirmation, in place or as a new message."""
         confirmation = self._store.confirmation(confirm_id)
         text = texts.get(confirmation.state) if confirmation is not None else None
-        if text is not None:
-            await self._notifier.edit(press.message_id, text)
+        if confirmation is not None and confirmation.outcome == REEVALUATED_OUTCOME:
+            text = REEVALUATED_TEXT
+        if text is None:
+            return
+        assert confirmation is not None
+        try:
+            edited = await self._notifier.edit(press.message_id, text)
+        except Exception:
+            log.exception("answering a spent %s press in place raised", confirmation.kind)
+            edited = False
+        if edited:
+            return
+        log.warning("answering a spent %s press in place failed, sending a new message", confirmation.kind)
+        self._enqueue(
+            f"{confirmation.kind}_spent", text, f"{confirmation.kind}|{_id_tag(confirm_id)}|spent|{press.seq}"
+        )
 
     async def _start_pressed(self, press: Press, confirm_id: str) -> None:
         """Holds the start lock (taken by the caller) until the start is decided."""
@@ -1950,7 +2697,11 @@ class Service:
                 now=self._clock().timestamp(),
             )
             self._enqueue(
-                "stop_confirm", text, f"stop|{_id_tag(confirmation.id)}", buttons=stop_buttons(confirmation.id)
+                "stop_confirm",
+                text,
+                f"stop|{_id_tag(confirmation.id)}",
+                buttons=stop_buttons(confirmation.id),
+                expires_at=confirmation.expires_at,
             )
         log.info("stop confirmation sent")
         return StopRequest(confirmation.id, text)
@@ -2127,24 +2878,224 @@ def _slot_press(button_id: str) -> tuple[int, int] | None:
     return job_id, number
 
 
-def _proposal(job: Job, plan: SlicePlan) -> tuple[str, list[list[Button]]]:
-    """The proposal's text and buttons: slice and change, then the slot rows."""
-    text = render_proposal(job, plan.settings, plan.choice, plan.plate_type, None)
-    warning = _preset_warning(plan)
-    if warning:
-        text = f"{text}\n{warning}"
+def _goal_press(button_id: str) -> tuple[int, str] | None:
+    """(job id, goal key) of a ``job:<id>:goal:<key>`` button, None for any other button."""
+    parts = button_id.split(":")
+    if len(parts) != 4 or parts[0] != "job" or parts[2] != "goal":
+        return None
+    if not (parts[1].isascii() and parts[1].isdigit()) or parts[3] not in GOAL_KEYS:
+        return None
+    return int(parts[1]), parts[3]
+
+
+def _eval_press(button_id: str) -> int | None:
+    """The job id of a ``job:<id>:eval`` button, None for any other button."""
+    parts = button_id.split(":")
+    if len(parts) != 3 or parts[0] != "job" or parts[2] != "eval":
+        return None
+    if not (parts[1].isascii() and parts[1].isdigit() and len(parts[1]) <= 18):
+        return None
+    return int(parts[1])
+
+
+def _reset_press(button_id: str) -> int | None:
+    """The job id of a ``job:<id>:reset`` button, None for any other button."""
+    parts = button_id.split(":")
+    if len(parts) != 3 or parts[0] != "job" or parts[2] != "reset":
+        return None
+    if not (parts[1].isascii() and parts[1].isdigit() and len(parts[1]) <= 18):
+        return None
+    return int(parts[1])
+
+
+def _variant_press(button_id: str) -> tuple[int, int] | None:
+    """(job id, variant number) of a ``job:<id>:variant:<n>`` button, None for any other button."""
+    parts = button_id.split(":")
+    if len(parts) != 4 or parts[0] != "job" or parts[2] != "variant":
+        return None
+    if not (parts[1].isascii() and parts[1].isdigit() and len(parts[1]) <= 18):
+        return None
+    if not (parts[3].isascii() and parts[3].isdigit() and len(parts[3]) <= 2):
+        return None
+    return int(parts[1]), int(parts[3])
+
+
+def _chosen_fields(slot: int | None, goal: tuple[str, str | None] | None) -> dict[str, Any]:
+    """Job fields for the owner's slot and goal: a new goal drops the chosen variant and the
+    evaluation (its variants were scored for the old goal)."""
+    chosen: dict[str, Any] = {"slot": slot} if slot is not None else {}
+    if goal is not None:
+        chosen.update(goal_json=goal_record(*goal), variant_json=None, variants_json=None)
+    return chosen
+
+
+def _variants(job: Job) -> dict | None:
+    """The job's last evaluation run (``jobs.variants_json``), None when it has none."""
+    try:
+        data = json.loads(job.variants_json or "null")
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("variants"), list):
+        return None
+    if not all(isinstance(v, dict) and type(v.get("n")) is int for v in data["variants"]):
+        return None
+    return data
+
+
+def _loads_dict(text: str | None) -> dict | None:
+    try:
+        value = json.loads(text or "null")
+    except (ValueError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _explicit(job: Job) -> dict[str, object]:
+    """The owner's explicit settings stored with the job (``explicit_json``), {} when none."""
+    return _loads_dict(job.explicit_json) or {}
+
+
+def _failed_record(previous: str | None, error: str, at: datetime) -> str:
+    """``variants_json`` after a run that failed or was cut off: state ``failed`` with the
+    English ``error`` and when. A previous run's variants stay (their buttons still work),
+    but the state says they are not this run's result."""
+    data = _loads_dict(previous) or {}
+    if data.get("state") == "running":
+        data = {}
+    record = {k: v for k, v in data.items() if k not in ("state", "error", "failed_at")}
+    record.update(state="failed", error=error, failed_at=at.astimezone(UTC).isoformat())
+    return json.dumps(record, ensure_ascii=False)
+
+
+def _chosen_entry(data: dict) -> dict | None:
+    """The chosen variant of an evaluation when it sliced, with usable minutes and grams."""
+    entry = next((v for v in data["variants"] if v.get("n") == data.get("chosen")), None)
+    if entry is None or entry.get("status") != "ok" or not isinstance(entry.get("settings"), dict):
+        return None
+    for key in ("minutes", "grams"):
+        value = entry.get(key)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            return None
+    return entry
+
+
+def _eval_marker(job: Job) -> dict | None:
+    """The running marker an evaluation run keeps in ``variants_json``, None when none runs."""
+    data = _loads_dict(job.variants_json)
+    return data if data is not None and data.get("state") == "running" else None
+
+
+def _last_primary(history: list[Job], name: str, exclude_id: int | None = None) -> str | None:
+    """The primary goal of the job ``last_settings`` takes the settings from (``history`` newest
+    first, ``exclude_id`` skipped as there)."""
+    for job in history:
+        if job.name != name or job.status != "sliced" or job.id == exclude_id or not job.settings_json:
+            continue
+        try:
+            if not isinstance(json.loads(job.settings_json), dict):
+                continue
+            return job_goal(job, parse_manifest(json.loads(job.manifest_json)))[0]
+        except (ValueError, RecursionError, ManifestError):
+            return None
+    return None
+
+
+def _variant(job: Job) -> dict | None:
+    """The job's chosen evaluation variant (a settings layer), None when it has none."""
+    try:
+        variant = json.loads(job.variant_json or "null")
+    except (ValueError, RecursionError):
+        return None
+    return variant if isinstance(variant, dict) else None
+
+
+def _proposal(
+    job: Job,
+    plan: SlicePlan,
+    cost: CostBreakdown | CurrencyMismatch | None,
+    symbol: str,
+    *,
+    code: str | None = None,
+    stale: bool = False,
+) -> tuple[str, list[list[Button]]]:
+    """The proposal's text and buttons: slice and change, the slot rows, the goal rows and,
+    for a part, «Подобрать», then the variant row after an evaluation. At most
+    ``MAX_BUTTONS``: the slot rows give way, and the goal rows to the variant row.
+    ``stale``: the cost's time is from a slice made with other settings."""
+    explicit = _explicit(job)
+    text = render_proposal(
+        job, plan.settings, plan.choice, plan.plate_type, None, cost, symbol=symbol, goal=plan.goal,
+        stale_minutes=stale, explicit=explicit,
+    )
+    for warning in (goal_warning(plan.goal[0], plan.settings), _preset_warning(plan)):
+        if warning:
+            text = f"{text}\n{warning}"
     choice = plan.choice
     chosen = None
     if choice.ams is not None and choice.slot is not None:
         chosen = slot_number(choice.ams, choice.slot)
-    buttons = [
-        [
-            Button(f"job:{job.id}:slice", SLICE_BUTTON_TEXT),
-            Button(f"job:{job.id}:change", CHANGE_BUTTON_TEXT),
-        ],
-        *slot_buttons(job.id, plan.usable, chosen),
-    ]
-    return text, buttons
+    data = _variants(job)
+    variants = variant_buttons(job.id, data["variants"], data.get("chosen")) if data is not None else []
+    if data is not None:
+        table = render_variants(
+            data["variants"], data.get("chosen"), symbol, code=code, strength_unknown=bool(data.get("strength_unknown"))
+        )
+        text = "\n".join([text, *table])
+    head = [Button(f"job:{job.id}:slice", SLICE_BUTTON_TEXT), Button(f"job:{job.id}:change", CHANGE_BUTTON_TEXT)]
+    goals = goal_buttons(job.id, plan.goal[0])
+    evaluate = eval_buttons(job.id) if plan.manifest.kind == "part" else []
+    reset = reset_buttons(job.id) if explicit else []
+    fixed = len(head) + sum(len(r) for r in (*evaluate, *variants, *reset))
+    if variants and fixed + sum(len(r) for r in goals) + len(plan.usable) > MAX_BUTTONS:
+        goals = []  # spec 5.8: after an evaluation the variant row replaces the goal rows
+    elif reset and fixed + sum(len(r) for r in goals) + len(plan.usable) > MAX_BUTTONS:
+        goals = _without_one_goal(goals, plan.goal[0])  # the reset button takes a goal's place
+    room = MAX_BUTTONS - fixed - sum(len(r) for r in goals)
+    rows = [head, *slot_buttons(job.id, plan.usable, chosen, room), *goals, *evaluate, *variants, *reset]
+    return text, rows
+
+
+def _without_one_goal(rows: list[list[Button]], current: str) -> list[list[Button]]:
+    """The goal rows less their last button that is not the ``current`` goal."""
+    flat = [b for row in rows for b in row]
+    drop = next(i for i in range(len(flat) - 1, -1, -1) if not flat[i].id.endswith(f":goal:{current}"))
+    flat = flat[:drop] + flat[drop + 1:]
+    return [flat[i : i + 4] for i in range(0, len(flat), 4)]
+
+
+def _sliced_minutes(job: Job) -> dict[int, float] | None:
+    """The minutes per plate of the job's last slice, None when it has none."""
+    try:
+        result = json.loads(job.result_json or "null")
+    except (ValueError, RecursionError):
+        return None
+    plates = result.get("plates") if isinstance(result, dict) else None
+    if not isinstance(plates, list):
+        return None
+    minutes: dict[int, float] = {}
+    for p in plates:
+        m = p.get("minutes") if isinstance(p, dict) else None
+        if type(p.get("index") if isinstance(p, dict) else None) is not int:
+            return None
+        if type(m) not in (int, float) or not math.isfinite(m) or m < 0:
+            return None
+        minutes[p["index"]] = float(m)
+    return minutes or None
+
+
+def _cost_json(index: int, cost: CostBreakdown | CurrencyMismatch) -> dict[str, Any]:
+    """A plate's predicted cost in the job result (the ``_uah`` names predate currencies)."""
+    if isinstance(cost, CurrencyMismatch):
+        return {"index": index, "currency": cost.expected, "error": cost.reason}
+    return {
+        "index": index,
+        "filament_uah": cost.plastic.amount if cost.plastic is not None else None,
+        "power_uah": cost.power.amount if cost.power is not None else None,
+        "amort": cost.amort.amount if cost.amort is not None else None,
+        "kwh": cost.kwh,
+        "total_uah": cost.total.amount,
+        "currency": cost.currency,
+    }
 
 
 def _job_key(job_id: int, what: str) -> str:
@@ -2234,6 +3185,7 @@ def extra_coroutines(
 async def _amain(secrets: Secrets, settings: Settings) -> None:
     store = Store(Path(settings.data_dir) / DB_NAME)
     store.migrate()
+    settings = with_country(settings, store.country())  # its timezone, unless config.toml has one
     notifier = build_notifier(secrets, settings)
     http = httpx.AsyncClient(trust_env=False)  # LAN only: no proxies from the environment
     slicer, waker = build_slicer(secrets, settings, http)
