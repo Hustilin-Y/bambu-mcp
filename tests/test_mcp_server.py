@@ -1080,6 +1080,31 @@ def test_override_keys_match_the_slice_agent_whitelist():
     assert {k for values in NAMED_SETS.values() for k in values} <= set(OVERRIDE_KEYS)
 
 
+def test_mcp_allowed_values_from_runner():
+    from bambu_mcp.mcp_server import OVERRIDE_KEYS, _allowed_values
+    from slice_agent import runner
+
+    new = ("top_shell_layers", "bottom_shell_layers", "outer_wall_speed", "seam_position", "ironing_type")
+    assert set(new) <= set(OVERRIDE_KEYS)
+    assert _allowed_values("top_shell_layers", "0.4") == "an integer {}..{}".format(*runner.SHELL_LAYERS_RANGE)
+    assert _allowed_values("bottom_shell_layers", "0.4") == "an integer {}..{}".format(*runner.SHELL_LAYERS_RANGE)
+    assert _allowed_values("outer_wall_speed", "0.4") == "a number {}..{} (mm/s)".format(*runner.OUTER_WALL_SPEED_RANGE)
+    assert _allowed_values("seam_position", "0.4") == ", ".join(runner.SEAM_POSITIONS)
+    assert _allowed_values("ironing_type", "0.4") == ", ".join(runner.IRONING_TYPES)
+    assert _allowed_values("wall_generator", "0.4") == ", ".join(runner.WALL_GENERATORS)
+
+
+def test_slice_job_settings_refuse_bad_new_values():
+    from bambu_mcp.mcp_server import ToolError, explicit_settings
+
+    explicit, _ = explicit_settings({"outer_wall_speed": 60, "seam_position": "back", "top_shell_layers": 6}, "0.4")
+    assert explicit == {"outer_wall_speed": 60, "seam_position": "back", "top_shell_layers": 6}
+    with pytest.raises(ToolError, match=r"seam_position: 'rear' is not allowed .*aligned, back, nearest, random"):
+        explicit_settings({"seam_position": "rear"}, "0.4")
+    with pytest.raises(ToolError, match=r"outer_wall_speed: 400 is not allowed .*20\.\.300"):
+        explicit_settings({"outer_wall_speed": 400}, "0.4")
+
+
 PATH_RUN = re.compile(r"[A-Za-z]:[\\/]|[^\s\\/<>]+[\\/]+[^\s\\/<>]+")
 
 

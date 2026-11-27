@@ -76,9 +76,13 @@ from bambu_mcp.store.models import Amortization, Job, Plate, PrintRow, Spool, Ta
 from slice_agent.runner import (
     BRIM_TYPES,
     DENSITY_RANGE,
+    IRONING_TYPES,
     LAYER_HEIGHTS,
+    OUTER_WALL_SPEED_RANGE,
     OVERRIDE_KEYS,
     PLATE_TYPES,
+    SEAM_POSITIONS,
+    SHELL_LAYERS_RANGE,
     SUPPORT_TYPES,
     WALL_GENERATORS,
     WALL_LOOPS_RANGE,
@@ -335,6 +339,11 @@ def _allowed_values(key: str, nozzle: str) -> str:
         "brim_type": ", ".join(BRIM_TYPES),
         "curr_bed_type": ", ".join(PLATE_TYPES),
         "layer_height": heights or f"nothing for nozzle {nozzle}",
+        "top_shell_layers": "an integer {}..{}".format(*SHELL_LAYERS_RANGE),
+        "bottom_shell_layers": "an integer {}..{}".format(*SHELL_LAYERS_RANGE),
+        "outer_wall_speed": "a number {}..{} (mm/s)".format(*OUTER_WALL_SPEED_RANGE),
+        "seam_position": ", ".join(SEAM_POSITIONS),
+        "ironing_type": ", ".join(IRONING_TYPES),
     }[key]
 
 
@@ -955,9 +964,10 @@ def build_mcp(
 
         `settings`: {"set": "standard" | "strong" | "draft"} and/or overrides: sparse_infill_density
         (0..100), sparse_infill_pattern, wall_loops (1..10), wall_generator, enable_support,
-        support_type, brim_type, curr_bed_type, layer_height. They win over the part's last
-        settings and its hints. `slot` (1..16) is the owner's choice of AMS slot: pass it only
-        when the owner names one. It is stored with the job. Without it the job's stored slot
+        support_type, brim_type, curr_bed_type, layer_height, top_shell_layers and
+        bottom_shell_layers (0..20), outer_wall_speed (20..300 mm/s), seam_position, ironing_type.
+        They win over the part's last settings and its hints. `slot` (1..16) is the owner's
+        choice of AMS slot: pass it only when the owner names one. It is stored with the job. Without it the job's stored slot
         is used, else the slot whose material matches the part. Follow it with job_status; the
         summary also goes to Telegram. `warning` is the AMS slot warning (a material mismatch,
         Russian) or null: tell the owner.
