@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,6 +17,15 @@ from bambu_mcp.logthrottle import Throttle
 from bambu_mcp.redact import redact
 
 log = logging.getLogger(__name__)
+
+# A newline that is not part of a blank line.
+_SINGLE_NEWLINE = re.compile(r"(?<!\n)\n(?!\n)")
+
+
+def paragraphs(text: str) -> str:
+    """Every single newline as a blank line. The add-in sends rich Markdown, where only a
+    blank line splits paragraphs and a lone newline collapses into a space."""
+    return _SINGLE_NEWLINE.sub("\n\n", text)
 
 EDIT_ATTEMPTS = 3
 BACKOFF_BASE_S = 1.0
@@ -219,7 +229,7 @@ class ServiceNotifyClient:
         expires_in: int | None = None,
         silent: bool = False,
     ) -> str | None:
-        payload: dict[str, Any] = {"text": text}
+        payload: dict[str, Any] = {"text": paragraphs(text)}
         if buttons:
             payload["buttons"] = _buttons_json(buttons)
         if files:
@@ -255,7 +265,7 @@ class ServiceNotifyClient:
     ) -> bool:
         payload: dict[str, Any] = {}
         if text is not None:
-            payload["text"] = text
+            payload["text"] = paragraphs(text)
         if buttons is not None:
             payload["buttons"] = _buttons_json(buttons)
         return await self._request("PATCH", f"/v1/messages/{message_id}", json=payload) is not None

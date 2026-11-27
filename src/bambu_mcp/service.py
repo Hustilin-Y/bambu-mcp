@@ -94,7 +94,7 @@ from bambu_mcp.messages import (
     variant_buttons,
 )
 from bambu_mcp.names import slug
-from bambu_mcp.notify import Button, LogNotifier, Notifier, Press, SendError, ServiceNotifyClient
+from bambu_mcp.notify import Button, LogNotifier, Notifier, Press, SendError, ServiceNotifyClient, paragraphs
 from bambu_mcp.printer import ftps
 from bambu_mcp.printer.ftps import UploadError
 from bambu_mcp.printer.hms import HmsTexts
@@ -1254,14 +1254,20 @@ class Service:
     def _proposal(self, job: Job, plan: SlicePlan) -> tuple[str, list[list[Button]]]:
         """The proposal's text and buttons: slice and change, then the slot rows.
 
-        The cost: the manifest's grams at the slot spool's price, and the minutes of the
-        job's last slice when it has one (else no electricity or amortization yet).
+        The cost: the chosen evaluation variant's sliced grams and minutes when it has them,
+        else the manifest's grams at the slot spool's price and the minutes of the job's last
+        slice when it has one (else no electricity or amortization yet).
         """
         sliced = _sliced_minutes(job)
         plates = plan.manifest.plates
         stale = False
+        data = _variants(job)
+        entry = _chosen_entry(data) if data is not None else None
         try:
-            if sliced is not None and all(p.index in sliced for p in plates):
+            if entry is not None:
+                stale = entry["settings"] != plan.settings
+                cost = self._predict(entry["grams"], entry["minutes"], plan.spool, plan.material)
+            elif sliced is not None and all(p.index in sliced for p in plates):
                 stale = _loads_dict(job.settings_json) != plan.settings
                 # Per plate, as the slice summary does: each plate heats up once.
                 cost = sum_costs(
@@ -1433,7 +1439,8 @@ class Service:
         }
         key = _job_key(job.id, "sliced")
         # A photo caption holds 1024 characters: a longer summary follows its picture.
-        split = png is not None and _caption_len(text) > CAPTION_MAX
+        # Counted as sent: the client turns each newline into a blank line.
+        split = png is not None and _caption_len(paragraphs(text)) > CAPTION_MAX
         picture_key = _job_key(job.id, "picture") if split else key
         folder = self._attachments_dir(notify_dedupe(picture_key)) if png else None
         try:
@@ -2956,6 +2963,18 @@ def _failed_record(previous: str | None, error: str, at: datetime) -> str:
     record = {k: v for k, v in data.items() if k not in ("state", "error", "failed_at")}
     record.update(state="failed", error=error, failed_at=at.astimezone(UTC).isoformat())
     return json.dumps(record, ensure_ascii=False)
+
+
+def _chosen_entry(data: dict) -> dict | None:
+    """The chosen variant of an evaluation when it sliced, with usable minutes and grams."""
+    entry = next((v for v in data["variants"] if v.get("n") == data.get("chosen")), None)
+    if entry is None or entry.get("status") != "ok" or not isinstance(entry.get("settings"), dict):
+        return None
+    for key in ("minutes", "grams"):
+        value = entry.get(key)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            return None
+    return entry
 
 
 def _eval_marker(job: Job) -> dict | None:

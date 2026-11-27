@@ -19,7 +19,7 @@ from bambu_mcp import jobs as jobs_module
 from bambu_mcp import mcp_server
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.evaluation import GOALS
-from bambu_mcp.messages import render_proposal, render_sliced
+from bambu_mcp.messages import render_cost, render_proposal, render_sliced
 from bambu_mcp.names import slug
 from bambu_mcp.notify import Button, LogNotifier, Press, SendError, ServiceNotifyClient
 from bambu_mcp.printer.ftps import UploadError
@@ -2233,6 +2233,23 @@ async def test_choose_variant_refusals(tmp_path):
         with pytest.raises(ValueError, match="variant"):
             await service.choose_variant(job.id, n)
     assert json.loads(store.job(job.id).variants_json)["chosen"] == 6
+    store.close()
+
+
+async def test_chosen_variant_prices_the_proposal_header(tmp_path):
+    service, store, _ = job_service(tmp_path, EvalSlicer())
+    spool_id = add_spool(store)
+    store.add_amortization(date(2026, 1, 1), 30000.0, 5000.0, 2.0)  # 8.00 an hour
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    await service.evaluate(job.id)
+    text = await service.choose_variant(job.id, 2)  # 3 walls, 25 %: 95 min, 9.5 g
+    lines = text.split("\n")
+    spool = next(s for s in store.spools() if s.id == spool_id)
+    cost = predict_cost(9.5, 95.0, spool, "PETG", store.tariff_on(T0.date()), store.amortization_on(T0.date()),
+                        service._settings, T0, currency="UAH")
+    assert lines[1:5] == render_cost(cost, "грн", start_now=True)
+    assert lines[3] == "амортизация 12.67 грн (95 мин × 8.00 грн/ч)"
+    assert "время неизвестно до нарезки" not in text and "по прошлой нарезке" not in text
     store.close()
 
 
