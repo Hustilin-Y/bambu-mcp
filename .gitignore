@@ -12,3 +12,4 @@ spike/in/
 spike/out/
 spike/dm/
 spike/cube.gcode.3mf
+/hms*.json

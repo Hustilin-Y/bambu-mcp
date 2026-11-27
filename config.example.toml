@@ -1,0 +1,32 @@
+# bambu-mcp settings. Every key is shown with its default unless noted.
+# Secrets (access code, serial, host, tokens) live in .env, never here.
+# Deployed copy: /srv/bambu/config.toml (override the path with BAMBU_CONFIG).
+
+# Relative paths resolve against the working directory (the app dir), so the
+# deployed config must set an absolute path. Holds bambu.db, hms_en_22E.json
+# and the CA bundle.
+data_dir = "data"
+
+# "host:port" entries. PC client on the LAN address, assistant on loopback.
+# MCP clients must connect by one of these addresses (Host header allowlist).
+listen = ["192.168.88.11:8765", "127.0.0.1:8765"]
+
+# "ca": verify chain against the Bambu root bundle, check CN == serial
+#       (needs ca_file and BAMBU_SERIAL).
+# "ca-no-hostname": chain only (needs ca_file).
+# "pin": compare cert_sha256.
+tls_mode = "ca"
+# ca_file = "/srv/bambu/data/bambu.cert"
+# cert_sha256 = "<hex sha256 of the printer certificate>"
+
+# service-notify add-in of the multiclaude assistant (loopback, default port 8790).
+# Without notify_url and NOTIFY_TOKEN notifications go to the log only.
+# notify_url = "http://127.0.0.1:8790"
+
+camera_backend = "pyav"
+heatup_kwh = 0.05
+timezone = "Europe/Kyiv"
+
+# Average power draw per filament type, watts.
+[power_w]
+PLA = 200.0
