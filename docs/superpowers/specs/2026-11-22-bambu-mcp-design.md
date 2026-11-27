@@ -164,6 +164,8 @@ A kit is sliced once, each plate is its own print, confirmation and journal row.
 
 **Later.** Multi-colour, queue, tolerance suggestions, OrcaSlicer, live camera, timelapse download, AMS drying.
 
+**Later, asked by the owner (2026-11-27): evaluation mode.** On request ("оцени", or a button on the proposal) the service picks the best settings for the part and sets them on the job: infill density and pattern, wall loops, top and bottom shells, supports, brim, and layer height where the whitelist allows it. It slices a few candidate variants on the PC (within the existing override whitelist), compares time, grams and cost, and weighs them against the part's purpose: the manifest's checks, its `PRINT_HINTS`, and the load or strength intent when one is given. Then it proposes the winner with a short comparison table, and the owner keeps it, picks another variant, or edits it. The chosen settings are stored as the job's explicit settings (R6). Open for the design: the scoring rule (strength proxy vs time and cost), the number of variants per run (each is a slice on the PC), and whether the PC stays awake through the batch under one lease.
+
 ## 13. MCP tools
 
 - Read: `printer_status`, `ams_status`, `camera_snapshot`, `job_status`, `print_history(part)`, `spools`, `plates`.
