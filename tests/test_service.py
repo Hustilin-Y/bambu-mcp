@@ -2073,7 +2073,11 @@ async def test_failed_variant_skipped_failed_baseline_restores(harness):
     assert harness.notifier.edits[1] == ("m9", before)
     assert len(slicer.requests) == count + 1  # nothing after the baseline
     stored = harness.store.job(other.id)
-    assert stored.status == "new" and stored.variants_json is None and stored.variant_json is None
+    assert stored.status == "new" and stored.variant_json is None and stored.error == "агент: no preset"
+    # The failure is recorded for job_status: no table, state failed with the reason.
+    assert json.loads(stored.variants_json) == {
+        "state": "failed", "error": "агент: no preset", "failed_at": T0.isoformat()
+    }
     await until(lambda: harness.store.outbox_count() == 0)
     assert harness.notifier.sent[-1]["text"] == "❌ Подбор вариантов для «lamp-arm» не удался: агент: no preset"
 
@@ -2276,30 +2280,84 @@ async def test_button_count_within_24_after_an_evaluation(tmp_path):
     small_store.close()
 
 
+def _running_marker(job_id: int, previous: str | None) -> str:
+    marker = {
+        "state": "running", "prev_status": "new", "message_id": "m4", "previous": previous,
+        "before_text": "BEFORE", "before_buttons": [[{"id": f"job:{job_id}:eval", "text": "🔍 Подобрать"}]],
+    }
+    return json.dumps(marker, ensure_ascii=False)
+
+
+INTERRUPTED_NOTICE = (
+    "Подбор вариантов для «lamp-arm» не закончен: подбор прерван перезапуском сервиса. "
+    "Нажми «🔍 Подобрать» ещё раз"
+)
+
+
 async def test_interrupted_evaluation_is_restored_at_startup(harness):
     harness.slicer, harness.waker = EvalSlicer(), FakeWaker()
     harness.settings = job_settings(harness.settings.data_dir)
+    harness.service_kwargs = {"restore_wait_s": 0.3}
     add_spool(harness.store)
     job = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
-    previous = json.dumps({"variants": [], "chosen": None})
-    marker = {
-        "state": "running", "prev_status": "new", "message_id": "m4", "previous": previous,
-        "before_text": "BEFORE", "before_buttons": [[{"id": f"job:{job.id}:eval", "text": "🔍 Подобрать"}]],
-    }
-    harness.store.update_job(job.id, status="slicing", variants_json=json.dumps(marker, ensure_ascii=False))
+    entry = {"n": 1, "status": "ok", "settings": {"wall_loops": 3}, "minutes": 85.0, "grams": 8.5,
+             "cost": 5.0, "currency": "UAH", "strength": None, "strength_ratio": None}
+    previous = json.dumps({"state": "done", "chosen": 1, "variants": [entry]})
+    # The run was started with the owner's new goal: the restored proposal must name it.
+    harness.store.update_job(
+        job.id, status="slicing", variants_json=_running_marker(job.id, previous),
+        goal_json=json.dumps({"primary": "speed", "secondary": None, "source": "owner"}),
+    )
 
-    await harness.start()
+    service = await harness.start()
+    service._state = replace(PrinterState.empty(), trays=TRAYS)
+    await until(lambda: harness.notifier.edits)
     await until(lambda: harness.store.outbox_count() == 0 and harness.notifier.sent)
 
     stored = harness.store.job(job.id)
-    assert stored.status == "new" and stored.variants_json == previous
-    assert harness.notifier.edits == [("m4", "BEFORE")]
-    assert harness.notifier.edit_buttons[0] == [[Button(f"job:{job.id}:eval", "🔍 Подобрать")]]
-    sent = texts(harness.notifier)
-    assert sent == [
-        "Подбор вариантов для «lamp-arm» не закончен: подбор прерван перезапуском сервиса. "
-        "Нажми «🔍 Подобрать» ещё раз"
-    ]
+    assert stored.status == "new" and stored.error == "evaluation interrupted by a service restart"
+    record = json.loads(stored.variants_json)
+    # The earlier table is kept, but the state says this run failed: it is not the result.
+    assert (record["state"], record["error"], record["chosen"]) == (
+        "failed", "evaluation interrupted by a service restart", 1
+    )
+    status = mcp_server._job_evaluation(harness.store, stored)
+    assert status["state"] == "failed" and status["error"] == "evaluation interrupted by a service restart"
+    assert status["previous"]["chosen"] == 1 and len(status["previous"]["table"]) == 1
+    # The proposal is rendered from the job as it is now (its goal), not the old text.
+    message_id, text = harness.notifier.edits[0]
+    assert message_id == "m4" and text != "BEFORE"
+    assert text.startswith("lamp-arm, пластина 1:") and "цель: быстро (выбрал ты)" in text
+    assert texts(harness.notifier) == [INTERRUPTED_NOTICE]
+
+
+async def test_one_failed_recovery_does_not_leave_other_jobs_running(harness, monkeypatch):
+    harness.slicer, harness.waker = EvalSlicer(), FakeWaker()
+    harness.settings = job_settings(harness.settings.data_dir)
+    harness.service_kwargs = {"restore_wait_s": 0.1}
+    add_spool(harness.store)
+    broken = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
+    fine = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
+    for job in (broken, fine):
+        harness.store.update_job(job.id, status="slicing", variants_json=_running_marker(job.id, None))
+    original = Service._recover_evaluation
+
+    def recover(self, job):
+        if job.id == broken.id:
+            raise RuntimeError("store error")
+        return original(self, job)
+
+    monkeypatch.setattr(Service, "_recover_evaluation", recover)
+    await harness.start()
+    await until(lambda: harness.store.outbox_count() == 0 and len(harness.notifier.sent) == 2)
+
+    assert harness.store.job(fine.id).status == "new"
+    stuck = harness.store.job(broken.id)
+    # _fail_interrupted_jobs marks it, and drops the running marker: never "running" forever.
+    assert stuck.status == "slice_failed"
+    assert json.loads(stuck.variants_json)["state"] == "failed"
+    assert mcp_server._job_evaluation(harness.store, stuck)["state"] == "failed"
+    assert INTERRUPTED_NOTICE in texts(harness.notifier)
 
 
 async def test_a_failed_edit_after_the_run_is_not_reported_as_a_failure(harness):

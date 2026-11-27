@@ -524,20 +524,27 @@ def _job_variants(job: Job | None) -> dict[str, Any]:
 
 
 def _job_evaluation(store: Store, job: Job) -> dict[str, Any] | None:
-    """The job's evaluation: ``running``, or ``done`` with the variants and the table's lines."""
+    """The job's evaluation: ``running``, ``done`` with the variants and the table's lines, or
+    ``failed`` with the English ``error`` and ``failed_at`` (and an earlier run's table under
+    ``previous``, which is not this run's result)."""
     data = _loads(job.variants_json)
     if data is None:
         return None
-    if data.get("state") == "running":
+    state = data.get("state")
+    if state == "running":
         return {"state": "running"}
     entries = data.get("variants")
-    if not isinstance(entries, list) or not all(isinstance(v, dict) and type(v.get("n")) is int for v in entries):
-        return None
-    code, symbol = store.currency()
-    table = render_variants(
-        entries, data.get("chosen"), symbol, code=code, strength_unknown=bool(data.get("strength_unknown"))
-    )
-    return {"state": "done", **_job_variants(job), "table": table[1:]}
+    done = None
+    if isinstance(entries, list) and all(isinstance(v, dict) and type(v.get("n")) is int for v in entries):
+        code, symbol = store.currency()
+        table = render_variants(
+            entries, data.get("chosen"), symbol, code=code, strength_unknown=bool(data.get("strength_unknown"))
+        )
+        done = {**_job_variants(job), "table": table[1:]}
+    if state == "failed":
+        failed = {"state": "failed", "error": data.get("error"), "failed_at": data.get("failed_at")}
+        return {**failed, "previous": done} if done is not None else failed
+    return {"state": "done", **done} if done is not None else None
 
 
 def _job_goal(job: Job) -> dict[str, Any] | None:
@@ -1114,7 +1121,9 @@ def build_mcp(
         The run takes minutes. Within 90 s this returns `status` "done" with the same text,
         `chosen` (the ✓ variant) and `variants`. Otherwise `status` "evaluating": the run goes
         on, the table goes to Telegram, and job_status shows it under `evaluation` when done.
-        Follow with choose_variant or slice_job.
+        A run that fails (or a restart cuts off) shows there as state "failed" with `error`:
+        a table under `previous` is an earlier run's, not this one's. Follow with
+        choose_variant or slice_job.
         """
         job = job_or_error(job_id)
         explicit, _named = explicit_settings(settings, _job_nozzle(job))  # a set is expanded into it
@@ -1160,8 +1169,9 @@ def build_mcp(
     @mcp.tool(annotations=READ)
     async def job_status(job_id: int) -> dict[str, Any]:
         """A job: status, settings, the owner's explicit settings, AMS slot it was sliced with,
-        the owner's chosen slot (1..16 or null: by material), goal, the evaluation (`running`, or
-        `done` with its variants and table lines), plate type, nozzle, per-plate minutes, grams
+        the owner's chosen slot (1..16 or null: by material), goal, the evaluation (`running`,
+        `done` with its variants and table lines, or `failed` with `error` and `failed_at`),
+        plate type, nozzle, per-plate minutes, grams
         and cost (in its currency), the sliced file name, the slot warning (material mismatch)
         and the last error."""
         return _job_status(store, job_or_error(job_id), tz)

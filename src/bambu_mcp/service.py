@@ -208,6 +208,8 @@ NOT_SLICED_TEXT = "Задание «{name}» не нарезано, сначал
 # A start confirmation an evaluation run made stale (ruling R5: the PC file is re-sliced).
 REEVALUATED_OUTCOME = "reevaluated"
 REEVALUATED_TEXT = "⌛ Настройки подбираются заново, подготовь печать после подбора"
+EVAL_INTERRUPTED_ERROR = "evaluation interrupted by a service restart"
+RESTORE_WAIT_S = 60.0  # at start-up, how long a cut-off run's proposal waits for the slots
 EVAL_INTERRUPTED_TEXT = (
     "Подбор вариантов для «{name}» не закончен: подбор прерван перезапуском сервиса. "
     "Нажми «🔍 Подобрать» ещё раз"
@@ -463,6 +465,7 @@ class Service:
         watch_s: float = START_WATCH_S,
         report_wait_s: float = REPORT_WAIT_S,
         upload_timeout_s: float = UPLOAD_TIMEOUT_S,
+        restore_wait_s: float = RESTORE_WAIT_S,
     ) -> None:
         self._secrets = secrets
         self._settings = settings
@@ -507,6 +510,7 @@ class Service:
         self._press_tasks: set[asyncio.Task] = set()  # starts and prepares run off the press loop
         self._preparing: set[int] = set()  # job ids with a prepare from a button in flight
         self._report_waiters: set[asyncio.Event] = set()
+        self._restore_wait_s = restore_wait_s
         self._watch: _StartWatch | None = None
         self._own_tasks: set[str] = set()  # task ids this process sent: their start gets the stop button
         self._last_task_id = 0
@@ -1456,11 +1460,13 @@ class Service:
             raise
         log.info("job %d sliced: %s", job.id, outcome.file)
 
-    def _fail_job(self, job: Job, error: str, text: str) -> None:
-        """``slicing`` -> ``slice_failed`` with ``error``, and tell the owner ``text``."""
+    def _fail_job(self, job: Job, error: str, text: str, **fields: Any) -> None:
+        """``slicing`` -> ``slice_failed`` with ``error`` (and ``fields``), and tell the owner ``text``."""
         try:
             with self._store.transaction():
-                if self._store.transition_job(job.id, ("slicing",), status="slice_failed", error=error):
+                if self._store.transition_job(
+                    job.id, ("slicing",), status="slice_failed", error=error, **fields
+                ):
                     self._enqueue(
                         "job_failed",
                         f"❌ Нарезка «{job_name(job.name)}» не удалась: {text}",
@@ -1472,7 +1478,12 @@ class Service:
     def _fail_interrupted_jobs(self) -> None:
         """Jobs left ``slicing`` by a stop that could not mark them: no slice runs for them now."""
         for job in self._store.jobs_with_status("slicing"):
-            self._fail_job(job, "interrupted by a service restart", "прервано перезапуском сервиса")
+            fields: dict[str, Any] = {}
+            marker = _eval_marker(job)
+            if marker is not None:  # an evaluation _recover_evaluations could not give back
+                previous = marker.get("previous") if isinstance(marker.get("previous"), str) else None
+                fields["variants_json"] = _failed_record(previous, EVAL_INTERRUPTED_ERROR, self._clock())
+            self._fail_job(job, "interrupted by a service restart", "прервано перезапуском сервиса", **fields)
 
     async def _on_slot_press(self, press: Press) -> None:
         """``job:<id>:slot:<n>``: store the slot and edit the proposal in place with it chosen.
@@ -1690,13 +1701,13 @@ class Service:
                 data = self._eval_commit(run, entries)
             except _SliceFailed as exc:
                 log.warning("job %d: evaluation failed: %s", job.id, exc.error)
-                await self._eval_failed(run, exc.text)
+                await self._eval_failed(run, exc.text, exc.error)
                 return None, exc.error
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("evaluating job %d failed", job.id)
-                await self._eval_failed(run, INTERNAL_TEXT)
+                await self._eval_failed(run, INTERNAL_TEXT, "internal error in the service")
                 return None, "internal error in the service"
             # Stored: whatever happens to the message now, the run did not fail.
             return await self._eval_announce(run, data), None
@@ -1813,59 +1824,116 @@ class Service:
                 log.exception("job %d: queueing the proposal after the evaluation failed", job.id)
         return text
 
-    async def _eval_failed(self, run: _EvalRun, reason: str) -> None:
-        """The job back to its status, the proposal back to its text, and the owner told why."""
+    async def _eval_failed(self, run: _EvalRun, reason: str, error: str) -> None:
+        """The job back to its status with the run recorded as ``failed`` (``error`` English, for
+        job_status), the owner told why (``reason``) and the proposal edited back."""
         job = run.job
         try:
             with self._store.transaction():
                 self._store.transition_job(
-                    job.id, ("slicing",), status=run.prev_status, variants_json=run.previous
+                    job.id,
+                    ("slicing",),
+                    status=run.prev_status,
+                    variants_json=_failed_record(run.previous, error, self._clock()),
+                    error=error,
                 )
                 self._enqueue(
                     "job_failed",
                     f"❌ Подбор вариантов для «{job_name(job.name)}» не удался: {reason}",
                     _job_key(job.id, "eval-failed"),
                 )
-            if run.message_id is not None:
-                await self._notifier.edit(run.message_id, run.before_text, run.before_buttons)
         except Exception:
-            log.exception("job %d: restoring after a failed evaluation did not work", job.id)
+            log.exception("job %d: recording a failed evaluation did not work", job.id)
+            return
+        if run.message_id is not None:
+            await self._restore_proposal(job.id, run.message_id, run.before_text, run.before_buttons)
 
-    async def _recover_evaluations(self) -> None:
-        """Runs a stop or crash cut off: the job back to its status, the proposal back to its
-        text, and the owner told to press «Подобрать» again. Before ``_fail_interrupted_jobs``."""
-        for job in self._store.jobs_with_status("slicing"):
-            marker = _eval_marker(job)
-            if marker is None:
-                continue
-            prev = marker.get("prev_status") if marker.get("prev_status") in CLAIMABLE else "new"
-            previous = marker.get("previous") if isinstance(marker.get("previous"), str) else None
-            with self._store.transaction():
-                if not self._store.transition_job(
-                    job.id, ("slicing",), status=prev, variants_json=previous, error=None
-                ):
-                    continue
-                self._enqueue(
-                    "job_eval_interrupted",
-                    EVAL_INTERRUPTED_TEXT.format(name=job_name(job.name)),
-                    _job_key(job.id, "eval-interrupted"),
-                )
-            log.info("job %d: an evaluation cut off by a restart was given back", job.id)
-            message_id, text = marker.get("message_id"), marker.get("before_text")
-            if not isinstance(text, str) or not text:
-                continue
-            try:
-                buttons = _rows_buttons(marker.get("before_buttons"))
-            except (KeyError, TypeError):
-                buttons = None
+    async def _restore_proposal(
+        self, job_id: int, message_id: str | None, before_text: str, before_buttons: list[list[Button]] | None
+    ) -> None:
+        """Edit the pressed proposal back after a run, rendered from the job as it is now (its
+        goal, no minutes of a slice ruling R5 cleared). ``before_text`` when that cannot be
+        rendered or the slots are not known yet. A new message when the edit fails. Never raises.
+        """
+        try:
+            text, buttons = before_text, before_buttons
+            if self._state.trays:
+                try:
+                    fresh = self._job(job_id)
+                    text, buttons = self._proposal(fresh, self._plan(fresh, None, DEFAULT_NAMED_SET))
+                except Exception:
+                    log.exception("job %d: rendering the proposal after a run failed, the old text goes back", job_id)
             edited = False
-            if isinstance(message_id, str):
+            if message_id is not None:
                 try:
                     edited = await self._notifier.edit(message_id, text, buttons)
                 except Exception:
-                    log.exception("job %d: restoring the proposal after a restart raised", job.id)
+                    log.exception("job %d: editing the proposal back raised", job_id)
             if not edited:
-                self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
+                self._enqueue("job_proposal", text, _job_key(job_id, "proposal"), buttons=buttons)
+        except Exception:
+            log.exception("job %d: restoring the proposal failed", job_id)
+
+    async def _recover_evaluations(self) -> None:
+        """Runs a stop or crash cut off: each job back to its status with the run recorded as
+        ``failed``, and the owner told to press «Подобрать» again. Before ``_fail_interrupted_jobs``,
+        which marks a job this could not give back. One job's failure never stops the others.
+        The proposals are edited back once the printer reports its slots (``_restore_later``).
+        """
+        for job in self._store.jobs_with_status("slicing"):
+            if _eval_marker(job) is None:
+                continue
+            try:
+                self._recover_evaluation(job)
+            except Exception:
+                log.exception("job %d: giving back an interrupted evaluation failed", job.id)
+
+    def _recover_evaluation(self, job: Job) -> None:
+        marker = _eval_marker(job)
+        assert marker is not None
+        prev = marker.get("prev_status") if marker.get("prev_status") in CLAIMABLE else "new"
+        previous = marker.get("previous") if isinstance(marker.get("previous"), str) else None
+        with self._store.transaction():
+            if not self._store.transition_job(
+                job.id,
+                ("slicing",),
+                status=prev,
+                variants_json=_failed_record(previous, EVAL_INTERRUPTED_ERROR, self._clock()),
+                error=EVAL_INTERRUPTED_ERROR,
+            ):
+                return
+            self._enqueue(
+                "job_eval_interrupted",
+                EVAL_INTERRUPTED_TEXT.format(name=job_name(job.name)),
+                _job_key(job.id, "eval-interrupted"),
+            )
+        log.info("job %d: an evaluation cut off by a restart was given back", job.id)
+        text = marker.get("before_text")
+        if not isinstance(text, str) or not text:
+            return
+        try:
+            buttons = _rows_buttons(marker.get("before_buttons"))
+        except (KeyError, TypeError):
+            buttons = None
+        message_id = marker.get("message_id") if isinstance(marker.get("message_id"), str) else None
+        task = asyncio.create_task(self._restore_later(job.id, message_id, text, buttons), name="bambu-eval-restore")
+        self._press_tasks.add(task)
+        task.add_done_callback(self._press_tasks.discard)
+
+    async def _restore_later(
+        self, job_id: int, message_id: str | None, before_text: str, before_buttons: list[list[Button]] | None
+    ) -> None:
+        """At start-up the slots are unknown until the printer reports: wait for that (at most
+        ``restore_wait_s``), then restore the proposal."""
+        if not self._state.trays:
+            waiter = asyncio.Event()
+            self._report_waiters.add(waiter)
+            try:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(waiter.wait(), self._restore_wait_s)
+            finally:
+                self._report_waiters.discard(waiter)
+        await self._restore_proposal(job_id, message_id, before_text, before_buttons)
 
     async def _on_eval_press(self, press: Press) -> None:
         """``job:<id>:eval``: run the evaluation in the background, the proposal says so meanwhile."""
@@ -2818,6 +2886,18 @@ def _loads_dict(text: str | None) -> dict | None:
 def _explicit(job: Job) -> dict[str, object]:
     """The owner's explicit settings stored with the job (``explicit_json``), {} when none."""
     return _loads_dict(job.explicit_json) or {}
+
+
+def _failed_record(previous: str | None, error: str, at: datetime) -> str:
+    """``variants_json`` after a run that failed or was cut off: state ``failed`` with the
+    English ``error`` and when. A previous run's variants stay (their buttons still work),
+    but the state says they are not this run's result."""
+    data = _loads_dict(previous) or {}
+    if data.get("state") == "running":
+        data = {}
+    record = {k: v for k, v in data.items() if k not in ("state", "error", "failed_at")}
+    record.update(state="failed", error=error, failed_at=at.astimezone(UTC).isoformat())
+    return json.dumps(record, ensure_ascii=False)
 
 
 def _eval_marker(job: Job) -> dict | None:

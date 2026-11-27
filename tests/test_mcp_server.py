@@ -849,6 +849,7 @@ class GatedSlicer:
     def __init__(self) -> None:
         self.hold = threading.Event()
         self.requests: list = []
+        self.detail: str | None = None  # set: every slice fails with this detail
 
     async def health(self) -> bool:
         return True
@@ -857,6 +858,8 @@ class GatedSlicer:
         self.requests.append(job)
         while self.hold.is_set():
             await asyncio.sleep(0.01)
+        if self.detail is not None:
+            return SliceOutcome("failed", detail=self.detail)
         return SliceOutcome("ok", file=job.out_file, plates=SLICED_PLATES, slicer_version="02.08.02.61")
 
     async def fetch_png(self, name, plate):
@@ -1347,6 +1350,29 @@ def test_evaluate_job_returns_while_the_run_goes_on(jh, monkeypatch):
     jh.wait_status(job_id, "new")
     evaluation = jh.call("job_status", job_id=job_id)["evaluation"]
     assert evaluation["state"] == "done" and len(evaluation["table"]) == 7
+
+
+def test_a_failed_background_run_shows_in_job_status(jh, monkeypatch):
+    job_id = jh.add_job(hints=EVAL_HINTS)
+    assert jh.call("evaluate_job", job_id=job_id)["status"] == "done"  # an earlier run's table
+    monkeypatch.setattr(mcp_server, "EVAL_WAIT_S", 0.2)
+    jh.slicer.hold.set()
+    assert jh.call("evaluate_job", job_id=job_id)["status"] == "evaluating"
+    jh.slicer.detail = "no filament preset"
+    jh.slicer.hold.clear()
+    jh.wait_status(job_id, "new")
+    status = jh.call("job_status", job_id=job_id)
+    assert status["error"] == "no filament preset"
+    evaluation = status["evaluation"]
+    assert (evaluation["state"], evaluation["error"]) == ("failed", "no filament preset")
+    assert evaluation["failed_at"]
+    # The earlier table is there, marked as not this run's.
+    assert evaluation["previous"]["chosen"] == 4 and len(evaluation["previous"]["table"]) == 7
+    # A first run that fails has no table at all.
+    other = jh.add_job(hints=EVAL_HINTS)
+    assert "no filament preset" in jh.error("evaluate_job", job_id=other)
+    failed = jh.call("job_status", job_id=other)["evaluation"]
+    assert failed["state"] == "failed" and "previous" not in failed
 
 
 def test_rate_caps(jh):
