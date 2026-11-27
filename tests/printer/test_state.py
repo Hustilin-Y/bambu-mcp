@@ -121,3 +121,24 @@ def test_rfid_remain_percent():
     report = {"print": {"ams": {"ams": [{"id": "0", "tray": [tray]}]}}}
     (parsed,) = apply(PrinterState.empty(), report).trays
     assert (parsed.ams, parsed.slot, parsed.remain_pct) == (0, 2, 80)
+
+
+def test_state_parses_sdcard_and_task_id():
+    empty = PrinterState.empty()
+    assert (empty.sdcard, empty.task_id) == (None, None)
+    idle = apply(empty, load("pushall_idle"))
+    assert (idle.sdcard, idle.task_id) == (False, "1473955007")
+    running = apply(idle, load("running_mid"))
+    assert (running.sdcard, running.task_id) == (True, "1795385329")
+    finish = apply(empty, load("finish"))
+    assert (finish.sdcard, finish.task_id) == (True, "1795385329")
+    # A partial report keeps them, the nested upload.task_id never wins.
+    assert apply(running, {"print": {"mc_percent": 5}}).sdcard is True
+    assert apply(running, {"print": {"upload": {"task_id": ""}}}).task_id == "1795385329"
+
+
+@pytest.mark.synthetic
+@pytest.mark.parametrize(("raw", "parsed"), [(True, True), (False, False), (1, None), ("true", None), (None, None)])
+def test_sdcard_only_a_boolean_counts(raw, parsed):
+    known = apply(PrinterState.empty(), {"print": {"sdcard": True}})
+    assert apply(known, {"print": {"sdcard": raw}}).sdcard is parsed

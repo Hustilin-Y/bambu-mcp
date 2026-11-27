@@ -45,6 +45,7 @@ class PrinterState:
     trays: tuple[Tray, ...]
     raw_unknown_state: str | None
     plate: int | None = None  # plate of the print's file: plate_idx, plate_id or gcode_file
+    sdcard: bool | None = None  # USB storage present; None until a report says, or not a boolean
 
     @classmethod
     def empty(cls) -> PrinterState:
@@ -171,6 +172,8 @@ def apply(state: PrinterState, report: dict) -> PrinterState:
         changes["plate"] = _parse_plate(p)
     elif any(key in changes and changes[key] != getattr(state, key) for key in _IDENTITY_KEYS):
         changes["plate"] = None  # another job without its plate: never keep the last one's
+    if "sdcard" in p:
+        changes["sdcard"] = p["sdcard"] if isinstance(p["sdcard"], bool) else None
     if "print_error" in p:
         changes["print_error"] = _int(p["print_error"]) or 0
     hms = _parse_hms(p.get("hms"))
