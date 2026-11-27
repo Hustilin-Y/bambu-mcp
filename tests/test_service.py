@@ -223,7 +223,7 @@ async def test_lifecycle_notifies_once_each(harness):
     assert first_layer["files"] == [("snapshot.jpg", JPEG)]
     assert finished["text"].startswith("✅ Печать завершена")
     assert "Длительность: 2 ч 30 мин" in finished["text"]  # layer0 -> finish: 1+30+60+59
-    assert "\nсвет " in finished["text"] and "\nитого " in finished["text"]
+    assert "\n⚡ свет " in finished["text"] and "\n💰 итого " in finished["text"]
     assert finished["files"] == [("snapshot.jpg", JPEG)]
     for message in (started, first_layer, finished):
         assert message["dedupe"] and message["dedupe"].startswith("cube|1795385329|")
@@ -1075,7 +1075,7 @@ async def test_propose_sends_the_summary_with_slice_and_change_buttons(tmp_path)
         f"job:{job.id}:slice", f"job:{job.id}:change", f"job:{job.id}:slot:1", *goals, f"job:{job.id}:eval"
     ]
     # Only slot 1 has a spool with a preset: slots 2 and 3 are loaded but not mapped.
-    assert notifier.sent[0]["buttons"][1] == [Button(f"job:{job.id}:slot:1", "✓ 1 petg белый")]
+    assert notifier.sent[0]["buttons"][1] == [Button(f"job:{job.id}:slot:1", "✅ 1️⃣ petg белый")]
     assert store.job(job.id).status == "new"
     store.close()
 
@@ -1088,27 +1088,27 @@ async def test_proposal_summary_and_confirmation_show_breakdown(tmp_path):
 
     proposal = (await service.propose(job.id)).split("\n")
     # The manifest's 14.2 g at the slot spool's 550 a kg, and no time before the first slice.
-    assert proposal[1:4] == ["пластик 7.81 грн (14 г × 550 грн/кг)", "время неизвестно до нарезки", "итого 7.81 грн"]
+    assert proposal[1:4] == ["🧵 пластик 7.81 грн (14 г × 550 грн/кг)", "⏱ время неизвестно до нарезки", "💰 итого 7.81 грн"]
 
     await service.slice_job(job.id)
     await drain(service)
     summary = notifier.sent[-1]["text"].split("\n")
     # 100 min at 230 W + 0.05 kWh heat-up = 0.43 kWh at 4.32, 100 min at 8.00 an hour.
     assert summary[1:] == [
-        "пластик 7.70 грн (14 г × 550 грн/кг)",
-        "свет 1.87 грн (0.43 кВт·ч × 4.32)",
-        "амортизация 13.33 грн (100 мин × 8.00 грн/ч)",
-        "итого 22.91 грн",
+        "🧵 пластик 7.70 грн (14 г × 550 грн/кг)",
+        "⚡ свет 1.87 грн (0.43 кВт·ч × 4.32)",
+        "🛠 амортизация 13.33 грн (100 мин × 8.00 грн/ч)",
+        "💰 итого 22.91 грн",
     ]
     assert json.loads(store.job(job.id).result_json)["costs"][0]["amort"] == pytest.approx(100 / 60 * 8)
 
     # A proposal after a slice takes the minutes of the last one.
     again = (await service.propose(job.id)).split("\n")
     assert again[1:5] == [
-        "пластик 7.81 грн (14 г × 550 грн/кг)",
-        "свет 1.87 грн (0.43 кВт·ч × 4.32)",
-        "амортизация 13.33 грн (100 мин × 8.00 грн/ч)",
-        "итого 23.02 грн",
+        "🧵 пластик 7.81 грн (14 г × 550 грн/кг)",
+        "⚡ свет 1.87 грн (0.43 кВт·ч × 4.32)",
+        "🛠 амортизация 13.33 грн (100 мин × 8.00 грн/ч)",
+        "💰 итого 23.02 грн",
     ]
     store.close()
 
@@ -1235,7 +1235,7 @@ async def test_missing_png_sends_the_text_alone(tmp_path):
     await service.slice_job(job.id)
     await drain(service)
     assert notifier.sent[0]["files"] == []
-    assert notifier.sent[0]["text"].startswith("lamp-arm, пластина 1:")
+    assert notifier.sent[0]["text"].startswith("🖨 lamp-arm, пластина 1:")
     store.close()
 
 
@@ -1452,7 +1452,7 @@ async def test_slice_press_starts_job_once(harness):
     gate.set()
     await until(lambda: harness.store.job(job.id).status == "sliced")
     await until(lambda: harness.store.outbox_count() == 0)
-    assert harness.notifier.sent[-1]["text"].startswith("lamp-arm, пластина 1:")
+    assert harness.notifier.sent[-1]["text"].startswith("🖨 lamp-arm, пластина 1:")
     assert len(harness.slicer.requests) == 1
 
 
@@ -1608,7 +1608,7 @@ async def test_long_summary_sends_the_picture_then_the_text(tmp_path):
     assert picture["files"] == [("plate-1.png", PNG)]
     assert len(picture["text"]) <= 1024 and picture["text"] == "desk-kit: пластина 1"
     assert summary["files"] == [] and len(summary["text"]) > 1024
-    assert summary["text"].startswith("desk-kit, 30 пластин:")
+    assert summary["text"].startswith("🖨 desk-kit, 30 пластин:")
     assert not any((tmp_path / "outbox-files").glob("*"))
     store.close()
 
@@ -1650,7 +1650,7 @@ async def test_propose_with_a_slot_stores_it_and_marks_its_button(tmp_path):
     await drain(service)
     assert notifier.sent[0]["text"] == text
     assert [b.text for b in flat_buttons(notifier.sent[0]["buttons"][1:]) if ":slot:" in b.id] == [
-        "1 petg белый", "✓ 2 PETG синий"
+        "1️⃣ petg белый", "✅ 2️⃣ PETG синий"
     ]
     # A later proposal without a slot keeps the stored one.
     assert "слот 2 PETG синий" in await service.propose(job.id)
@@ -1722,8 +1722,8 @@ async def test_slot_press_edits_the_proposal_and_a_later_slice_press_uses_it(har
     rows = harness.notifier.edit_buttons[0]
     assert [b.id for b in rows[0]] == [f"job:{job.id}:slice", f"job:{job.id}:change"]
     assert [(b.id, b.text) for b in flat_buttons(rows[1:]) if ":slot:" in b.id] == [
-        (f"job:{job.id}:slot:1", "1 petg белый"),
-        (f"job:{job.id}:slot:2", "✓ 2 PETG синий"),
+        (f"job:{job.id}:slot:1", "1️⃣ petg белый"),
+        (f"job:{job.id}:slot:2", "✅ 2️⃣ PETG синий"),
     ]
     assert harness.store.job(job.id).slot == 2
     assert harness.store.outbox_count() == 0  # edited in place, nothing new sent
@@ -1741,7 +1741,7 @@ async def test_slot_press_sends_a_new_proposal_when_the_edit_fails(harness):
     await until(lambda: harness.notifier.sent)
     sent = harness.notifier.sent[0]
     assert sent["text"] == harness.notifier.edits[0][1]
-    assert "✓ 2 PETG синий" in [b.text for b in flat_buttons(sent["buttons"])]
+    assert "✅ 2️⃣ PETG синий" in [b.text for b in flat_buttons(sent["buttons"])]
     assert harness.store.job(job.id).slot == 2
 
 
@@ -1770,7 +1770,7 @@ async def test_slot_press_while_slicing_is_ignored_like_the_slice_button(harness
 
 # -- goals and base points (evaluation Task 5) -----------------------------------------
 
-GOAL_LABELS = ["Обычно", "Быстро", "Прочно", "Красиво", "Дёшево", "Легко", "Точно", "Герметично"]
+GOAL_LABELS = ["⚖️ Обычно", "⚡ Быстро", "💪 Прочно", "✨ Красиво", "💸 Дёшево", "🪶 Легко", "🎯 Точно", "💧 Герметично"]
 STRENGTH_BASE = {
     "wall_loops": 4, "sparse_infill_density": 40, "sparse_infill_pattern": "gyroid",
     "top_shell_layers": 7, "bottom_shell_layers": 5,
@@ -1837,7 +1837,7 @@ async def test_goal_press_sets_base_point_no_slice(harness):
     assert "4 стенки, 40% gyroid" in text and "верх/низ 7/5" in text
     rows = goal_rows(harness.notifier.edit_buttons[0])
     assert [len(r) for r in rows] == [4, 4]
-    assert [t for r in rows for _, t in r] == [("✓ " if t == "Прочно" else "") + t for t in GOAL_LABELS]
+    assert [t for r in rows for _, t in r] == [("✅ " if t == "💪 Прочно" else "") + t for t in GOAL_LABELS]
     assert rows[0][2][0] == f"job:{job.id}:goal:strength"
     stored = harness.store.job(job.id)
     assert json.loads(stored.goal_json) == {"primary": "strength", "secondary": None, "source": "owner"}
@@ -1972,7 +1972,7 @@ class EvalSlicer:
 
 def table(text: str) -> list[str]:
     lines = text.split("\n")
-    return lines[lines.index("Варианты:") + 1:]
+    return lines[lines.index("📊 Варианты:") + 1:]
 
 
 def variant_ids(rows) -> list[tuple[str, str]]:
@@ -2010,14 +2010,14 @@ async def test_evaluation_slices_baseline_then_variants_sequentially(tmp_path):
     assert all(r.name == "lamp-arm" and r.job_id == job.id for r in slicer.requests)
     rows = table(text)
     assert len(rows) == 6
-    assert rows[0].startswith("1 3 стенки 15% gyroid · 85 мин · 8 г · ")
-    assert rows[0].endswith(" · прочность 1.0×")
-    assert rows[3].startswith("4 4 стенки 40% gyroid верх/низ 7/5 · 120 мин · 12 г · ")
-    assert rows[3].endswith(" · прочность 1.7×")  # 850 / 500: against the balanced baseline
+    assert rows[0].startswith("1️⃣ 3 стенки 15% gyroid · ⏱ 85 мин · ⚖️ 8 г · 💰 ")
+    assert rows[0].endswith(" · 💪 1.0×")
+    assert rows[3].startswith("4️⃣ 4 стенки 40% gyroid, верх/низ 7/5 · ⏱ 120 мин · ⚖️ 12 г · 💰 ")
+    assert rows[3].endswith(" · 💪 1.7×")  # 850 / 500: against the balanced baseline
     # The strongest within 2.5 x the baseline's time wins, and is shown as the proposal.
-    assert rows[5].startswith("6 ✓ 6 стенок 60% gyroid верх/низ 7/5 · 160 мин · 16 г · ")
-    assert rows[5].endswith(" грн · прочность 2.5×")  # 1250 / 500
-    assert text.startswith("lamp-arm, пластина 1: ") and "6 стенок, 60% gyroid" in text.split("\n")[0]
+    assert rows[5].startswith("6️⃣ ✅ 6 стенок 60% gyroid, верх/низ 7/5 · ⏱ 160 мин · ⚖️ 16 г · 💰 ")
+    assert rows[5].endswith(" грн · 💪 2.5×")  # 1250 / 500
+    assert text.startswith("🖨 lamp-arm, пластина 1: ") and "6 стенок, 60% gyroid" in text.split("\n")[0]
     stored = store.job(job.id)
     assert stored.status == "new"  # the run gives the job back as it was
     assert json.loads(stored.variant_json)["wall_loops"] == 6
@@ -2026,7 +2026,7 @@ async def test_evaluation_slices_baseline_then_variants_sequentially(tmp_path):
     await drain(service)
     assert notifier.sent[-1]["text"] == text
     assert variant_ids(notifier.sent[-1]["buttons"]) == [
-        (f"job:{job.id}:variant:{n}", f"{'✓ ' if n == 6 else ''}Вариант {n}") for n in range(1, 7)
+        (f"job:{job.id}:variant:{n}", f"{'✅ ' if n == 6 else ''}{n}\ufe0f\u20e3") for n in range(1, 7)
     ]
     store.close()
 
@@ -2056,7 +2056,7 @@ async def test_failed_variant_skipped_failed_baseline_restores(harness):
 
     text = await service.evaluate(job.id)
     rows = table(text)
-    assert rows[4] == "5 ✗ 5 стенок 50% adaptivecubic верх/низ 7/5 · не нарезан"
+    assert rows[4] == "5️⃣ ❌ 5 стенок 50% adaptivecubic, верх/низ 7/5 · не нарезан"
     assert len(slicer.requests) == 6  # the run went on after the failure
     await until(lambda: harness.store.outbox_count() == 0)
     assert f"job:{job.id}:variant:5" not in [i for i, _ in variant_ids(harness.notifier.sent[-1]["buttons"])]
@@ -2088,11 +2088,11 @@ async def test_all_variants_fail_baseline_only(tmp_path):
     add_spool(store)
     job = add_job(store, service._settings, hints=STRENGTH_HINTS)
     rows = table(await service.evaluate(job.id))
-    assert rows[0].startswith("1 ✓ 3 стенки 15% gyroid · 85 мин")
+    assert rows[0].startswith("1️⃣ ✅ 3 стенки 15% gyroid · ⏱ 85 мин")
     assert all(r.endswith("не нарезан") for r in rows[1:6])
     assert rows[6] == "Нарезался только базовый вариант, остальные не нарезались"
     await drain(service)
-    assert variant_ids(notifier.sent[-1]["buttons"]) == [(f"job:{job.id}:variant:1", "✓ Вариант 1")]
+    assert variant_ids(notifier.sent[-1]["buttons"]) == [(f"job:{job.id}:variant:1", "✅ 1️⃣")]
     store.close()
 
 
@@ -2101,9 +2101,9 @@ async def test_no_features_strength_unknown(tmp_path):
     add_spool(store)
     job = add_job(store, service._settings, hints=STRENGTH_HINTS)
     rows = table(await service.evaluate(job.id))
-    assert len(rows) == 7 and all(r.endswith(" · прочность ?") for r in rows[:6])
+    assert len(rows) == 7 and all(r.endswith(" · 💪 ?") for r in rows[:6])
     # Strength unknown: the strength goal keeps its base point, not the fastest variant.
-    assert rows[3].startswith("4 ✓ 4 стенки 40% gyroid")
+    assert rows[3].startswith("4️⃣ ✅ 4 стенки 40% gyroid")
     assert rows[6] == "Прочность неизвестна: агент на ПК её не измерил, выбран базовый вариант цели"
     assert json.loads(store.job(job.id).variants_json)["chosen"] == 4
     store.close()
@@ -2161,8 +2161,8 @@ async def test_choose_variant_then_slice_slices_it_fresh(harness):
     await until(lambda: harness.notifier.edits)
     message_id, text = harness.notifier.edits[0]
     assert message_id == "m5" and "5 стенок, 50% adaptivecubic" in text.split("\n")[0]
-    assert table(text)[4].startswith("5 ✓ ")
-    assert "✓ Вариант 5" in [t for _, t in variant_ids(harness.notifier.edit_buttons[0])]
+    assert table(text)[4].startswith("5️⃣ ✅ ")
+    assert "✅ 5️⃣" in [t for _, t in variant_ids(harness.notifier.edit_buttons[0])]
     stored = harness.store.job(job.id)
     assert json.loads(stored.variant_json)["wall_loops"] == 5 and stored.goal_json is None
     assert json.loads(stored.variants_json)["chosen"] == 5
@@ -2245,7 +2245,7 @@ async def test_goal_change_after_a_sliced_variant_applies_the_new_base_point(har
     assert sent["top_shell_layers"] >= 5 and sent["bottom_shell_layers"] >= 5
     await until(lambda: harness.store.outbox_count() == 0)
     summary = harness.notifier.sent[-1]["text"]
-    assert summary.startswith("lamp-arm, пластина 1:") and "требует" not in summary
+    assert summary.startswith("🖨 lamp-arm, пластина 1:") and "требует" not in summary
 
 
 async def test_choose_variant_refusals(tmp_path):
@@ -2275,8 +2275,8 @@ async def test_chosen_variant_prices_the_proposal_header(tmp_path):
     cost = predict_cost(9.5, 95.0, spool, "PETG", store.tariff_on(T0.date()), store.amortization_on(T0.date()),
                         service._settings, T0, currency="UAH")
     assert lines[1:5] == render_cost(cost, "грн", start_now=True)
-    assert lines[3] == "амортизация 12.67 грн (95 мин × 8.00 грн/ч)"
-    assert "время неизвестно до нарезки" not in text and "по прошлой нарезке" not in text
+    assert lines[3] == "🛠 амортизация 12.67 грн (95 мин × 8.00 грн/ч)"
+    assert "⏱ время неизвестно до нарезки" not in text and "по прошлой нарезке" not in text
     store.close()
 
 
@@ -2371,7 +2371,7 @@ async def test_interrupted_evaluation_is_restored_at_startup(harness):
     # The proposal is rendered from the job as it is now (its goal), not the old text.
     message_id, text = harness.notifier.edits[0]
     assert message_id == "m4" and text != "BEFORE"
-    assert text.startswith("lamp-arm, пластина 1:") and "цель: быстро (выбрал ты)" in text
+    assert text.startswith("🖨 lamp-arm, пластина 1:") and "цель: быстро (выбрал ты)" in text
     assert texts(harness.notifier) == [INTERRUPTED_NOTICE]
 
 
@@ -2431,7 +2431,7 @@ async def test_proposal_marks_minutes_from_an_older_slice(tmp_path):
     same = await service.propose(job.id)
     assert "по прошлой нарезке" not in same
     changed = await service.propose(job.id, goal="strength")
-    assert "свет " in changed and "время и свет по прошлой нарезке, настройки с тех пор изменились" in changed
+    assert "⚡ свет " in changed and "время и свет по прошлой нарезке, настройки с тех пор изменились" in changed
     store.close()
 
 
@@ -2460,7 +2460,7 @@ async def test_proposal_names_the_explicit_settings_and_offers_a_reset(tmp_path)
     assert "твои настройки: 2 стенки, 25% заполнение" in text
     await drain(service)
     assert reset_ids(notifier.sent[0]["buttons"]) == []
-    assert reset_ids(notifier.sent[1]["buttons"]) == [(f"job:{job.id}:reset", "↺ Сбросить мои настройки")]
+    assert reset_ids(notifier.sent[1]["buttons"]) == [(f"job:{job.id}:reset", "♻️ Сбросить мои настройки")]
     store.close()
 
 
@@ -2755,12 +2755,12 @@ async def test_print_confirmation_shows_breakdown(harness):
     service, job, _printer = await print_harness(harness)
     result = await service.prepare_print(job.id)
     lines = result.text.split("\n")
-    start = lines.index("пластик 7.70 грн (14 г × 550 грн/кг)")
+    start = lines.index("🧵 пластик 7.70 грн (14 г × 550 грн/кг)")
     assert lines[start:start + 4] == [
-        "пластик 7.70 грн (14 г × 550 грн/кг)",
-        "свет 1.87 грн (0.43 кВт·ч × 4.32)",
-        "амортизация: не задана",
-        "итого 9.57 грн",
+        "🧵 пластик 7.70 грн (14 г × 550 грн/кг)",
+        "⚡ свет 1.87 грн (0.43 кВт·ч × 4.32)",
+        "🛠 амортизация: не задана",
+        "💰 итого 9.57 грн",
     ]
     assert lines[-1].startswith("Проверь, что стол чистый")
 

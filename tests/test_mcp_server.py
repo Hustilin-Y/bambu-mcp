@@ -1294,7 +1294,7 @@ EVAL_HINTS = {"walls": 4, "infill_pct": 25, "infill_pattern": "gyroid", "materia
 
 def _rows(text: str) -> list[str]:
     lines = text.split("\n")
-    return lines[lines.index("Варианты:") + 1:]
+    return lines[lines.index("📊 Варианты:") + 1:]
 
 
 def test_evaluate_job_tool_returns_table(jh):
@@ -1302,7 +1302,7 @@ def test_evaluate_job_tool_returns_table(jh):
     result = jh.call("evaluate_job", job_id=job_id)
     assert result["job_id"] == job_id and result["status"] == "done"
     rows = _rows(result["text"])
-    assert rows[0].startswith("1 ") and all("прочность ?" in r for r in rows[:6])
+    assert rows[0].startswith("1️⃣ ") and all("💪 ?" in r for r in rows[:6])
     # An agent without features: strength is unknown, the strength base point is kept (variant 4).
     assert result["chosen"] == 4
     assert [v["n"] for v in result["variants"]] == [1, 2, 3, 4, 5, 6]

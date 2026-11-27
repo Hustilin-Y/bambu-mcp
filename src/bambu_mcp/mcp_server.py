@@ -1116,12 +1116,13 @@ def build_mcp(
         `goal` (as in propose_job, only when the owner names one) is stored with the job first.
         `settings` (as in slice_job, only the owner's words) are stored with the job and fixed
         in every variant. The best variant for the goal becomes the job's settings, and the
-        proposal with the table ("<n> [✓] <settings> · <min> мин · <g> г · <cost> · прочность
-        <x>×", strength against the first, balanced variant, "?" when the agent did not
-        measure it) goes to Telegram with «Вариант N» buttons. Kits are refused.
+        proposal with the table ("2️⃣ ✅ <settings> · ⏱ <min> мин · ⚖️ <g> г · 💰 <cost> · 💪
+        <x>×", the chosen variant marked ✅, strength against the first, balanced variant, "?"
+        when the agent did not measure it) goes to Telegram with one button per variant
+        ("1️⃣", "✅ 2️⃣", ...). Kits are refused.
 
         The run takes minutes. Within 90 s this returns `status` "done" with the same text,
-        `chosen` (the ✓ variant) and `variants`. Otherwise `status` "evaluating": the run goes
+        `chosen` (the ✅ variant) and `variants`. Otherwise `status` "evaluating": the run goes
         on, the table goes to Telegram, and job_status shows it under `evaluation` when done.
         A run that fails (or a restart cuts off) shows there as state "failed" with `error`:
         a table under `previous` is an earlier run's, not this one's. Follow with
@@ -1154,7 +1155,7 @@ def build_mcp(
     @mcp.tool(annotations=WRITE)
     async def choose_variant(job_id: int, n: int) -> dict[str, Any]:
         """Choose variant `n` (1..6) of the job's last evaluate_job run as its settings, as the
-        «Вариант N» button does. The owner's words (stored from slice_job or evaluate_job
+        variant's button («2️⃣») does. The owner's words (stored from slice_job or evaluate_job
         settings) still win over it. A following slice_job slices that variant again.
         Returns the proposal text, also sent to Telegram."""
         job_or_error(job_id)

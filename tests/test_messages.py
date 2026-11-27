@@ -47,8 +47,8 @@ def test_render_finished_without_cost():
 def test_render_finished_without_filament_cost():
     cost = full_cost(8, None, 52, 0.4444, TARIFF, None, currency="UAH")
     text = render_event(event(EventKind.FINISHED), HmsTexts(), cost, symbol="грн")
-    assert "свет 1.92 грн (0.44 кВт·ч × 4.32)" in text
-    assert "пластик: цена неизвестна" in text
+    assert "⚡ свет 1.92 грн (0.44 кВт·ч × 4.32)" in text
+    assert "🧵 пластик: цена неизвестна" in text
 
 
 # -- cost lines (evaluation Task 2) ------------------------------------------------
@@ -60,10 +60,10 @@ SPOOL = Spool(
 AMORT = Amortization(date(2024, 6, 1), 30000.0, 5000.0, 2.0, "UAH")
 TWO_ZONE = Tariff(valid_from=date(2024, 6, 1), day_uah=4.32, night_uah=2.16)
 SAMPLE_LINES = [
-    "пластик 5.60 грн (8 г × 700 грн/кг)",
-    "свет 1.92 грн (0.44 кВт·ч × 4.32)",
-    "амортизация 6.93 грн (52 мин × 8.00 грн/ч)",
-    "итого 14.45 грн",
+    "🧵 пластик 5.60 грн (8 г × 700 грн/кг)",
+    "⚡ свет 1.92 грн (0.44 кВт·ч × 4.32)",
+    "🛠 амортизация 6.93 грн (52 мин × 8.00 грн/ч)",
+    "💰 итого 14.45 грн",
 ]
 
 
@@ -74,19 +74,19 @@ def test_render_cost_exact_lines():
 
 def test_render_cost_without_amortization_excludes_it():
     cost = full_cost(8, SPOOL, 52, 0.4444, TARIFF, None, currency="UAH")
-    assert render_cost(cost, "грн") == [*SAMPLE_LINES[:2], "амортизация: не задана", "итого 7.52 грн"]
+    assert render_cost(cost, "грн") == [*SAMPLE_LINES[:2], "🛠 амортизация: не задана", "💰 итого 7.52 грн"]
 
 
 def test_render_cost_before_slicing_has_no_time():
     cost = full_cost(8, SPOOL, None, None, TARIFF, AMORT, currency="UAH")
-    assert render_cost(cost, "грн") == [SAMPLE_LINES[0], "время неизвестно до нарезки", "итого 5.60 грн"]
+    assert render_cost(cost, "грн") == [SAMPLE_LINES[0], "⏱ время неизвестно до нарезки", "💰 итого 5.60 грн"]
 
 
 def test_render_cost_two_zone_says_if_started_now():
     start = datetime(2026, 6, 1, 19, 0, tzinfo=UTC)  # 22:00 Kyiv, the night starts at 23:00
     cost = full_cost(8, SPOOL, 120, 0.45, TWO_ZONE, None, currency="UAH", start=start, settings=Settings())
     power = render_cost(cost, "грн", start_now=True)[1]
-    assert power.startswith(f"свет {cost.power.amount:.2f} грн (0.45 кВт·ч × ")
+    assert power.startswith(f"⚡ свет {cost.power.amount:.2f} грн (0.45 кВт·ч × ")
     assert power.endswith(" в среднем, если начать сейчас)")
     assert "если начать сейчас" not in render_cost(cost, "грн")[1]
     single = full_cost(8, SPOOL, 52, 0.4444, TARIFF, None, currency="UAH")
@@ -96,7 +96,7 @@ def test_render_cost_two_zone_says_if_started_now():
 def test_render_cost_escapes_the_symbol():
     cost = full_cost(8, SPOOL, 52, 0.4444, TARIFF, AMORT, currency="UAH")
     lines = render_cost(cost, "<$*>")
-    assert lines[-1] == "итого 14.45 &lt;\\$\\*&gt;"
+    assert lines[-1] == "💰 итого 14.45 &lt;\\$\\*&gt;"
     assert all("<" not in line and "*>" not in line for line in lines)
 
 
@@ -264,7 +264,7 @@ def test_render_end_unknown_and_lost():
 def test_render_cost_in_another_currency_shows_its_iso_code():
     cost = full_cost(8, SPOOL, 52, 0.4444, TARIFF, AMORT, currency="UAH")
     lines = render_cost(cost, "€", code="EUR")  # recorded in UAH, the currency is EUR now
-    assert lines[-1] == "итого 14.45 UAH" and lines[0] == "пластик 5.60 UAH (8 г × 700 UAH/кг)"
+    assert lines[-1] == "💰 итого 14.45 UAH" and lines[0] == "🧵 пластик 5.60 UAH (8 г × 700 UAH/кг)"
     assert not any("€" in line for line in lines)
     assert render_cost(cost, "грн", code="UAH") == SAMPLE_LINES
 
@@ -272,10 +272,31 @@ def test_render_cost_in_another_currency_shows_its_iso_code():
 def test_render_finished_in_another_currency_and_refused():
     cost = full_cost(8, SPOOL, 52, 0.4444, TARIFF, AMORT, currency="UAH")
     text = render_event(event(EventKind.FINISHED), HmsTexts(), cost, symbol="€", code="EUR")
-    assert text.split("\n")[-1] == "итого 14.45 UAH" and "€" not in text
+    assert text.split("\n")[-1] == "💰 итого 14.45 UAH" and "€" not in text
     refused = full_cost(None, None, 52, 0.44, TARIFF, None, currency="EUR")
     text = render_event(event(EventKind.FINISHED), HmsTexts(), refused, symbol="€", code="EUR")
     assert text.split("\n")[-1] == "Стоимость не посчитана: тариф с 01.06.2024 в UAH, а печать в EUR"
+
+
+def test_emoji_markup_matches_the_owners_samples():
+    from bambu_mcp.messages import EMOJI, explicit_line, goal_buttons, goal_line, keycap, render_variants
+
+    assert [keycap(n) for n in (1, 6, 10, 11, 16)] == ["1️⃣", "6️⃣", "🔟", "11", "16"]
+    base = {"n": 1, "status": "ok", "settings": {"wall_loops": 3, "sparse_infill_density": 15,
+            "sparse_infill_pattern": "gyroid"}, "minutes": 40, "grams": 7.0, "cost": 10.0, "currency": "UAH",
+            "strength_ratio": 1.0}
+    chosen = {**base, "n": 2, "minutes": 49, "grams": 8.0, "cost": 12.8, "strength_ratio": 1.2,
+              "settings": {"wall_loops": 3, "sparse_infill_density": 25, "sparse_infill_pattern": "gyroid",
+                           "top_shell_layers": 7, "bottom_shell_layers": 5}}
+    lines = render_variants([base, chosen], 2, "грн", code="UAH")
+    assert lines[0] == "📊 Варианты:"
+    assert lines[2] == "2️⃣ ✅ 3 стенки 25% gyroid, верх/низ 7/5 · ⏱ 49 мин · ⚖️ 8 г · 💰 12.80 грн · 💪 1.2×"
+    assert goal_line("strength", None, "owner", None) == "🎯 цель: прочно (выбрал ты)"
+    assert explicit_line({"wall_loops": 4}) == "✍️ твои настройки: 4 стенки"
+    texts = [b.text for row in goal_buttons(1, "strength") for b in row]
+    assert texts == ["⚖️ Обычно", "⚡ Быстро", "✅ 💪 Прочно", "✨ Красиво", "💸 Дёшево", "🪶 Легко", "🎯 Точно",
+                     "💧 Герметично"]
+    assert all(len(t) <= 64 for t in texts) and EMOJI["chosen"] == "✅"
 
 
 def test_render_variants_uses_each_entry_currency():
@@ -286,7 +307,7 @@ def test_render_variants_uses_each_entry_currency():
     other = {**base, "n": 2, "settings": {"wall_loops": 4}, "currency": "EUR", "cost": 1.5, "strength_ratio": None}
     lines = render_variants([base, other], 1, "грн", code="UAH")
     assert lines == [
-        "Варианты:",
-        "1 ✓ 3 стенки · 50 мин · 8 г · 14.45 грн · прочность 1.0×",
-        "2 4 стенки · 50 мин · 8 г · 1.50 EUR · прочность ?",
+        "📊 Варианты:",
+        "1️⃣ ✅ 3 стенки · ⏱ 50 мин · ⚖️ 8 г · 💰 14.45 грн · 💪 1.0×",
+        "2️⃣ 4 стенки · ⏱ 50 мин · ⚖️ 8 г · 💰 1.50 EUR · 💪 ?",
     ]
