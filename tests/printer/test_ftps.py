@@ -381,3 +381,13 @@ def test_data_socket_reuses_the_control_session(monkeypatch):
 def test_module_exports():
     assert ftps_module.FTPS_PORT == 990
     assert ftps_module.FTPS_USER == "bblp"
+
+
+def test_failed_connect_raises_upload_error_not_attribute_error(local, tmp_path, monkeypatch):
+    """A real ImplicitFTPS whose connect fails has no socket: closing it must not mask the UploadError."""
+    def refuse(*args, **kwargs):
+        raise ConnectionRefusedError()
+
+    monkeypatch.setattr(socket, "create_connection", refuse)
+    with pytest.raises(UploadError):
+        upload(HOST, SERIAL, ACCESS_CODE, CA, local, "a.gcode.3mf", timeout_s=1)

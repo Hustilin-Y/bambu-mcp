@@ -89,9 +89,11 @@ def _reply_code(err: BaseException) -> str:
 
 
 def _close(ftp: Any) -> None:
+    if getattr(ftp, "sock", None) is None:  # connect failed: nothing to quit, and quit() would raise
+        return
     try:
         ftp.quit()
-    except ftplib.all_errors:
+    except (*ftplib.all_errors, AttributeError):
         try:
             ftp.close()
         except ftplib.all_errors:
@@ -181,6 +183,8 @@ def _transfer(
 
     try:
         remote_size = ftp.size(remote)
+    except ValueError:
+        raise UploadError("the printer sent an unreadable size reply") from None
     except ftplib.Error as err:
         raise UploadError(f"cannot read the uploaded size (reply {_reply_code(err)})") from None
     except (OSError, EOFError):
