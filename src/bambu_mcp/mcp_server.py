@@ -22,6 +22,7 @@ import functools
 import hmac
 import json
 import logging
+import math
 import re
 import socket
 from collections.abc import Awaitable, Callable, Iterator, Mapping
@@ -43,7 +44,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from bambu_mcp import camera as camera_module
-from bambu_mcp.config import Secrets, Settings, with_country
+from bambu_mcp.config import Secrets, Settings, country_timezone, with_country
 from bambu_mcp.cost import tariff_reminder_enabled
 from bambu_mcp.jobs import (
     MAX_FILE_BYTES,
@@ -275,6 +276,11 @@ _COUNTRY_RE = re.compile(r"[A-Z]{2}", re.ASCII)
 _SYMBOL_MAX = 8
 
 
+def _finite(*values: float | None) -> bool:
+    """Every given number is finite (None is skipped). NaN and infinity are not."""
+    return all(v is None or math.isfinite(v) for v in values)
+
+
 def _print(row: PrintRow, tz: ZoneInfo) -> dict[str, Any]:
     costs = [c for c in (row.cost_filament_uah, row.cost_power_uah, row.cost_amort) if c is not None]
     return {
@@ -449,7 +455,9 @@ def _job_plates(result: dict) -> list[dict[str, Any]]:
                 "grams": round(sum(grams.values()), 2) if isinstance(grams, dict) else None,
                 "cost_filament_uah": _money(cost.get("filament_uah")),
                 "cost_power_uah": _money(cost.get("power_uah")),
+                "cost_amort": _money(cost.get("amort")),
                 "cost_total_uah": _money(cost.get("total_uah")),
+                "currency": cost.get("currency"),
             }
         )
     return plates
@@ -822,6 +830,8 @@ def build_mcp(
     ) -> dict[str, Any]:
         """Electricity tariff per kWh, in the current currency (see set_currency), for prints
         from `valid_from` on; night_uah = two-zone."""
+        if not _finite(day_uah, night_uah):
+            raise ToolError("tariff rates must be finite numbers")
         if day_uah <= 0 or (night_uah is not None and night_uah <= 0):
             raise ToolError("tariff rates must be positive")
         store.add_tariff(valid_from, day_uah, night_uah)
@@ -836,10 +846,14 @@ def build_mcp(
         Rate per hour of printing = printer_price / life_hours (expected service life in
         hours of printing) + upkeep_per_hour (nozzles, belts, plates). Same date: replaced.
         """
+        if not _finite(printer_price, life_hours, upkeep_per_hour):
+            raise ToolError("printer_price, life_hours and upkeep_per_hour must be finite numbers")
         if not (printer_price >= 0 and life_hours > 0 and upkeep_per_hour >= 0):
             raise ToolError(
                 "printer_price and upkeep_per_hour must not be negative, life_hours must be positive"
             )
+        if not _finite(printer_price / life_hours + upkeep_per_hour):
+            raise ToolError("the rate per hour (printer_price / life_hours + upkeep_per_hour) is not finite")
         store.add_amortization(valid_from, printer_price, life_hours, upkeep_per_hour)
         entry = store.amortization_on(valid_from)
         if entry is None:  # cannot happen: just written
@@ -849,7 +863,7 @@ def build_mcp(
     @mcp.tool(annotations=WRITE)
     async def set_currency(code: str, symbol: str) -> dict[str, Any]:
         """The currency of new prices and rates: an ISO code (UAH, EUR) and the symbol shown
-        (грн, €). Nothing is converted: a cost whose inputs are in another currency is
+        in messages (the local word for the hryvnia, €). Nothing is converted: a cost whose inputs are in another currency is
         refused until they are entered again in this one."""
         code = code.strip().upper()
         if not _CURRENCY_RE.fullmatch(code):
@@ -874,7 +888,9 @@ def build_mcp(
             "timezone": timezone,
             "tariff_reminder": tariff_reminder_enabled(code),
         }
-        if timezone != settings.timezone:
+        if country_timezone(code) is None:
+            result["note"] = f"no default timezone for {code}: set timezone in config.toml"
+        elif timezone != settings.timezone:
             result["note"] = "the timezone applies after a service restart"
         return result
 

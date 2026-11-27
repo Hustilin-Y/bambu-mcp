@@ -8,14 +8,15 @@ from bambu_mcp import cost
 from bambu_mcp.config import Settings
 from bambu_mcp.cost import (
     CostBreakdown,
-    CostLine,
     CurrencyMismatch,
     Money,
     amortization_cost,
     filament_cost,
     full_cost,
+    plastic_cost,
     power_cost,
     print_kwh,
+    sum_costs,
     tariff_check_due,
 )
 from bambu_mcp.store.models import Amortization, Spool, Tariff
@@ -141,11 +142,6 @@ def test_filament_cost_unknown_price():
     assert filament_cost(14.2, None, {}, "PETG") is None
 
 
-def test_cost_line_total():
-    assert CostLine(1.5, 2.0, 0.4, TWO_ZONE).total_uah == 3.5
-    assert CostLine(None, 2.0, 0.4, TWO_ZONE).total_uah == 2.0
-
-
 def test_tariff_check_due():
     today = date(2026, 11, 22)
     assert tariff_check_due(None, today) is True
@@ -260,3 +256,59 @@ def test_mixed_currency_refused_names_input():
 
     ok = full_cost(8, _uah_spool("EUR"), 52, 0.44, eur_tariff, eur_amort, currency="EUR")
     assert isinstance(ok, CostBreakdown) and ok.currency == "EUR"
+
+
+def test_full_cost_keeps_the_inputs_of_its_lines():
+    b = full_cost(8, _uah_spool(), 52, 0.4444, SINGLE, AMORT, currency="UAH")
+    assert (b.grams, b.price_per_kg, b.kwh, b.minutes) == (8, 700.0, 0.4444, 52)
+    assert (b.power_rate, b.amort_rate, b.two_zone) == (4.32, 8.0, False)
+
+
+def test_full_cost_two_zone_rate_is_the_average():
+    start = datetime(2026, 6, 1, 22, 0, tzinfo=KYIV)
+    b = full_cost(8, None, 120, 0.45, TWO_ZONE, None, currency="UAH", start=start, settings=Settings())
+    assert b.two_zone is True
+    assert b.power_rate == pytest.approx(b.power.amount / 0.45)
+    assert 2.16 < b.power_rate < 4.32
+
+
+def test_full_cost_with_the_time_unknown_has_plastic_only():
+    b = full_cost(8, _uah_spool(), None, None, TWO_ZONE, AMORT, currency="UAH")
+    assert b.power is None and b.amort is None and b.minutes is None
+    assert b.total == Money(pytest.approx(5.6), "UAH")
+
+
+def test_mismatch_names_kind_and_ref():
+    eur_tariff = Tariff(valid_from=date(2026, 1, 1), day_uah=0.25, night_uah=None, currency="EUR")
+    off = full_cost(8, _uah_spool(), 52, 0.44, eur_tariff, None, currency="EUR")
+    assert (off.kind, off.ref) == ("spool", "3")
+    off = full_cost(8, None, 52, 0.44, SINGLE, None, currency="EUR")
+    assert (off.kind, off.ref) == ("tariff", "2026-01-01")
+    off = full_cost(8, None, 52, 0.44, eur_tariff, AMORT, currency="EUR")
+    assert (off.kind, off.ref) == ("amortization", "2026-01-01")
+
+
+def test_plastic_cost_checks_the_spool_currency():
+    assert plastic_cost(8, _uah_spool(), "UAH") == Money(pytest.approx(5.6), "UAH")
+    assert plastic_cost(None, _uah_spool(), "UAH") is None
+    assert plastic_cost(8, None, "UAH") is None
+    off = plastic_cost(8, _uah_spool(), "EUR")
+    assert isinstance(off, CurrencyMismatch) and off.input_name == "spool 3"
+
+
+def test_sum_costs_adds_the_plates():
+    a = full_cost(3, _uah_spool(), 20, 0.1, SINGLE, AMORT, currency="UAH")
+    b = full_cost(18, _uah_spool(), 90, 0.35, SINGLE, AMORT, currency="UAH")
+    total = sum_costs([a, b])
+    assert total.plastic.amount == pytest.approx(a.plastic.amount + b.plastic.amount)
+    assert total.power.amount == pytest.approx(a.power.amount + b.power.amount)
+    assert total.amort.amount == pytest.approx(a.amort.amount + b.amort.amount)
+    assert total.total.amount == pytest.approx(a.total.amount + b.total.amount)
+    assert (total.grams, total.price_per_kg, total.minutes, total.amort_rate) == (21, 700.0, 110, 8.0)
+    assert total.kwh == pytest.approx(0.45) and total.power_rate == pytest.approx(4.32)
+    no_spool = full_cost(3, None, 20, 0.1, SINGLE, None, currency="UAH")
+    mixed = sum_costs([a, no_spool])
+    assert mixed.plastic is None and mixed.amort is None
+    assert mixed.total.amount == pytest.approx(a.power.amount + no_spool.power.amount)
+    off = CurrencyMismatch("spool 3", "UAH", "EUR")
+    assert sum_costs([a, off]) is off

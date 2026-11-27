@@ -1226,3 +1226,24 @@ def test_slot_tool_descriptions_name_the_owners_choice(jh):
         description = tools[name]["description"]
         assert "owner" in description and "material" in description, name
         assert "slot" in tools[name]["inputSchema"]["properties"], name
+
+
+def test_set_tariff_and_amortization_refuse_non_finite_numbers(h):
+    # JSON has no infinity: a client sends it as a string, which the tool's lax validation takes.
+    inf, nan = "inf", "nan"
+    for args in ({"day_uah": inf}, {"day_uah": "-inf"}, {"day_uah": nan}, {"day_uah": 4.32, "night_uah": inf}):
+        result = h.call_raw("set_tariff", valid_from="2027-01-01", **args)
+        assert result["isError"], args
+    assert h.store.tariff_on(datetime(2027, 2, 1).date()).valid_from.isoformat() == "2024-06-01"
+    base = {"valid_from": "2027-01-01", "printer_price": 30000, "life_hours": 5000, "upkeep_per_hour": 2}
+    for bad in ({"printer_price": inf}, {"life_hours": inf}, {"upkeep_per_hour": inf},
+                {"printer_price": nan}, {"printer_price": 1e308, "life_hours": 1e-300}):
+        result = h.call_raw("set_amortization", **{**base, **bad})
+        assert result["isError"], bad
+    assert h.store.amortization_on(datetime(2027, 2, 1).date()) is None
+
+
+def test_set_country_without_a_timezone_says_so(h):
+    result = h.call("set_country", code="US")
+    assert result["country"] == "US" and result["timezone"] == h.settings.timezone
+    assert result["note"] == "no default timezone for US: set timezone in config.toml"

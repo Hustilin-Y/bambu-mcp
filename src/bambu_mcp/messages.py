@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
-from datetime import tzinfo
+from datetime import date, tzinfo
 from zoneinfo import ZoneInfo
 
-from bambu_mcp.cost import CostLine
+from bambu_mcp.cost import CostBreakdown, CurrencyMismatch, sum_costs
 from bambu_mcp.events import Event, EventKind
 from bambu_mcp.manifest import Manifest, PlateInfo, parse_manifest
 from bambu_mcp.notify import Button
@@ -21,9 +21,11 @@ from bambu_mcp.proposal import (
     job_material,
     slot_number,
 )
-from bambu_mcp.store.models import Job, Spool
+from bambu_mcp.store.db import DEFAULT_CURRENCY
+from bambu_mcp.store.models import Job, Spool, Tariff
 
 DEFAULT_TZ = ZoneInfo("Europe/Kyiv")  # the service passes settings.timezone
+DEFAULT_SYMBOL = DEFAULT_CURRENCY[1]  # the service passes the store's currency symbol
 NO_NAME = "без названия"
 END_UNKNOWN_TEXT = "Точное время окончания неизвестно: сервис не видел конец печати"
 LOST_TITLE = "❌ Печать прервана, пока сервис не видел"
@@ -66,24 +68,89 @@ def spool_question(name: str | None) -> str:
     )
 
 
-def _money(value: float) -> str:
-    return f"{value:.2f} грн"
+# -- money: the one cost formatter ------------------------------------------------
+
+_MISMATCH_WORDS = {"spool": "катушка", "tariff": "тариф", "amortization": "амортизация"}
 
 
-def _cost_lines(cost: CostLine) -> list[str]:
-    if cost.filament_uah is None:
-        costs = f"Электричество {_money(cost.power_uah)}"
-    else:
-        costs = (
-            f"Пластик {_money(cost.filament_uah)}, электричество {_money(cost.power_uah)}, "
-            f"всего {_money(cost.total_uah)}"
+def money_text(amount: float, symbol: str) -> str:
+    """``amount`` with two decimals and the escaped currency symbol: '14.45 €'."""
+    return f"{amount:.2f} {md_literal(symbol)}"
+
+
+def _number(value: float) -> str:
+    """At most two decimals, no trailing zeros: 700, 733.33."""
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _mismatch_input(m: CurrencyMismatch) -> str:
+    word = _MISMATCH_WORDS.get(m.kind)
+    if word is None:
+        return md_literal(m.input_name)
+    if m.kind == "spool":
+        return f"{word} {md_literal(m.ref)}"
+    try:
+        when = date.fromisoformat(m.ref).strftime("%d.%m.%Y")
+    except ValueError:
+        when = md_literal(m.ref)
+    return f"{word} с {when}"
+
+
+def render_cost_refused(m: CurrencyMismatch) -> str:
+    return (
+        f"Стоимость не посчитана: {_mismatch_input(m)} в {md_literal(m.currency)}, "
+        f"а валюта сейчас {md_literal(m.expected)}. Пересчёта нет, задай это заново в {md_literal(m.expected)}"
+    )
+
+
+def render_cost(cost: CostBreakdown | CurrencyMismatch, symbol: str, *, start_now: bool = False) -> list[str]:
+    """The Russian cost lines: plastic, electricity, amortization, total. Markdown-escaped.
+
+    ``start_now``: a predicted cost priced as if the print started now, which the
+    electricity line says under a two-zone tariff.
+    """
+    if isinstance(cost, CurrencyMismatch):
+        return [render_cost_refused(cost)]
+    sym = md_literal(symbol)
+    lines = []
+    if cost.plastic is None:
+        lines.append("пластик: цена неизвестна")
+    elif cost.grams is not None and cost.price_per_kg is not None:
+        lines.append(
+            f"пластик {money_text(cost.plastic.amount, symbol)} "
+            f"({_grams(cost.grams)} × {_number(cost.price_per_kg)} {sym}/кг)"
         )
-    t = cost.tariff
-    if t.night_uah is None:
-        rate = f"{t.day_uah:.2f} грн/кВт·ч"
     else:
-        rate = f"день {t.day_uah:.2f} / ночь {t.night_uah:.2f} грн/кВт·ч"
-    return [costs, f"({cost.kwh:.2f} кВт·ч, тариф {rate} с {t.valid_from:%d.%m.%Y})"]
+        lines.append(f"пластик {money_text(cost.plastic.amount, symbol)}")
+    if cost.power is None:
+        lines.append("время неизвестно до нарезки")
+    else:
+        power = f"свет {money_text(cost.power.amount, symbol)}"
+        if cost.kwh is not None and cost.power_rate is not None:
+            rate = f"{cost.power_rate:.2f}" + (" в среднем" if cost.two_zone else "")
+            when = ", если начать сейчас" if cost.two_zone and start_now else ""
+            power += f" ({cost.kwh:.2f} кВт·ч × {rate}{when})"
+        lines.append(power)
+        if cost.amort is None:
+            lines.append("амортизация: не задана")
+        elif cost.minutes is not None and cost.amort_rate is not None:
+            lines.append(
+                f"амортизация {money_text(cost.amort.amount, symbol)} "
+                f"({round(cost.minutes)} мин × {cost.amort_rate:.2f} {sym}/ч)"
+            )
+        else:
+            lines.append(f"амортизация {money_text(cost.amort.amount, symbol)}")
+    lines.append(f"итого {money_text(cost.total.amount, symbol)}")
+    return lines
+
+
+def tariff_reminder(tariff: Tariff, symbol: str) -> str:
+    sym = md_literal(symbol)
+    if tariff.night_uah is None:
+        rate = f"{tariff.day_uah:.2f} {sym}/кВт·ч"
+    else:
+        rate = f"день {tariff.day_uah:.2f} / ночь {tariff.night_uah:.2f} {sym}/кВт·ч"
+    return f"Проверь тариф на электроэнергию: сейчас {rate} с {tariff.valid_from:%d.%m.%Y}"
 
 
 def _duration(minutes: int) -> str:
@@ -94,10 +161,11 @@ def _duration(minutes: int) -> str:
 def render_event(
     event: Event,
     texts: HmsTexts,
-    cost: CostLine | None,
+    cost: CostBreakdown | None,
     duration_min: int | None = None,
     *,
     tz: tzinfo = DEFAULT_TZ,
+    symbol: str = DEFAULT_SYMBOL,
 ) -> str:
     state = event.state
     name = job_name(state.subtask_name)
@@ -128,7 +196,7 @@ def render_event(
     ):
         lines.append(f"Длительность: {_duration(duration_min)}")
     if event.kind is EventKind.FINISHED and cost is not None:
-        lines.extend(_cost_lines(cost))
+        lines.extend(render_cost(cost, symbol))
     return "\n".join(lines)
 
 
@@ -180,6 +248,8 @@ _HINT_WORDS = {
     "material_reason": "причина материала",
 }
 _BRIM_WORDS = {"no_brim": "без каймы", "auto_brim": "кайма авто", "outer_only": "кайма снаружи"}
+_SEAM_WORDS = {"back": "шов сзади", "aligned": "шов по линии", "nearest": "шов ближайший", "random": "шов случайный"}
+_IRONING_WORDS = {"no ironing": "без разглаживания", "top": "разглаживание", "topmost": "разглаживание верха"}
 _PLATE_SUFFIX = " Plate"
 
 
@@ -229,7 +299,29 @@ def _setting_parts(settings: Mapping) -> list[str]:
         parts.append(f"слой {settings['layer_height']} мм")
     if "wall_generator" in settings:
         parts.append(f"стенки {md_literal(str(settings['wall_generator']))}")
+    parts += _shell_parts(settings)
+    if "outer_wall_speed" in settings:
+        speed = settings["outer_wall_speed"]
+        shown = f"{speed:g}" if isinstance(speed, int | float) else md_literal(str(speed))
+        parts.append(f"внешняя стенка {shown} мм/с")
+    if "seam_position" in settings:
+        seam = str(settings["seam_position"])
+        parts.append(_SEAM_WORDS.get(seam, f"шов {md_literal(seam)}"))
+    if "ironing_type" in settings:
+        ironing = str(settings["ironing_type"])
+        parts.append(_IRONING_WORDS.get(ironing, f"разглаживание {md_literal(ironing)}"))
     return parts
+
+
+def _shell_parts(settings: Mapping) -> list[str]:
+    top, bottom = settings.get("top_shell_layers"), settings.get("bottom_shell_layers")
+    if top is not None and bottom is not None:
+        return [f"верх/низ {md_literal(str(top))}/{md_literal(str(bottom))}"]
+    for word, value in (("верх", top), ("низ", bottom)):
+        if value is not None:
+            n = int(value)
+            return [f"{word} {n} {_plural(n, 'слой', 'слоя', 'слоёв')}"]
+    return []
 
 
 def _slot_text(choice: SlotChoice) -> str:
@@ -336,10 +428,15 @@ def render_proposal(
     slot_choice: SlotChoice,
     plate_type: str,
     estimate: Mapping[int, float] | None,
+    cost: CostBreakdown | CurrencyMismatch | None = None,
+    *,
+    symbol: str = DEFAULT_SYMBOL,
 ) -> str:
     """What the service is about to slice. ``estimate``: grams per plate index (None: the manifest's).
 
     Plain text, no buttons. ``plate_type`` is the bed when ``settings`` has no ``curr_bed_type``.
+    ``cost``: the predicted cost of the whole job (its lines follow the grams), priced as
+    if the print started now.
     """
     manifest = _job_manifest(job)
     grams = dict(estimate) if estimate is not None else {p.index: p.estimate_g for p in manifest.plates}
@@ -348,6 +445,8 @@ def render_proposal(
         lines = [head, *(f"Пластина {i}: {_about(_grams(g))}" for i, g in sorted(grams.items()))]
     else:
         lines = [f"{head} {_about(_grams(sum(grams.values())))}"]
+    if cost is not None:
+        lines += render_cost(cost, symbol, start_now=True)
     material, reason = job_material(manifest)
     if reason:
         lines.append(f"Почему {md_literal(material)}: {md_literal(reason)}")
@@ -358,51 +457,47 @@ def render_proposal(
     return "\n".join(lines)
 
 
-def _result_text(minutes: float, grams: float, cost: CostLine) -> str:
-    money = _about(_money(cost.total_uah))
-    if cost.filament_uah is None:
-        money += " без пластика"
-    return f"{_about(_duration(round(minutes)))}, {_grams(grams)}, {money}"
+def _result_text(minutes: float, grams: float) -> str:
+    return f"{_about(_duration(round(minutes)))}, {_grams(grams)}"
 
 
 def render_sliced(
     job: Job,
     plate_results: Sequence[Mapping],
-    cost_lines: Sequence[CostLine],
+    costs: Sequence[CostBreakdown | CurrencyMismatch],
     *,
     settings: Mapping,
     slot_choice: SlotChoice,
     plate_type: str,
+    symbol: str = DEFAULT_SYMBOL,
 ) -> str:
     """The slice summary, plain text.
 
     ``plate_results`` are the slice-agent's plates (``{"index", "minutes", "grams":
-    {filament: g}}``), ``cost_lines`` one per plate in the same order. The slot's
-    warning (a material mismatch) ends the text, as in the proposal: a job sliced
-    without a proposal shows it only here.
+    {filament: g}}``), ``costs`` one per plate in the same order, priced as if the print
+    started now. A kit lists each plate with its total, then the cost lines of the sum.
+    The slot's warning (a material mismatch) ends the text, as in the proposal: a job
+    sliced without a proposal shows it only here.
     """
-    if not plate_results or len(plate_results) != len(cost_lines):
-        raise ValueError("render_sliced needs one cost line per plate result")
+    if not plate_results or len(plate_results) != len(costs):
+        raise ValueError("render_sliced needs one cost per plate result")
     manifest = _job_manifest(job)
     head = _job_head(manifest, settings, slot_choice, plate_type)
     rows = [
         (int(p["index"]), float(p["minutes"]), sum(float(g) for g in p["grams"].values()), c)
-        for p, c in zip(plate_results, cost_lines, strict=True)
+        for p, c in zip(plate_results, costs, strict=True)
     ]
     warning = [slot_choice.warning] if slot_choice.warning else []
     if manifest.kind != "kit":
         _index, minutes, grams, cost = rows[0]
-        return "\n".join([f"{head} {_result_text(minutes, grams, cost)}", *warning])
-    costs = [c for *_, c in rows]
-    known = all(c.filament_uah is not None for c in costs)
-    total = CostLine(
-        filament_uah=sum(c.filament_uah or 0.0 for c in costs) if known else None,
-        power_uah=sum(c.power_uah for c in costs),
-        kwh=sum(c.kwh for c in costs),
-        tariff=costs[0].tariff,
-    )
-    lines = [head, *(f"Пластина {i}: {_result_text(m, g, c)}" for i, m, g, c in rows)]
-    lines.append(f"Всего: {_result_text(sum(r[1] for r in rows), sum(r[2] for r in rows), total)}")
+        cost_lines = render_cost(cost, symbol, start_now=True)
+        return "\n".join([f"{head} {_result_text(minutes, grams)}", *cost_lines, *warning])
+    lines = [head]
+    for i, m, g, c in rows:
+        money = f", {_about(money_text(c.total.amount, symbol))}" if isinstance(c, CostBreakdown) else ""
+        lines.append(f"Пластина {i}: {_result_text(m, g)}{money}")
+    lines.append(f"Всего: {_result_text(sum(r[1] for r in rows), sum(r[2] for r in rows))}")
+    lines += render_cost(sum_costs(costs), symbol, start_now=True)
     return "\n".join([*lines, *warning])
 
 
@@ -462,12 +557,18 @@ def render_start_confirmation(
     grams: float,
     plate_type: str,
     warnings: Sequence[str],
+    cost: CostBreakdown | CurrencyMismatch | None = None,
+    symbol: str = DEFAULT_SYMBOL,
 ) -> str:
-    """The question the start button answers. ``plate`` None for a part (always plate 1)."""
+    """The question the start button answers. ``plate`` None for a part (always plate 1).
+
+    ``cost``: the plate's predicted cost, priced as if the print started now.
+    """
     where = f", пластина {plate}" if plate is not None else ""
     lines = [
         f"🖨 Печатать «{job_name(name)}»{where}?",
         f"{_slot_text(slot_choice)}, {_about(_duration(round(minutes)))}, {_grams(grams)}",
+        *(render_cost(cost, symbol, start_now=True) if cost is not None else ()),
         f"На столе должна лежать {md_literal(plate_type)}",
         *(f"⚠️ {w}" for w in warnings),
         "Проверь, что стол чистый и пустой. Кнопка действует 10 минут.",

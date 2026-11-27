@@ -42,6 +42,8 @@ tls_mode = "ca"
 
 camera_backend = "pyav"
 heatup_kwh = 0.05
+# Omit timezone to take it from the country (MCP set_country, default UA: Europe/Kyiv).
+# A timezone set here always wins over the country's.
 timezone = "Europe/Kyiv"
 
 # Average power draw per filament type, watts.

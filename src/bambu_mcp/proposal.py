@@ -9,13 +9,13 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from bambu_mcp.config import Settings
-from bambu_mcp.cost import CostLine, filament_cost, power_cost, print_kwh
+from bambu_mcp.cost import CostBreakdown, CurrencyMismatch, full_cost, print_kwh
 from bambu_mcp.manifest import Manifest
 from bambu_mcp.printer.state import Tray
-from bambu_mcp.store.models import Job, Spool, Tariff
+from bambu_mcp.store.models import Amortization, Job, Spool, Tariff
 from slice_agent.runner import Overrides
 
 DEFAULT_NOZZLE = "0.4"
@@ -323,21 +323,21 @@ def _forced_slot(
 # -- cost ---------------------------------------------------------------------------
 
 
-def estimate_cost(
-    minutes: float,
-    grams: float,
+def predict_cost(
+    grams: float | None,
+    minutes: float | None,
     spool: Spool | None,
     material: str,
     tariff: Tariff,
+    amort: Amortization | None,
     settings: Settings,
     start: datetime,
-) -> CostLine:
-    """Predicted cost of a plate started at ``start``: the spool's price, electricity at the tariff."""
-    kwh = print_kwh(minutes, material, settings)
-    end = start + timedelta(minutes=minutes)
-    return CostLine(
-        filament_uah=filament_cost(grams, spool, {}, material),
-        power_uah=power_cost(start, end, kwh, tariff, settings),
-        kwh=kwh,
-        tariff=tariff,
-    )
+    *,
+    currency: str,
+) -> CostBreakdown | CurrencyMismatch:
+    """Predicted cost of a plate started at ``start`` (now: nothing better is known).
+
+    ``minutes`` None (not sliced yet): the plastic alone.
+    """
+    kwh = None if minutes is None else print_kwh(minutes, material, settings)
+    return full_cost(grams, spool, minutes, kwh, tariff, amort, currency=currency, start=start, settings=settings)

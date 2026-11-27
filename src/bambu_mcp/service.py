@@ -35,7 +35,13 @@ from bambu_mcp import camera as camera_module
 from bambu_mcp import jobs as jobs_module
 from bambu_mcp import mcp_server
 from bambu_mcp.config import Secrets, Settings, with_country
-from bambu_mcp.cost import tariff_check_due, tariff_reminder_enabled
+from bambu_mcp.cost import (
+    CostBreakdown,
+    CurrencyMismatch,
+    sum_costs,
+    tariff_check_due,
+    tariff_reminder_enabled,
+)
 from bambu_mcp.events import CANCEL_ERROR, Event, EventDetector, EventKind, event_identity
 from bambu_mcp.jobs import JobBusy, SliceStart
 from bambu_mcp.journal import NO_SPOOL, TERMINAL_KINDS, Journal, Slot
@@ -63,6 +69,7 @@ from bambu_mcp.messages import (
     start_buttons,
     stop_ask_buttons,
     stop_buttons,
+    tariff_reminder,
 )
 from bambu_mcp.names import slug
 from bambu_mcp.notify import Button, LogNotifier, Notifier, Press, SendError, ServiceNotifyClient
@@ -90,11 +97,11 @@ from bambu_mcp.proposal import (
     SlotChoice,
     SlotUnusable,
     UsableSlot,
-    estimate_cost,
     job_hints,
     job_material,
     last_settings,
     pick_slot,
+    predict_cost,
     resolve_settings,
     slot_number,
     slot_position,
@@ -111,7 +118,7 @@ from bambu_mcp.slicer import (
     WakeError,
 )
 from bambu_mcp.store.db import Store
-from bambu_mcp.store.models import Job, OutboxRow, Spool, Tariff
+from bambu_mcp.store.models import Job, OutboxRow, Spool
 from slice_agent.runner import PLATE_TYPES
 
 log = logging.getLogger(__name__)
@@ -370,14 +377,6 @@ def notify_dedupe(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
-def tariff_text(tariff: Tariff) -> str:
-    if tariff.night_uah is None:
-        rate = f"{tariff.day_uah:.2f} грн/кВт·ч"
-    else:
-        rate = f"день {tariff.day_uah:.2f} / ночь {tariff.night_uah:.2f} грн/кВт·ч"
-    return f"Проверь тариф на электроэнергию: сейчас {rate} с {tariff.valid_from:%d.%m.%Y}"
-
-
 def _tray_slot(report: dict) -> Slot | None:
     """AMS slot the printer currently feeds from, if the report says so."""
     p = report.get("print")
@@ -573,7 +572,7 @@ class Service:
         last = date.fromisoformat(raw) if raw else None
         if not tariff_check_due(last, today):
             return False
-        text = tariff_text(self._store.tariff_on(today))
+        text = tariff_reminder(self._store.tariff_on(today), self._store.currency()[1])
         with self._store.transaction():
             self._enqueue("tariff", text, f"tariff-reminder|{today.isoformat()}")
             self._store.set_meta(TARIFF_META_KEY, today.isoformat())
@@ -951,7 +950,7 @@ class Service:
             log.exception("journal update for a %s event failed", event.kind)
             print_id = cost = duration = None
 
-        text = render_event(event, self._hms_texts, cost, duration, tz=self._tz)
+        text = render_event(event, self._hms_texts, cost, duration, tz=self._tz, symbol=self._store.currency()[1])
         buttons = None
         task_id = event.state.task_id
         if event.kind is EventKind.STARTED and task_id and task_id in self._own_tasks:
@@ -996,7 +995,7 @@ class Service:
         if slot is not None and job.status == "slicing":
             raise JobBusy(job.id)  # the slot of a running slice never changes under it
         plan = self._plan(job, None, DEFAULT_NAMED_SET, slot)
-        text, buttons = _proposal(job, plan)
+        text, buttons = self._proposal(job, plan)
         with self._store.transaction():
             if slot is not None:
                 self._store.update_job(job.id, slot=slot)
@@ -1110,6 +1109,51 @@ class Service:
             usable=tuple(usable_slots(trays, spools)),
         )
 
+    def _predict(
+        self, grams: float | None, minutes: float | None, spool: Spool | None, material: str
+    ) -> CostBreakdown | CurrencyMismatch:
+        """A predicted cost, priced as if the print started now with today's tariff and amortization."""
+        now = self._clock()
+        day = now.astimezone(self._tz).date()
+        return predict_cost(
+            grams,
+            minutes,
+            spool,
+            material,
+            self._store.tariff_on(day),
+            self._store.amortization_on(day),
+            self._settings,
+            now,
+            currency=self._store.currency()[0],
+        )
+
+    def _proposal(self, job: Job, plan: SlicePlan) -> tuple[str, list[list[Button]]]:
+        """The proposal's text and buttons: slice and change, then the slot rows.
+
+        The cost: the manifest's grams at the slot spool's price, and the minutes of the
+        job's last slice when it has one (else no electricity or amortization yet).
+        """
+        sliced = _sliced_minutes(job)
+        plates = plan.manifest.plates
+        try:
+            if sliced is not None and all(p.index in sliced for p in plates):
+                # Per plate, as the slice summary does: each plate heats up once.
+                cost = sum_costs(
+                    [self._predict(p.estimate_g, sliced[p.index], plan.spool, plan.material) for p in plates]
+                )
+            else:
+                cost = self._predict(sum(p.estimate_g for p in plates), None, plan.spool, plan.material)
+        except Exception:
+            log.exception("job %d: the proposal's cost failed, sent without it", job.id)
+            cost = None
+        return _proposal(job, plan, cost, self._store.currency()[1])
+
+    def _print_material(self, target: _PrintTarget, info: PrintFileInfo) -> str:
+        """The material whose power draw prices the plate: the slot spool's, else the file's."""
+        if target.spool is not None:
+            return self._canonical(target.spool.material)
+        return self._canonical(info.filament_types[0] if info.filament_types else "PLA")
+
     def _canonical(self, material: str) -> str:
         """The material as the power table spells it (``print_kwh`` is case-sensitive)."""
         for key in self._settings.power_w:
@@ -1203,14 +1247,8 @@ class Service:
     async def _finish(self, job: Job, plan: SlicePlan, outcome: SliceOutcome) -> None:
         assert self._slicer is not None and outcome.file
         now = self._clock()
-        tariff = self._store.tariff_on(now.astimezone(self._tz).date())
         plates = [dict(p) for p in outcome.plates]
-        costs = [
-            estimate_cost(
-                p["minutes"], sum(p["grams"].values()), plan.spool, plan.material, tariff, self._settings, now
-            )
-            for p in plates
-        ]
+        costs = [self._predict(sum(p["grams"].values()), p["minutes"], plan.spool, plan.material) for p in plates]
         first = min(p["index"] for p in plates)
         try:
             png = await self._slicer.fetch_png(outcome.file, first)
@@ -1218,21 +1256,18 @@ class Service:
             log.exception("job %d: plate picture failed, sending the text alone", job.id)
             png = None
         text = render_sliced(
-            job, plates, costs, settings=plan.settings, slot_choice=plan.choice, plate_type=plan.plate_type
+            job,
+            plates,
+            costs,
+            settings=plan.settings,
+            slot_choice=plan.choice,
+            plate_type=plan.plate_type,
+            symbol=self._store.currency()[1],
         )
         choice = plan.choice
         result = {
             "plates": plates,
-            "costs": [
-                {
-                    "index": p["index"],
-                    "filament_uah": c.filament_uah,
-                    "power_uah": c.power_uah,
-                    "kwh": c.kwh,
-                    "total_uah": c.total_uah,
-                }
-                for p, c in zip(plates, costs, strict=True)
-            ],
+            "costs": [_cost_json(p["index"], c) for p, c in zip(plates, costs, strict=True)],
             "slot": {
                 "ams": choice.ams,
                 "slot": choice.slot,
@@ -1333,7 +1368,7 @@ class Service:
         if not self._store.transition_job(job.id, CLAIMABLE, slot=number):
             await self._notifier.edit(press.message_id, f"Уже режу «{name}»")
             return
-        text, buttons = _proposal(self._job(job.id), plan)
+        text, buttons = self._proposal(self._job(job.id), plan)
         if not await self._notifier.edit(press.message_id, text, buttons):
             log.warning("job %d: editing the proposal failed, sending it again", job.id)
             self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
@@ -1420,6 +1455,11 @@ class Service:
         )
         if check.blocking:
             raise PrintRefused(check.blocking)
+        try:
+            cost = self._predict(info.grams, info.minutes, target.spool, self._print_material(target, info))
+        except Exception:
+            log.exception("job %d: the confirmation's cost failed, sent without it", target.job.id)
+            cost = None
         text = render_start_confirmation(
             target.job.name,
             plate=plate if target.job.kind == "kit" else None,
@@ -1428,6 +1468,8 @@ class Service:
             grams=info.grams,
             plate_type=target.plate_type,
             warnings=check.warnings,
+            cost=cost,
+            symbol=self._store.currency()[1],
         )
         with self._store.transaction():
             confirmation = self._store.add_confirmation(
@@ -2164,9 +2206,11 @@ def _slot_press(button_id: str) -> tuple[int, int] | None:
     return job_id, number
 
 
-def _proposal(job: Job, plan: SlicePlan) -> tuple[str, list[list[Button]]]:
+def _proposal(
+    job: Job, plan: SlicePlan, cost: CostBreakdown | CurrencyMismatch | None, symbol: str
+) -> tuple[str, list[list[Button]]]:
     """The proposal's text and buttons: slice and change, then the slot rows."""
-    text = render_proposal(job, plan.settings, plan.choice, plan.plate_type, None)
+    text = render_proposal(job, plan.settings, plan.choice, plan.plate_type, None, cost, symbol=symbol)
     warning = _preset_warning(plan)
     if warning:
         text = f"{text}\n{warning}"
@@ -2182,6 +2226,41 @@ def _proposal(job: Job, plan: SlicePlan) -> tuple[str, list[list[Button]]]:
         *slot_buttons(job.id, plan.usable, chosen),
     ]
     return text, buttons
+
+
+def _sliced_minutes(job: Job) -> dict[int, float] | None:
+    """The minutes per plate of the job's last slice, None when it has none."""
+    try:
+        result = json.loads(job.result_json or "null")
+    except (ValueError, RecursionError):
+        return None
+    plates = result.get("plates") if isinstance(result, dict) else None
+    if not isinstance(plates, list):
+        return None
+    minutes: dict[int, float] = {}
+    for p in plates:
+        m = p.get("minutes") if isinstance(p, dict) else None
+        if type(p.get("index") if isinstance(p, dict) else None) is not int:
+            return None
+        if type(m) not in (int, float) or not math.isfinite(m) or m < 0:
+            return None
+        minutes[p["index"]] = float(m)
+    return minutes or None
+
+
+def _cost_json(index: int, cost: CostBreakdown | CurrencyMismatch) -> dict[str, Any]:
+    """A plate's predicted cost in the job result (the ``_uah`` names predate currencies)."""
+    if isinstance(cost, CurrencyMismatch):
+        return {"index": index, "currency": cost.expected, "error": cost.reason}
+    return {
+        "index": index,
+        "filament_uah": cost.plastic.amount if cost.plastic is not None else None,
+        "power_uah": cost.power.amount if cost.power is not None else None,
+        "amort": cost.amort.amount if cost.amort is not None else None,
+        "kwh": cost.kwh,
+        "total_uah": cost.total.amount,
+        "currency": cost.currency,
+    }
 
 
 def _job_key(job_id: int, what: str) -> str:

@@ -25,7 +25,7 @@ from bambu_mcp.printer.ftps import UploadError
 from bambu_mcp.printer.link import LinkStatus, PrinterNotConnected, tray_setting
 from bambu_mcp.printer.state import PrinterState, Tray
 from bambu_mcp.printgate import gate_hash
-from bambu_mcp.proposal import SlotChoice, SlotUnusable, estimate_cost
+from bambu_mcp.proposal import SlotChoice, SlotUnusable, predict_cost
 from bambu_mcp.service import (
     AUTH_FAILED_TEXT,
     CHANGE_TEXT,
@@ -222,7 +222,7 @@ async def test_lifecycle_notifies_once_each(harness):
     assert first_layer["files"] == [("snapshot.jpg", JPEG)]
     assert finished["text"].startswith("✅ Печать завершена")
     assert "Длительность: 2 ч 30 мин" in finished["text"]  # layer0 -> finish: 1+30+60+59
-    assert "Электричество" in finished["text"]
+    assert "\nсвет " in finished["text"] and "\nитого " in finished["text"]
     assert finished["files"] == [("snapshot.jpg", JPEG)]
     for message in (started, first_layer, finished):
         assert message["dedupe"] and message["dedupe"].startswith("cube|1795385329|")
@@ -788,7 +788,7 @@ async def test_cost_failure_still_sends_finished_and_questions(tmp_path):
     heads = [m["text"].splitlines()[0] for m in h.notifier.sent]
     assert "✅ Печать завершена" in heads
     finished = next(m for m in h.notifier.sent if m["text"].startswith("✅"))
-    assert "Длительность" in finished["text"] and "Электричество" not in finished["text"]
+    assert "Длительность" in finished["text"] and "итого" not in finished["text"]
     assert any(m["text"].startswith("Как села деталь") for m in h.notifier.sent)
     await h.stop()
     store.close()
@@ -1062,11 +1062,70 @@ async def test_propose_sends_the_summary_with_slice_and_change_buttons(tmp_path)
     await service.propose(job.id)
     await drain(service)
     choice = SlotChoice(0, 0, spool, None, tray_type="PETG", color_name="белый", remaining_g=1000.0)
-    assert notifier.sent[0]["text"] == render_proposal(job, OVERRIDES, choice, "Textured PEI Plate", None)
+    spool_row = next(s for s in store.spools() if s.id == spool)
+    cost = predict_cost(14.2, None, spool_row, "PETG", store.tariff_on(T0.date()), None, service._settings, T0,
+                        currency="UAH")
+    assert notifier.sent[0]["text"] == render_proposal(job, OVERRIDES, choice, "Textured PEI Plate", None, cost)
     assert notifier.button_ids(0) == [f"job:{job.id}:slice", f"job:{job.id}:change", f"job:{job.id}:slot:1"]
     # Only slot 1 has a spool with a preset: slots 2 and 3 are loaded but not mapped.
     assert notifier.sent[0]["buttons"][1] == [Button(f"job:{job.id}:slot:1", "✓ 1 petg белый")]
     assert store.job(job.id).status == "new"
+    store.close()
+
+
+async def test_proposal_summary_and_confirmation_show_breakdown(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)
+    store.add_amortization(date(2026, 1, 1), 30000.0, 5000.0, 2.0)  # 8.00 an hour
+    job = add_job(store, service._settings)
+
+    proposal = (await service.propose(job.id)).split("\n")
+    # The manifest's 14.2 g at the slot spool's 550 a kg, and no time before the first slice.
+    assert proposal[1:4] == ["пластик 7.81 грн (14 г × 550 грн/кг)", "время неизвестно до нарезки", "итого 7.81 грн"]
+
+    await service.slice_job(job.id)
+    await drain(service)
+    summary = notifier.sent[-1]["text"].split("\n")
+    # 100 min at 230 W + 0.05 kWh heat-up = 0.43 kWh at 4.32, 100 min at 8.00 an hour.
+    assert summary[1:] == [
+        "пластик 7.70 грн (14 г × 550 грн/кг)",
+        "свет 1.87 грн (0.43 кВт·ч × 4.32)",
+        "амортизация 13.33 грн (100 мин × 8.00 грн/ч)",
+        "итого 22.91 грн",
+    ]
+    assert json.loads(store.job(job.id).result_json)["costs"][0]["amort"] == pytest.approx(100 / 60 * 8)
+
+    # A proposal after a slice takes the minutes of the last one.
+    again = (await service.propose(job.id)).split("\n")
+    assert again[1:5] == [
+        "пластик 7.81 грн (14 г × 550 грн/кг)",
+        "свет 1.87 грн (0.43 кВт·ч × 4.32)",
+        "амортизация 13.33 грн (100 мин × 8.00 грн/ч)",
+        "итого 23.02 грн",
+    ]
+    store.close()
+
+
+async def test_costs_use_the_current_currency_symbol(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    store.set_currency("EUR", "<€>")
+    store.add_tariff(date(2026, 1, 1), 0.25, None)
+    store.add_spool("Elegoo", "petg", "белый", "#FFFFFF", PRESET, 25.0, 1000.0)
+    store.map_slot(0, 0, store.spools()[-1].id)
+    job = add_job(store, service._settings)
+    text = await service.propose(job.id)
+    assert "&lt;€&gt; (14 г × 25 &lt;€&gt;/кг)" in text and "<€>" not in text
+    store.close()
+
+
+async def test_proposal_says_when_a_price_is_in_another_currency(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)  # priced in UAH
+    store.set_currency("EUR", "€")
+    store.add_tariff(date(2026, 1, 1), 0.25, None)
+    job = add_job(store, service._settings)
+    text = await service.propose(job.id)
+    assert "Стоимость не посчитана: катушка 1 в UAH" in text
     store.close()
 
 
@@ -1104,11 +1163,12 @@ async def test_slice_job_happy_path_stores_result_and_enqueues_summary(tmp_path)
     result = json.loads(done.result_json)
     spool = next(s for s in store.spools() if s.id == spool_id)
     # Canonical material: the spool says "petg", the power table has "PETG".
-    cost = estimate_cost(100.0, 14.0, spool, "PETG", store.tariff_on(T0.date()), service._settings, T0)
+    cost = predict_cost(14.0, 100.0, spool, "PETG", store.tariff_on(T0.date()), None, service._settings, T0,
+                        currency="UAH")
     assert result["plates"] == list(PLATES)
     assert result["costs"] == [{
-        "index": 1, "filament_uah": cost.filament_uah, "power_uah": cost.power_uah,
-        "kwh": cost.kwh, "total_uah": cost.total_uah,
+        "index": 1, "filament_uah": cost.plastic.amount, "power_uah": cost.power.amount, "amort": None,
+        "kwh": cost.kwh, "total_uah": cost.total.amount, "currency": "UAH",
     }]
     assert result["slot"]["spool_id"] == spool_id and (result["slot"]["ams"], result["slot"]["slot"]) == (0, 0)
     assert result["slot"]["color"] == "белый"
@@ -1921,6 +1981,20 @@ async def test_prepare_sends_confirmation_and_starts_nothing(harness):
     assert harness.waker.budgets == [120]
     assert link.full_reports == reports + 1  # the checks ran on a fresh report
     assert link.projects == [] and harness.uploader.calls == []
+
+
+async def test_print_confirmation_shows_breakdown(harness):
+    service, job, _printer = await print_harness(harness)
+    result = await service.prepare_print(job.id)
+    lines = result.text.split("\n")
+    start = lines.index("пластик 7.70 грн (14 г × 550 грн/кг)")
+    assert lines[start:start + 4] == [
+        "пластик 7.70 грн (14 г × 550 грн/кг)",
+        "свет 1.87 грн (0.43 кВт·ч × 4.32)",
+        "амортизация: не задана",
+        "итого 9.57 грн",
+    ]
+    assert lines[-1].startswith("Проверь, что стол чистый")
 
 
 async def test_prepare_refused_lists_reasons_and_sends_nothing(harness):
