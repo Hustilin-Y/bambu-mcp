@@ -124,3 +124,17 @@ def test_deploy_readmes_cover_phase2_keys():
         "studio_resources", "Smart App Control", "install.ps1", "3 %",
     ):
         assert key in agent, key
+
+
+def test_deploy_readme_covers_phase3():
+    service = (ROOT / "deploy" / "README.md").read_text(encoding="utf-8")
+    phase3 = service[service.index("## 8. Phase 3"):]
+    for key in (
+        "USB stick", "print-cache", "30 s", "prepare_print", "pause_print", "request_stop",
+        "never deletes", "project_file", "start_print", "resume", "990",
+        "PREPARE", "sha256", "slice it again", "bambu.db", "TLS session", 'sequence_id "0"', "task id",
+    ):
+        assert key in phase3, key
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for tool in ("prepare_print", "pause_print", "request_stop", "load_spool", "printer_status"):
+        assert tool in readme, tool

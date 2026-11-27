@@ -121,7 +121,7 @@ A kit is sliced once, each plate is its own print, confirmation and journal row.
 - The confirmation is always a Telegram button sent by the service through the notify add-in, for requests from Claude Code and from Telegram alike, and the press goes to the service, never to Claude (section 16).
 - Pre-flight (review finding 5): printer idle or finished, no fatal or serious HMS, nozzle diameter matches, plate type confirmed, slot material equals the filament preset's (hard stop), colour difference is a warning, the spool's tracked remainder covers grams x 1.15, the manifest's material intent (for example PETG near a lamp) is respected or warned about, the bed is confirmed clear by the owner in the confirmation itself.
 - Upload by FTPS, size check, then the `project_file` command with a unique `subtask_name`/`task_id`. Then watch reports for 15 to 30 s and answer `started` or `unconfirmed`. **Never resend** on `unconfirmed`: tell the owner.
-- Exposed physical controls: pause and stop (stop asks for a confirmation). Not exposed at all: resume, raw G-code, axis moves, heating, AMS load or unload, HMS clearing, file deletion, LAN and Developer Mode settings.
+- Exposed physical controls: pause (while printing) and stop (while preparing, printing or paused; stop asks for a confirmation). Not exposed at all: resume, raw G-code, axis moves, heating, AMS load or unload, HMS clearing, file deletion, LAN and Developer Mode settings.
 
 ## 10. Monitoring and notifications (phase 1)
 
@@ -163,6 +163,48 @@ A kit is sliced once, each plate is its own print, confirmation and journal row.
 **Phase 3, print start (v1.1).** Section 9 in full, pause and stop. Done = confirmed prints from both entry points, `unconfirmed` and expiry paths tested against fixtures and once on the printer with the owner present.
 
 **Later.** Multi-colour, queue, tolerance suggestions, OrcaSlicer, live camera, timelapse download, AMS drying.
+
+**Later, asked by the owner (2026-11-27): printer model as configuration.** Today the code assumes the owner's P2S. The owner wants a printer model to be a setting: a "model profile" that holds everything printer-specific, so that another Bambu model (or a second printer) is a new profile, not a code change. What is hard-coded now, file by file (2026-11-27, branch `phase3-print`):
+
+| Where | What is P2S-specific |
+|---|---|
+| `slice_agent/config.py` | Default presets: machine `Bambu Lab P2S 0.4 nozzle`, process `0.20mm Standard @BBL P2S`, filament `Generic PETG @BBL P2S`, resources folder `profiles\BBL` |
+| `slice_agent/profiles.py` | Flatten assertions: bed `256x256`, height `256` |
+| `slice_agent/output.py` | Output check: `printer_model == "Bambu Lab P2S"`, bed `(256, 256)` |
+| `slice_agent/runner.py` | Plate types list (5 Bambu plates), layer heights per nozzle (only `0.4`: 0.12-0.28), override ranges |
+| `bambu_mcp/config.py`, `cost.py` | Power per material (`PLA` 200 W from the P2S FAQ), heat-up kWh |
+| `bambu_mcp/service.py`, `scripts/extract_hms.py` | HMS table `hms_en_22E.json` (`22E` is the P2S device prefix) |
+| `bambu_mcp/printer/link.py` | AMS geometry: 4 units × 4 slots, `tray_ids` mapping and `ams_mapping = ams*4+slot`, tray types list, nozzle temp range 150-320 °C, the verified `project_file` payload fields (`bed_type`, levelling, `layer_inspect`) |
+| `bambu_mcp/proposal.py`, `mcp_server.py` | Slot numbers 1-16 (`MAX_SLOT_NUMBER`), "ams and slot 0..3" checks |
+| `bambu_mcp/printgate.py` | Nozzle diameter check against one nozzle, USB storage requirement (P2S without the closed plug-in needs a stick) |
+| `bambu_mcp/printer/state.py`, `events.py` | `gcode_state` names and the idle/stoppable sets as the P2S firmware 01.03 reports them |
+| Spec, README, phase 0 report | Bed 256³, firmware 01.03.00.00, the TLS chain and CN = serial (true for current Bambu printers) |
+
+Target shape: a `printers/<model>.toml` (or a section of the service config) with the model name, bed size, device prefix for HMS, preset names per nozzle, plate types, layer-height and temperature ranges, power per material, AMS geometry and the payload flags. A `printer` key in the config picks it, and the slice-agent reads the same profile name. The P2S becomes the first profile with today's values, and the tests run against it. Several printers at once (more than one printer section, jobs bound to a printer) is a step after that.
+
+**Later, asked by the owner (2026-11-27): evaluation mode.** On request ("оцени", or a button on the proposal) the service picks the best settings for the part and sets them on the job: infill density and pattern, wall loops, top and bottom shells, supports, brim, and layer height where the whitelist allows it. It slices a few candidate variants on the PC (within the existing override whitelist), compares time, grams and cost, and weighs them against the part's purpose: the manifest's checks, its `PRINT_HINTS`, and the load or strength intent when one is given. Then it proposes the winner with a short comparison table, and the owner keeps it, picks another variant, or edits it. The chosen settings are stored as the job's explicit settings (R6). The scoring follows a goal preset the owner names, "сделай прочно" for example. When none is named, it is taken from `PRINT_HINTS` or else defaults to Balanced. Each preset lists which settings vary, what the score weighs, and which hard limits a variant must keep. Strength is a proxy computed from the sliced file: perimeter and shell volume plus infill volume times a per-pattern factor. Time, grams and cost come from the slice itself.
+
+| Preset (owner's word) | Varies | Score weighs | Hard limits |
+|---|---|---|---|
+| Balanced, «обычно» (default) | infill 10-25 %, walls 2-3, pattern grid/gyroid | equal weights on time, cost and strength | the manifest's checks pass |
+| Speed, «быстро» | layer 0.24-0.28, infill 5-15 %, walls 2, lightning/grid, support only where needed | time | strength at least 0.6 of Balanced |
+| Strength, «прочно» | walls 3-6, infill 25-60 %, gyroid/cubic/adaptive, top/bottom +2 | strength, then time | time at most 2.5 times Balanced |
+| Quality, «красиво» | layer 0.12-0.16, outer wall first, slower outer wall, seam aligned or back, ironing on top if flat | surface: smallest layer, fewest visible seams | time at most 3 times Balanced |
+| Cheap, «дёшево» | infill 0-12 %, walls 2, lightning, thinner shells, no brim unless the checks ask | cost (filament plus power) | strength at least 0.5 of Balanced, the checks pass |
+| Light, «легко» | infill 0-10 %, lightning or honeycomb, walls 2, minimum shells | grams | strength at least 0.4 of Balanced |
+| Fit, «точно» (holes, snaps, threads from CAD Workshop) | classic wall generator, walls 3+, slow outer wall, no fuzzy skin, layer 0.12-0.2 | dimensional risk (outer wall speed, layer, wall count), then time | none of the part's tolerance features are thinned by infill or shells |
+| Watertight, «герметично» (jars, boxes, liquids) | walls 4-6, top/bottom 5+, 100 % infill below a size cap | shell thickness | no sparse layer reaches an outer surface |
+
+Who picks the preset, in this order:
+1. **The owner, in words or with a button.** The proposal gets a row of preset buttons, with the chosen one marked, like the slot buttons from Task 12.
+2. **The agent that designed the part.** CAD Workshop's `PRINT_HINTS` gains `goal` (a closed list of the preset keys, a primary and an optional secondary) and `goal_reason` (at most 200 characters). The cad skill and the CAD Workshop rules tell the agent to set them from the task: what the part does, the load, heat, outdoor use, fits, liquids, and whether it is a test print. The agent says why in the reason. Examples: a lamp arm under load gives `strength`, a jar or wax box gives `watertight`, a part with snaps, threads or a press fit gives `fit`, a fit test or calibration piece gives `speed` plus `cheap`, a visible decor part gives `quality`.
+3. **The service, as a fallback, from the manifest.** Tolerance features (holes, threads or snaps listed by CAD Workshop's checks) give `fit`. A closed cavity open at the top gives `watertight`. Otherwise it is `balanced`.
+
+The proposal always names the preset and where it came from ("цель: прочно, от ассистента: несущий кронштейн лампы"), so a wrong guess is one tap to change. The MCP tools take `goal` on `propose_job`, `slice_job` and the evaluation call, so Claude Code and the multiclaude assistant can pass a goal they inferred from the conversation. Whatever the owner names in words is explicit (R6) and wins.
+
+Presets can be combined as primary and secondary, "прочно и быстро" for example: the primary sets the hard limits, the secondary breaks ties. Settings outside the current override whitelist, such as ironing, seam position, the wall generator and outer wall speed, need the whitelist extended first, each with its own range. The table above lists the target set.
+
+Still open for the design: the number of variants per run (each is a slice on the PC, so 3 to 6 is a sane cap), whether the PC stays awake through the batch under one lease, and calibrating the strength proxy against a few real prints (break test or flex test).
 
 ## 13. MCP tools
 

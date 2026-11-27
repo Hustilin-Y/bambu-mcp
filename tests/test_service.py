@@ -1,7 +1,12 @@
 import asyncio
+import copy
 import hashlib
+import io
 import json
 import logging
+import os
+import threading
+import zipfile
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -14,20 +19,26 @@ from bambu_mcp import jobs as jobs_module
 from bambu_mcp import mcp_server
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.messages import render_proposal, render_sliced
+from bambu_mcp.names import slug
 from bambu_mcp.notify import Button, LogNotifier, Press, SendError, ServiceNotifyClient
+from bambu_mcp.printer.ftps import UploadError
 from bambu_mcp.printer.link import LinkStatus, PrinterNotConnected, tray_setting
 from bambu_mcp.printer.state import PrinterState, Tray
+from bambu_mcp.printgate import gate_hash
 from bambu_mcp.proposal import SlotChoice, SlotUnusable, estimate_cost
 from bambu_mcp.service import (
     AUTH_FAILED_TEXT,
     CHANGE_TEXT,
     TARIFF_META_KEY,
+    ControlRefused,
     JobBusy,
+    PrepareResult,
+    PrintRefused,
     Service,
     build_notifier,
     notify_dedupe,
 )
-from bambu_mcp.slicer import SliceOutcome, WakeError
+from bambu_mcp.slicer import FetchError, SliceOutcome, WakeError
 from bambu_mcp.store.db import Store
 
 FIXTURES = Path(__file__).parent / "fixtures" / "p2s"
@@ -122,9 +133,11 @@ class Harness:
         self.sleep = asyncio.sleep
         self.slicer = None
         self.waker = None
+        self.link_class = FakeLink
+        self.service_kwargs: dict = {}
 
     def _factory(self, on_report, on_status) -> FakeLink:
-        link = FakeLink(on_report, on_status)
+        link = self.link_class(on_report, on_status)
         self.links.append(link)
         return link
 
@@ -143,6 +156,7 @@ class Harness:
             sleep=self.sleep,
             slicer=self.slicer,
             waker=self.waker,
+            **self.service_kwargs,
         )
         count = len(self.links)
         self.task = asyncio.create_task(self.service.run())
@@ -487,6 +501,38 @@ async def test_load_spool_waits_for_a_fresh_report_after_a_reconnect(harness):
     assert len(link.trays) == 2
 
 
+async def test_link_drop_forgets_sdcard(harness):
+    """Pre-flight trusts sdcard only from a report since the last CONNECTED."""
+    service = await harness.start()
+    await _status(harness, LinkStatus.CONNECTED)
+    await harness.feed_report({"print": {"gcode_state": "IDLE", "sdcard": True, "task_id": "42"}})
+    assert service.state.sdcard is True and service.state.task_id == "42"
+    for status in (LinkStatus.CONNECTING, LinkStatus.DISCONNECTED, LinkStatus.AUTH_FAILED):
+        await _status(harness, LinkStatus.CONNECTED)
+        await harness.feed_report({"print": {"gcode_state": "IDLE", "sdcard": True, "task_id": "42"}})
+        await _status(harness, status)
+        assert service.state.sdcard is None, status
+        assert service.state.task_id == "42"  # kept: see the next test
+    await _status(harness, LinkStatus.CONNECTED)
+    assert service.state.sdcard is None  # CONNECTED alone says nothing about the stick
+    await harness.feed_report({"print": {"gcode_state": "IDLE", "sdcard": False}})
+    assert service.state.sdcard is False
+
+
+async def test_reconnect_report_without_task_id_does_not_announce_a_start(harness):
+    """The job identity survives a drop: a first report without task_id is not a new job."""
+    await harness.start()
+    await _status(harness, LinkStatus.CONNECTED)
+    await harness.feed("running_mid")
+    await until(lambda: harness.store.outbox_count() == 0)
+    sent = len(harness.notifier.sent)
+    await _status(harness, LinkStatus.DISCONNECTED)
+    await _status(harness, LinkStatus.CONNECTED)
+    await harness.feed_report({"print": {"gcode_state": "RUNNING", "mc_percent": 51}})
+    await until(lambda: harness.store.outbox_count() == 0)
+    assert len(harness.notifier.sent) == sent
+
+
 async def test_disconnect_does_not_announce_events(harness):
     """UNKNOWN on a drop is not a state change for the event detector (phase 1 logic)."""
     service = await harness.start()
@@ -822,6 +868,8 @@ async def test_running_to_idle_is_reported_as_failed(harness):
     assert len(failed) == 1 and "cube" in failed[0]["text"]
     row = harness.store.print_by_identity(("cube", "1795385329", None))
     assert row.outcome == "failed" and row.actual_min is not None
+    # A failed print has no part to fit: no fit question (the spool question may still come).
+    assert not any(b.startswith("fit:") for i in range(len(harness.notifier.sent)) for b in harness.notifier.button_ids(i))
 
 
 async def test_normal_finish_then_restart_sends_nothing_more(harness):
@@ -1058,6 +1106,24 @@ async def test_slice_job_happy_path_stores_result_and_enqueues_summary(tmp_path)
     assert notifier.sent[0]["files"] == [("plate-1.png", PNG)]
     assert store.outbox_count() == 0
     assert not any((tmp_path / "outbox-files").glob("*"))  # the picture goes once it is sent
+    store.close()
+
+
+async def test_slice_job_records_the_sliced_file_sha256(tmp_path):
+    """The agent's sha256 goes into result_json: pre-flight compares the fetched file with it."""
+    sha = "ab" * 32
+    service, store, _ = job_service(tmp_path, FakeSlicer(replace(ok(), sha256=sha)))
+    add_spool(store)
+    job = await service.slice_job(add_job(store, service._settings).id)
+    assert json.loads(job.result_json)["file_sha256"] == sha
+    store.close()
+
+
+async def test_slice_job_from_an_older_agent_records_no_sha256(tmp_path):
+    service, store, _ = job_service(tmp_path, FakeSlicer(ok()))
+    add_spool(store)
+    job = await service.slice_job(add_job(store, service._settings).id)
+    assert json.loads(job.result_json)["file_sha256"] is None  # the print asks for a re-slice
     store.close()
 
 
@@ -1611,3 +1677,920 @@ async def test_slot_press_while_slicing_is_ignored_like_the_slice_button(harness
     assert harness.notifier.edits == [("m4", "Уже режу «lamp-arm»")]
     assert harness.store.job(job.id).slot is None
     assert harness.store.outbox_count() == 0
+
+
+# -- phase 3: prepare, confirm and start a print -------------------------------------------
+
+MD5_1 = "DD49CB18BFA49DB2DCDC78948AEFBA81"  # Bambu Studio writes it in upper case
+MD5_2 = "0123456789ABCDEF0123456789ABCDEF"
+CA_NAME = "ca.pem"
+GO_TEXT = "Стол чистый, печатать"
+UPLOADING = "⏳ Загружаю на принтер…"
+
+
+def _slice_info(plates) -> str:
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>', "<config>"]
+    for idx, secs, filaments in plates:
+        parts += ["  <plate>", f'    <metadata key="index" value="{idx}"/>', f'    <metadata key="prediction" value="{secs}"/>']
+        for fid, kind, grams in filaments:
+            parts.append(f'    <filament id="{fid}" type="{kind}" color="#FFFFFF" used_m="1.7" used_g="{grams}"/>')
+        parts.append("  </plate>")
+    parts.append("</config>")
+    return "\n".join(parts)
+
+
+PART_PLATES = ((1, 6000, (("1", "PETG", "14.0"),)),)
+KIT_PLATES = ((1, 6000, (("1", "PETG", "14.0"),)), (2, 1200, (("1", "PETG", "5.0"),)))
+
+
+def sliced_bytes(plates=PART_PLATES) -> bytes:
+    """A sliced file shaped like slice-agent output (as in tests/test_printgate.py)."""
+    settings = {"printable_area": ["0x0", "256x0", "256x256", "0x256"], "printer_model": "Bambu Lab P2S",
+                "nozzle_diameter": ["0.4"]}
+    md5 = {1: MD5_1, 2: MD5_2}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("Metadata/slice_info.config", _slice_info(plates))
+        z.writestr("Metadata/project_settings.config", json.dumps(settings))
+        for idx, _, _ in plates:
+            z.writestr(f"Metadata/plate_{idx}.gcode", f"; plate {idx}\nG1 X0\n")
+            z.writestr(f"Metadata/plate_{idx}.gcode.md5", md5[idx] + "\n")
+    return buf.getvalue()
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+class PrintSlicer(FakeSlicer):
+    """Serves one sliced file. Never a network call."""
+
+    def __init__(self, data: bytes) -> None:
+        super().__init__()
+        self.data = data
+        self.fetched: list[tuple[str, Path]] = []
+        self.error: Exception | None = None
+
+    async def fetch_file(self, name, dest, max_bytes=50 * 2**20):
+        self.fetched.append((name, dest))
+        if self.error is not None:
+            raise self.error
+        dest.write_bytes(self.data)
+        return sha(self.data)
+
+
+class PrintLink(FakeLink):
+    """A printer that answers a pushall with ``printer`` and a project_file with ``answer``."""
+
+    def __init__(self, on_report, on_status) -> None:
+        super().__init__(on_report, on_status)
+        self.printer: dict | None = None
+        self.projects: list[dict] = []
+        self.answer: str | None = "RUNNING"
+        self.refuse = False
+        self.after_send: Exception | None = None  # raised once the project_file is out
+        self.events: list[str] = []
+
+    def request_full_report(self) -> None:
+        super().request_full_report()
+        if self.printer is not None:
+            self.on_report(copy.deepcopy(self.printer))
+
+    def pause(self) -> None:
+        if self.refuse:
+            raise PrinterNotConnected("printer link is not connected, nothing was sent")
+        self.events.append("pause")
+
+    def stop_print(self) -> None:
+        if self.refuse:
+            raise PrinterNotConnected("printer link is not connected, nothing was sent")
+        self.events.append("stop")
+        if self.after_send is not None:
+            raise self.after_send
+
+    def start_project(self, **fields) -> None:
+        if self.refuse:
+            raise PrinterNotConnected("printer link is not connected, nothing was sent")
+        self.events.append("project_file")
+        self.projects.append(fields)
+        if self.answer is not None:
+            self.on_report({"print": {
+                "gcode_state": self.answer, "task_id": fields["task_id"], "subtask_name": fields["subtask_name"],
+                "mc_percent": 0, "layer_num": 0, "total_layer_num": 50,
+            }})
+        if self.after_send is not None:
+            raise self.after_send
+
+
+class FakeUploader:
+    """``ftps.upload`` stand-in, called in a worker thread."""
+
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.calls: list[dict] = []
+        self.error: Exception | None = None
+        self.gate: threading.Event | None = None
+        self.entered = threading.Event()
+
+    def __call__(self, host, serial, access_code, ca_file, local, remote_name) -> None:
+        self.entered.set()
+        if self.gate is not None:
+            assert self.gate.wait(5)
+        self.events.append("upload")
+        self.calls.append({
+            "host": host, "serial": serial, "access_code": access_code, "ca_file": ca_file,
+            "remote": remote_name, "sha": sha(Path(local).read_bytes()),
+        })
+        if self.error is not None:
+            raise self.error
+
+
+def idle_printer() -> dict:
+    payload = report("pushall_idle")  # one AMS unit: slot 1 white PETG
+    payload["print"].update(gcode_state="IDLE", sdcard=True, subtask_name="", task_id="0")
+    return payload
+
+
+def sliced_job(store: Store, settings: Settings, data: bytes, spool: int, *, kit: bool = False, **result):
+    job = add_job(store, settings, kind="kit") if kit else add_job(store, settings)
+    name = f"{slug(job.name)}-{job.id}-{'kit' if kit else 'p1'}.gcode.3mf"
+    plates = [{"index": 1, "minutes": 100.0, "grams": {"PETG": 14.0}}]
+    if kit:
+        plates.append({"index": 2, "minutes": 20.0, "grams": {"PETG": 5.0}})
+    body = {
+        "plates": plates,
+        "slot": {"ams": 0, "slot": 0, "spool_id": spool, "tray_type": "PETG", "color": "белый", "warning": None},
+        "material": "PETG", "plate_type": "Textured PEI Plate", "nozzle": "0.4", "file_sha256": sha(data),
+        **result,
+    }
+    store.update_job(job.id, status="sliced", sliced_file=name, result_json=json.dumps(body, ensure_ascii=False))
+    return store.job(job.id)
+
+
+async def connect_printer(harness, printer: dict) -> PrintLink:
+    link = harness.links[-1]
+    link.printer = printer
+    link.events = harness.events
+    await _status(harness, LinkStatus.CONNECTED)
+    await harness.feed_report(printer)
+    return link
+
+
+async def print_harness(harness, *, kit: bool = False, watch_s: float = 2.0):
+    data = sliced_bytes(KIT_PLATES if kit else PART_PLATES)
+    tmp = harness.settings.data_dir
+    harness.events = []
+    harness.slicer, harness.waker = PrintSlicer(data), FakeWaker()
+    harness.uploader = FakeUploader(harness.events)
+    harness.link_class = PrintLink
+    harness.settings = Settings(data_dir=tmp, ca_file=tmp / CA_NAME, power_w={"PLA": 200.0, "PETG": 230.0})
+    harness.service_kwargs = {"uploader": harness.uploader, "watch_s": watch_s, "report_wait_s": 1.0}
+    service = await harness.start()
+    printer = idle_printer()
+    await connect_printer(harness, printer)
+    spool = add_spool(harness.store)
+    job = sliced_job(harness.store, harness.settings, data, spool, kit=kit)
+    harness.data, harness.spool = data, spool
+    return service, job, printer
+
+
+def confirmations(store: Store) -> int:
+    return store._conn().execute("SELECT COUNT(*) FROM confirmations").fetchone()[0]
+
+
+async def press(harness, button: str, message_id: str = "m1") -> None:
+    harness.seq = getattr(harness, "seq", 0) + 1
+    await harness.notifier.press_queue.put(Press(harness.seq, message_id, button, T0))
+
+
+async def pressed_to_the_end(harness, cid: str) -> str:
+    await until(lambda: harness.store.confirmation(cid).outcome is not None, timeout=5)
+    await until(lambda: harness.store.outbox_count() == 0)
+    return harness.store.confirmation(cid).outcome
+
+
+def plain(rows) -> list[list[tuple[str, str]]]:
+    return [[(b.id, b.text) for b in row] for row in rows]
+
+
+async def test_prepare_sends_confirmation_and_starts_nothing(harness):
+    service, job, _printer = await print_harness(harness)
+    link = harness.links[-1]
+    reports = link.full_reports
+
+    result = await service.prepare_print(job.id)
+
+    assert isinstance(result, PrepareResult)
+    cid = result.confirm_id
+    assert len(cid) == 32 and int(cid, 16) >= 0
+    assert result.warnings == []
+    await until(lambda: harness.store.outbox_count() == 0)
+    (message,) = harness.notifier.sent
+    assert message["text"] == result.text
+    assert "lamp-arm" in result.text and "Textured PEI Plate" in result.text and "слот 1" in result.text
+    assert "—" not in result.text and ";" not in result.text
+    assert plain(message["buttons"]) == [[(f"start:{cid}:go", GO_TEXT), (f"start:{cid}:cancel", "Отмена")]]
+    conf = harness.store.confirmation(cid)
+    assert (conf.kind, conf.state, conf.job_id, conf.plate, conf.outcome) == ("start", "pending", job.id, 1, None)
+    assert conf.expires_at - conf.created_at == 600
+    assert conf.created_at == harness.clock().timestamp()
+    assert conf.gate_hash == gate_hash(sha(harness.data), 1, 0, 0, SECRETS.serial, "0.4", "Textured PEI Plate")
+    cache = harness.settings.data_dir / "print-cache"
+    assert harness.slicer.fetched == [(job.sliced_file, cache / job.sliced_file)]
+    assert (cache / job.sliced_file).read_bytes() == harness.data
+    assert harness.waker.budgets == [120]
+    assert link.full_reports == reports + 1  # the checks ran on a fresh report
+    assert link.projects == [] and harness.uploader.calls == []
+
+
+async def test_prepare_refused_lists_reasons_and_sends_nothing(harness):
+    service, job, printer = await print_harness(harness)
+    printer["print"].update(gcode_state="RUNNING", sdcard=False)  # the next pushall says so
+    with pytest.raises(PrintRefused) as info:
+        await service.prepare_print(job.id)
+    lines = info.value.lines
+    assert len(lines) == 2 and "занят" in lines[0] and "флешки" in lines[1]
+    assert "занят" in str(info.value)  # Claude sees the same reasons
+    await until(lambda: harness.store.outbox_count() == 0)  # the phase 1 "started" news only
+    assert confirmations(harness.store) == 0
+    assert [b for m in harness.notifier.sent for row in m["buttons"] for b in row] == []
+    assert not any("Печатать" in m["text"] for m in harness.notifier.sent)
+    assert harness.links[-1].projects == [] and harness.uploader.calls == []
+
+
+@pytest.mark.parametrize("case", ["not_sliced", "tls_pin", "no_ca_file", "kit_plate_missing", "part_plate_2"])
+async def test_prepare_refuses_before_waking_the_pc(harness, case):
+    service, job, _printer = await print_harness(harness, kit=case == "kit_plate_missing")
+    plate = 1
+    if case == "not_sliced":
+        harness.store.update_job(job.id, status="slice_failed")
+    elif case == "tls_pin":
+        service._settings = replace(service._settings, tls_mode="pin", cert_sha256="ab" * 32)
+    elif case == "no_ca_file":
+        service._settings = replace(service._settings, ca_file=None)
+    else:
+        plate = 3 if case == "kit_plate_missing" else 2
+    with pytest.raises((PrintRefused, ValueError)) as info:
+        await service.prepare_print(job.id, plate)
+    if case in ("tls_pin", "no_ca_file"):
+        assert isinstance(info.value, PrintRefused)
+        assert "tls_mode" in str(info.value) and "ca_file" in str(info.value)  # English, for Claude
+        assert "TLS" in info.value.lines[0]  # Russian, for Telegram
+    if case == "not_sliced":
+        assert isinstance(info.value, PrintRefused) and "не нарезано" in info.value.lines[0]
+    assert harness.waker.budgets == [] and harness.slicer.fetched == []
+    assert confirmations(harness.store) == 0 and harness.store.outbox_count() == 0
+
+
+async def test_press_starts_once_then_started_message(harness):
+    service, job, _printer = await print_harness(harness)
+    link = harness.links[-1]
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await until(lambda: harness.store.outbox_count() == 0)
+
+    await press(harness, f"start:{cid}:go")
+    assert await pressed_to_the_end(harness, cid) == "started"
+
+    assert harness.notifier.edits[0] == ("m1", UPLOADING)
+    assert harness.store.confirmation(cid).state == "used"
+    assert harness.events == ["upload", "project_file"]
+    (upload,) = harness.uploader.calls
+    assert upload == {
+        "host": SECRETS.host, "serial": SECRETS.serial, "access_code": SECRETS.access_code,
+        "ca_file": harness.settings.data_dir / CA_NAME, "remote": job.sliced_file, "sha": sha(harness.data),
+    }
+    (project,) = link.projects
+    task_id = project["task_id"]
+    assert task_id.isascii() and task_id.isdigit() and task_id != "0"
+    assert project == {
+        "file": job.sliced_file, "plate": 1, "md5": MD5_1.lower(),
+        "subtask_name": job.sliced_file.removesuffix(".gcode.3mf"), "task_id": task_id, "ams": 0, "slot": 0,
+    }
+    started = [m for m in harness.notifier.sent if "Печать началась" in m["text"]]
+    assert len(started) == 1
+    assert plain(started[0]["buttons"]) == [[(f"stop:ask:{task_id}", "Остановить…")]]
+
+
+async def test_double_press_and_restart_replay_start_once(harness):
+    service, job, printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    harness.uploader.gate = threading.Event()
+
+    await press(harness, f"start:{cid}:go")
+    await until(lambda: harness.uploader.entered.is_set())
+    await press(harness, f"start:{cid}:go")  # while the first one uploads
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert harness.notifier.edits[1] == ("m1", "⏳ Уже запускаю печать")
+    harness.uploader.gate.set()
+    assert await pressed_to_the_end(harness, cid) == "started"
+
+    await press(harness, f"start:{cid}:go")  # after it started
+    await until(lambda: len(harness.notifier.edits) == 3)
+    assert "уже нажата" in harness.notifier.edits[2][1]
+
+    (project,) = harness.links[-1].projects
+    await harness.stop()
+    await harness.start()
+    printer["print"].update(gcode_state="RUNNING", task_id=project["task_id"], subtask_name=project["subtask_name"])
+    await connect_printer(harness, printer)
+    await press(harness, f"start:{cid}:go")  # the add-in replays the press after the restart
+    await until(lambda: len(harness.notifier.edits) == 4)
+    assert "уже нажата" in harness.notifier.edits[3][1]
+    assert sum(len(link.projects) for link in harness.links) == 1
+    assert len(harness.uploader.calls) == 1
+    assert harness.store.confirmation(cid).outcome == "started"
+
+
+@pytest.mark.parametrize("change", ["printer_busy", "plate_type", "cached_file"])
+async def test_press_after_state_changed_refuses(harness, change):
+    service, job, printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await until(lambda: harness.store.outbox_count() == 0)
+    if change == "printer_busy":  # the owner started another print from Bambu Studio
+        printer["print"].update(gcode_state="RUNNING", subtask_name="other", task_id="555")
+        await harness.feed_report(printer)
+        expected = "занят"
+    elif change == "plate_type":  # sliced again for another plate
+        result = json.loads(job.result_json)
+        result["plate_type"] = "Smooth PEI Plate"
+        harness.store.update_job(job.id, result_json=json.dumps(result))
+        expected = "изменилось"
+    else:
+        (harness.settings.data_dir / "print-cache" / job.sliced_file).write_bytes(b"something else")
+        expected = "изменился"
+    sent = len(harness.notifier.sent)
+
+    await press(harness, f"start:{cid}:go")
+    outcome = await pressed_to_the_end(harness, cid)
+
+    assert outcome.startswith("refused:")
+    assert harness.store.confirmation(cid).state == "used"
+    assert harness.uploader.calls == [] and harness.links[-1].projects == []
+    (refusal,) = harness.notifier.sent[sent:]
+    assert "не запущена" in refusal["text"] and expected in refusal["text"]
+    assert "—" not in refusal["text"] and ";" not in refusal["text"]
+    await press(harness, f"start:{cid}:go")  # the confirmation stays used
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert "уже нажата" in harness.notifier.edits[1][1]
+    assert harness.uploader.calls == [] and harness.links[-1].projects == []
+
+
+async def test_press_after_expiry_refuses(harness):
+    service, job, _printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await until(lambda: harness.store.outbox_count() == 0)
+    harness.clock.advance(minutes=10)  # valid for 10 minutes, so this moment is too late
+    await press(harness, f"start:{cid}:go")
+    await until(lambda: harness.notifier.edits)
+    assert "истекло" in harness.notifier.edits[0][1]
+    assert harness.store.confirmation(cid).state == "expired"
+    assert harness.uploader.calls == [] and harness.links[-1].projects == []
+
+
+async def test_unconfirmed_tells_owner_and_never_resends(harness):
+    service, job, printer = await print_harness(harness, watch_s=0.3)
+    link = harness.links[-1]
+    link.answer = None  # the printer stays silent about our task
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await press(harness, f"start:{cid}:go")
+    assert await pressed_to_the_end(harness, cid) == "unconfirmed"
+
+    (project,) = link.projects
+    unconfirmed = harness.notifier.sent[-1]["text"]
+    assert "не подтвердил" in unconfirmed and "IDLE" in unconfirmed and "повторно" in unconfirmed
+    assert "—" not in unconfirmed and ";" not in unconfirmed
+
+    # A later report of our task is still a print of the job.
+    printer["print"].update(gcode_state="RUNNING", task_id=project["task_id"], subtask_name=project["subtask_name"])
+    await harness.feed_report(printer)
+    (row,) = harness.store.history(None, 10)
+    assert (row.source, row.job_id) == ("job", job.id)
+    await press(harness, f"start:{cid}:go")
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert len(link.projects) == 1 and len(harness.uploader.calls) == 1
+    assert harness.store.confirmation(cid).outcome == "unconfirmed"
+
+
+async def test_press_answers_when_the_upload_or_the_send_fails(harness):
+    service, job, _printer = await print_harness(harness)
+    link = harness.links[-1]
+    harness.uploader.error = UploadError(
+        "printer cannot store the file (553): no USB storage in the printer?",
+        "принтер не может сохранить файл, вставлена ли флешка?",
+    )
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await press(harness, f"start:{cid}:go")
+    assert await pressed_to_the_end(harness, cid) == "refused:upload"
+    assert link.projects == []
+    refusal = harness.notifier.sent[-1]["text"]
+    assert "не загрузился" in refusal and "флешка" in refusal and "USB storage" not in refusal
+
+    harness.uploader.error = None
+    link.refuse = True
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await press(harness, f"start:{cid}:go")
+    assert await pressed_to_the_end(harness, cid) == "refused:not_connected"
+    assert link.projects == []
+    assert "не на связи" in harness.notifier.sent[-1]["text"]
+
+
+async def test_cancel(harness):
+    service, job, _printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await press(harness, f"start:{cid}:cancel")
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits == [("m1", "Печать отменена")]
+    conf = harness.store.confirmation(cid)
+    assert (conf.state, conf.outcome) == ("cancelled", "cancelled")
+    await press(harness, f"start:{cid}:go")
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert "отменена" in harness.notifier.edits[1][1]
+    assert harness.uploader.calls == [] and harness.links[-1].projects == []
+
+
+async def test_malformed_start_buttons_are_ignored(harness):
+    service, job, _printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    for button in (f"start:{cid}:resume", f"start:{cid.upper()}:go", f"start:{cid}", "start::go", f"start:{cid}:go:1"):
+        await press(harness, button)
+    await press(harness, f"job:{job.id}:change", "m9")  # handled after the ones above
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits == [("m9", CHANGE_TEXT)]
+    assert harness.store.confirmation(cid).state == "pending"
+
+
+async def test_part_print_button_prepares_plate_one(harness):
+    _service, job, _printer = await print_harness(harness)
+    await press(harness, f"job:{job.id}:print", "m5")
+    await until(lambda: any(b.id.startswith("start:") for m in harness.notifier.sent for row in m["buttons"] for b in row))
+    (message,) = harness.notifier.sent
+    cid = message["buttons"][0][0].id.split(":")[1]
+    assert harness.store.confirmation(cid).plate == 1
+    assert harness.notifier.edits == []  # the sliced summary stays as it was
+
+
+async def test_kit_print_button_asks_for_plate(harness):
+    _service, job, _printer = await print_harness(harness, kit=True)
+    await press(harness, f"job:{job.id}:print", "m5")
+    await until(lambda: harness.notifier.sent)
+    (question,) = harness.notifier.sent
+    assert "desk-kit" in question["text"]
+    assert [b.id for row in question["buttons"] for b in row] == [f"job:{job.id}:print:1", f"job:{job.id}:print:2"]
+    assert harness.slicer.fetched == []  # nothing prepared before the owner picks a plate
+
+    await press(harness, f"job:{job.id}:print:2", "m6")
+    await until(lambda: len(harness.notifier.sent) == 2)
+    confirmation = harness.notifier.sent[1]
+    cid = confirmation["buttons"][0][0].id.split(":")[1]
+    assert harness.store.confirmation(cid).plate == 2
+    assert "пластина 2" in confirmation["text"]
+    assert harness.notifier.edits[0][0] == "m6"
+
+    await press(harness, f"start:{cid}:go")
+    assert await pressed_to_the_end(harness, cid) == "started"
+    (project,) = harness.links[-1].projects
+    assert (project["plate"], project["md5"]) == (2, MD5_2.lower())
+
+
+@pytest.mark.parametrize(
+    ("result", "text"),
+    [(False, "не проснулся"), (WakeError("unreachable", "the gateway did not answer"), "шлюз не ответил")],
+)
+async def test_pc_asleep_wake_fails_no_confirmation(harness, result, text):
+    service, job, _printer = await print_harness(harness)
+    harness.waker.result = result
+    with pytest.raises(PrintRefused) as info:
+        await service.prepare_print(job.id)
+    assert text in info.value.lines[0]
+    assert harness.slicer.fetched == []
+    assert confirmations(harness.store) == 0 and harness.store.outbox_count() == 0
+
+    await press(harness, f"job:{job.id}:print", "m5")  # the same from the button
+    await until(lambda: harness.notifier.sent)
+    (message,) = harness.notifier.sent
+    assert "не подготовлена" in message["text"] and text in message["text"] and message["buttons"] == []
+    assert confirmations(harness.store) == 0
+
+
+async def test_started_print_matched_by_journal(harness):
+    service, job, _printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await press(harness, f"start:{cid}:go")
+    assert await pressed_to_the_end(harness, cid) == "started"
+    (row,) = harness.store.history(None, 10)
+    assert (row.source, row.job_id, row.plate, row.spool_id) == ("job", job.id, 1, harness.spool)
+    assert row.grams == pytest.approx(14.0)
+    assert harness.store.spools()[0].remaining_g == pytest.approx(986.0)
+
+
+async def test_print_cache_keeps_the_last_three_files(harness):
+    service, job, _printer = await print_harness(harness)
+    cache = harness.settings.data_dir / "print-cache"
+    cache.mkdir()
+    for age, name in enumerate(("a-1-p1.gcode.3mf", "b-2-p1.gcode.3mf", "c-3-p1.gcode.3mf", "d-4-p1.gcode.3mf")):
+        (cache / name).write_bytes(b"old")
+        stamp = T0.timestamp() - 1000 * (age + 1)
+        os.utime(cache / name, (stamp, stamp))
+    (cache / ".a-1-p1.gcode.3mf.0011223344556677.part").write_bytes(b"partial")
+    await service.prepare_print(job.id)
+    assert sorted(p.name for p in cache.iterdir()) == sorted(
+        [job.sliced_file, "a-1-p1.gcode.3mf", "b-2-p1.gcode.3mf", ".a-1-p1.gcode.3mf.0011223344556677.part"]
+    )
+
+
+async def test_sliced_summary_has_a_print_button(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    await service.slice_job(job.id)
+    await drain(service)
+    assert plain(notifier.sent[0]["buttons"]) == [[(f"job:{job.id}:print", "Печатать…")]]
+    store.close()
+
+
+async def test_long_summary_puts_the_print_button_on_the_text(tmp_path):
+    raw = long_kit(30)
+    plates = tuple({"index": i, "minutes": 61.0, "grams": {"PETG": 3.0}} for i in range(1, 31))
+    service, store, notifier = job_service(tmp_path, FakeSlicer(ok("desk-kit-1-kit.gcode.3mf", plates)))
+    add_spool(store)
+    job = add_job(store, service._settings, kind="kit", plates=raw["plates"])
+    await service.slice_job(job.id)
+    await drain(service)
+    picture, summary = notifier.sent
+    assert picture["buttons"] == []
+    assert plain(summary["buttons"]) == [[(f"job:{job.id}:print", "Печатать…")]]
+    store.close()
+
+
+# -- pause and the confirmed stop (Task 6) -----------------------------------------------
+
+STOP_GO_TEXT = "Да, остановить"
+
+
+async def running(harness, printer: dict, *, task_id: str = "777", name: str = "other-print", state: str = "RUNNING"):
+    printer["print"].update(gcode_state=state, task_id=task_id, subtask_name=name)
+    await harness.feed_report(printer)
+
+
+async def test_pause_only_while_running(harness):
+    service, _job, printer = await print_harness(harness)
+    link = harness.links[-1]
+    with pytest.raises(ControlRefused) as info:
+        await service.pause_print()  # IDLE
+    assert "IDLE" in str(info.value) and "nothing was sent" in str(info.value)
+    await running(harness, printer, state="PAUSE")
+    with pytest.raises(ControlRefused):
+        await service.pause_print()
+    assert "pause" not in harness.events
+
+    await running(harness, printer)
+    result = await service.pause_print()
+    assert result == {"task_id": "777", "job_name": "other-print"}
+    assert harness.events.count("pause") == 1
+
+    link.refuse = True  # the link dropped between the check and the send
+    with pytest.raises(ControlRefused) as info:
+        await service.pause_print()
+    assert "not connected" in str(info.value)
+    await _status(harness, LinkStatus.DISCONNECTED)
+    with pytest.raises(ControlRefused):
+        await service.pause_print()
+    assert harness.events.count("pause") == 1
+    assert "resume" not in harness.events and "stop" not in harness.events
+
+
+async def test_request_stop_sends_button_stops_nothing(harness):
+    service, _job, printer = await print_harness(harness)
+    with pytest.raises(ControlRefused) as info:
+        await service.request_stop()  # nothing is printing
+    assert "IDLE" in str(info.value)
+    assert confirmations(harness.store) == 0
+    await running(harness, printer)
+    sent = len(harness.notifier.sent)
+
+    result = await service.request_stop()
+
+    cid = result.confirm_id
+    assert len(cid) == 32
+    await until(lambda: harness.store.outbox_count() == 0)
+    (message,) = harness.notifier.sent[sent:]
+    assert message["text"] == result.text
+    assert "Остановить печать «other-print»?" in result.text
+    assert "—" not in result.text and ";" not in result.text
+    assert plain(message["buttons"]) == [[(f"stop:{cid}:go", STOP_GO_TEXT), (f"stop:{cid}:cancel", "Отмена")]]
+    assert cid not in message["dedupe"]
+    conf = harness.store.confirmation(cid)
+    assert (conf.kind, conf.state, conf.outcome) == ("stop", "pending", None)
+    assert conf.expires_at - conf.created_at == 600
+    assert "stop" not in harness.events and "pause" not in harness.events
+
+
+async def test_stop_ask_button_sends_the_confirmation(harness):
+    _service, _job, printer = await print_harness(harness)
+    await running(harness, printer, task_id="888")
+    sent = len(harness.notifier.sent)
+    await press(harness, "stop:ask:777", "m3")  # an old print's button: nothing to stop
+    await until(lambda: len(harness.notifier.sent) == sent + 1)
+    assert "уже не идёт" in harness.notifier.sent[-1]["text"]
+    assert confirmations(harness.store) == 0
+
+    await press(harness, "stop:ask:888", "m4")
+    await until(lambda: len(harness.notifier.sent) == sent + 2)
+    message = harness.notifier.sent[-1]
+    cid = message["buttons"][0][0].id.split(":")[1]
+    assert plain(message["buttons"]) == [[(f"stop:{cid}:go", STOP_GO_TEXT), (f"stop:{cid}:cancel", "Отмена")]]
+    assert harness.store.confirmation(cid).kind == "stop"
+    assert harness.notifier.edits == []  # the start message keeps its text
+    assert "stop" not in harness.events
+
+
+async def test_stop_press_sends_stop_once(harness):
+    service, _job, printer = await print_harness(harness)
+    await running(harness, printer)
+    cid = (await service.request_stop()).confirm_id
+
+    await press(harness, f"stop:{cid}:go", "m7")
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits[0] == ("m7", "⏹ Команда остановки отправлена")
+    await press(harness, f"stop:{cid}:go", "m7")
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert "уже нажата" in harness.notifier.edits[1][1]
+    assert harness.events.count("stop") == 1
+    conf = harness.store.confirmation(cid)
+    assert (conf.state, conf.outcome) == ("used", "sent")
+
+    await harness.stop()  # the add-in replays the press after a restart
+    await harness.start()
+    await connect_printer(harness, printer)
+    await press(harness, f"stop:{cid}:go", "m7")
+    await until(lambda: len(harness.notifier.edits) == 3)
+    assert "уже нажата" in harness.notifier.edits[2][1]
+    assert harness.events.count("stop") == 1
+
+
+async def test_stop_send_that_raises_is_never_repeated(harness):
+    service, _job, printer = await print_harness(harness)
+    await running(harness, printer)
+    cid = (await service.request_stop()).confirm_id
+    harness.links[-1].after_send = RuntimeError("paho broke after the publish")
+    await press(harness, f"stop:{cid}:go", "m7")
+    await until(lambda: harness.notifier.edits)
+    assert "Не знаю" in harness.notifier.edits[0][1]
+    assert harness.store.confirmation(cid).outcome == "unconfirmed"
+    await press(harness, f"stop:{cid}:go", "m7")
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert harness.events.count("stop") == 1
+
+
+@pytest.mark.parametrize("change", ["finished", "other_print", "disconnected", "expired"])
+async def test_stop_press_after_print_changed_refuses(harness, change):
+    service, _job, printer = await print_harness(harness)
+    await running(harness, printer)
+    cid = (await service.request_stop()).confirm_id
+    if change == "finished":
+        await running(harness, printer, state="FINISH")
+        expected = "уже не идёт"
+    elif change == "other_print":
+        await running(harness, printer, task_id="999", name="next-print")
+        expected = "другая"
+    elif change == "disconnected":
+        await _status(harness, LinkStatus.DISCONNECTED)
+        expected = "не на связи"
+    else:
+        harness.clock.advance(minutes=10)
+        expected = "истекло"
+
+    await press(harness, f"stop:{cid}:go", "m7")
+    await until(lambda: harness.notifier.edits)
+    answer = harness.notifier.edits[0][1]
+    assert expected in answer
+    assert "—" not in answer and ";" not in answer
+    assert "stop" not in harness.events
+    assert harness.store.confirmation(cid).state in ("used", "expired")
+    await press(harness, f"stop:{cid}:go", "m7")  # spent, whatever happens next
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert "stop" not in harness.events
+
+
+async def test_stop_cancel_and_malformed_stop_buttons(harness):
+    service, _job, printer = await print_harness(harness)
+    await running(harness, printer)
+    cid = (await service.request_stop()).confirm_id
+    await until(lambda: harness.store.outbox_count() == 0)
+    sent = len(harness.notifier.sent)
+    for button in (f"stop:{cid}:resume", f"stop:{cid.upper()}:go", f"stop:{cid}", "stop:ask:", "stop:ask:7x7",
+                   f"stop:{cid}:go:1", "stop:ask:777:go", "stop:ask:" + "1" * 20):
+        await press(harness, button)
+    await press(harness, f"stop:{cid}:cancel", "m8")
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits == [("m8", "Остановка отменена")]
+    assert len(harness.notifier.sent) == sent
+    conf = harness.store.confirmation(cid)
+    assert (conf.state, conf.outcome) == ("cancelled", "cancelled")
+    await press(harness, f"stop:{cid}:go", "m8")
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert "отменена" in harness.notifier.edits[1][1]
+    assert "stop" not in harness.events
+
+
+async def test_start_and_stop_confirmations_do_not_cross(harness):
+    service, job, printer = await print_harness(harness)
+    start_cid = (await service.prepare_print(job.id)).confirm_id
+    await running(harness, printer)
+    stop_cid = (await service.request_stop()).confirm_id
+    await press(harness, f"stop:{start_cid}:go", "m1")
+    await press(harness, f"start:{stop_cid}:go", "m2")
+    await press(harness, f"job:{job.id}:change", "m9")  # handled after the ones above
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits == [("m9", CHANGE_TEXT)]
+    assert harness.store.confirmation(start_cid).state == "pending"
+    assert harness.store.confirmation(stop_cid).state == "pending"
+    assert harness.events == []
+
+
+# -- Task 5 review fixes -------------------------------------------------------------------
+
+
+async def test_failure_after_the_send_is_unconfirmed_never_not_started(harness):
+    service, job, _printer = await print_harness(harness, watch_s=0.3)
+    link = harness.links[-1]
+    link.answer = None
+    link.after_send = RuntimeError("paho broke after the publish")
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await press(harness, f"start:{cid}:go")
+    assert await pressed_to_the_end(harness, cid) == "unconfirmed"
+    assert len(link.projects) == 1
+    text = harness.notifier.sent[-1]["text"]
+    assert "не подтвердил" in text and "не запущена" not in text
+
+
+async def test_store_failure_in_the_watch_is_unconfirmed(harness, monkeypatch):
+    service, job, _printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    real = service._store.set_confirmation_outcome
+
+    def flaky(confirm_id, outcome):
+        if outcome == "started":
+            raise RuntimeError("disk full")
+        real(confirm_id, outcome)
+
+    monkeypatch.setattr(service._store, "set_confirmation_outcome", flaky)
+    await press(harness, f"start:{cid}:go")
+    assert await pressed_to_the_end(harness, cid) == "unconfirmed"
+    assert len(harness.links[-1].projects) == 1
+    assert not any("не запущена" in m["text"] for m in harness.notifier.sent)
+
+
+async def test_upload_deadline_refuses_and_sends_nothing(harness):
+    service, job, _printer = await print_harness(harness)
+    service._upload_timeout_s = 0.2
+    harness.uploader.gate = threading.Event()  # a transfer that trickles on
+    cid = (await service.prepare_print(job.id)).confirm_id
+    try:
+        await press(harness, f"start:{cid}:go")
+        assert await pressed_to_the_end(harness, cid) == "refused:upload_timeout"
+    finally:
+        harness.uploader.gate.set()
+    assert harness.links[-1].projects == []
+    assert "не уложилась в 5 минут" in harness.notifier.sent[-1]["text"]
+    assert harness.store.confirmation(cid).state == "used"
+    await press(harness, f"start:{cid}:go")
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert harness.links[-1].projects == []
+
+
+async def test_prepare_press_refusals_are_russian(harness):
+    _service, job, _printer = await print_harness(harness, kit=True)
+    await press(harness, f"job:{job.id}:print:3", "m5")  # the kit has plates 1 and 2
+    await until(lambda: harness.notifier.sent)
+    text = harness.notifier.sent[-1]["text"]
+    assert "не подготовлена" in text and "пластины 3" in text
+    assert "has no plate" not in text and "job" not in text
+
+
+async def test_press_refuses_a_retired_spool(harness):
+    service, job, _printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    harness.store.update_spool(harness.spool, active=False)
+    await press(harness, f"start:{cid}:go")
+    assert await pressed_to_the_end(harness, cid) == "refused:preflight"
+    assert "списана" in harness.notifier.sent[-1]["text"]
+    assert harness.uploader.calls == [] and harness.links[-1].projects == []
+
+
+async def test_press_refuses_a_multi_filament_plate(harness):
+    service, job, _printer = await print_harness(harness)
+    data = sliced_bytes(((1, 6000, (("1", "PETG", "10.0"), ("2", "PETG", "4.0"))),))
+    harness.store.update_job(job.id, result_json=job.result_json.replace(sha(harness.data), sha(data)))
+    cache = harness.settings.data_dir / "print-cache"
+    cache.mkdir()
+    (cache / job.sliced_file).write_bytes(data)
+    target = service._print_target(harness.store.job(job.id), 1)
+    confirmation = harness.store.add_confirmation(  # as a prepare of an older build would have stored it
+        None, "start", job_id=job.id, plate=1, gate_hash=service._gate(target, sha(data)),
+        payload_json=json.dumps({"file": job.sliced_file, "plate": 1}), now=harness.clock().timestamp(),
+    )
+    await press(harness, f"start:{confirmation.id}:go")
+    assert await pressed_to_the_end(harness, confirmation.id) == "refused:preflight"
+    assert "несколько филаментов" in harness.notifier.sent[-1]["text"]
+    assert harness.uploader.calls == [] and harness.links[-1].projects == []
+
+
+async def test_start_lock_covers_another_confirmation(harness):
+    service, job, _printer = await print_harness(harness)
+    first = (await service.prepare_print(job.id)).confirm_id
+    second = (await service.prepare_print(job.id)).confirm_id
+    await until(lambda: harness.store.outbox_count() == 0)
+    harness.uploader.gate = threading.Event()
+    await press(harness, f"start:{first}:go", "m1")
+    await until(lambda: harness.uploader.entered.is_set())
+    await press(harness, f"start:{second}:go", "m2")
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert harness.notifier.edits[1] == ("m2", "⏳ Уже запускаю печать")
+    assert harness.store.confirmation(second).state == "pending"
+    harness.uploader.gate.set()
+    assert await pressed_to_the_end(harness, first) == "started"
+    assert len(harness.links[-1].projects) == 1
+
+
+async def test_confirmation_id_stays_out_of_logs_and_dedupe(harness, caplog):
+    caplog.set_level(logging.DEBUG)
+    service, job, _printer = await print_harness(harness)
+    harness.uploader.error = UploadError("printer cannot store the file (553)")
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await press(harness, f"start:{cid}:go")
+    assert await pressed_to_the_end(harness, cid) == "refused:upload"
+    assert all(cid not in (m["dedupe"] or "") for m in harness.notifier.sent)
+    assert cid not in caplog.text
+    with pytest.raises(KeyError) as info:
+        harness.store.set_confirmation_outcome("ab" * 16, "started")
+    assert "ab" * 16 not in str(info.value)
+
+
+# -- final review fixes ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("entry", ["request_stop", "button"])
+async def test_stop_during_prepare(harness, entry):
+    """Heating and levelling: the owner may notice a wrong plate there, so the stop works."""
+    service, _job, printer = await print_harness(harness)
+    await running(harness, printer, task_id="777", state="PREPARE")
+    if entry == "request_stop":
+        cid = (await service.request_stop()).confirm_id
+    else:
+        sent = len(harness.notifier.sent)
+        await press(harness, "stop:ask:777", "m3")
+        await until(lambda: len(harness.notifier.sent) == sent + 1)
+        cid = harness.notifier.sent[-1]["buttons"][0][0].id.split(":")[1]
+    assert harness.store.confirmation(cid).kind == "stop"
+    assert "stop" not in harness.events
+
+    await press(harness, f"stop:{cid}:go", "m7")
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits[-1] == ("m7", "⏹ Команда остановки отправлена")
+    await press(harness, f"stop:{cid}:go", "m7")
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert harness.events.count("stop") == 1
+
+
+async def test_start_interrupted_by_a_restart_is_unconfirmed(harness):
+    service, job, _printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    waiting = (await service.prepare_print(job.id)).confirm_id
+    await until(lambda: harness.store.outbox_count() == 0)
+    # The press claimed it, then the service stopped before the start was decided.
+    assert harness.store.claim_confirmation(cid, harness.clock().timestamp()) is not None
+    await harness.stop()
+    sent = len(harness.notifier.sent)
+
+    await harness.start()
+    await until(lambda: harness.store.confirmation(cid).outcome is not None)
+    await until(lambda: harness.store.outbox_count() == 0)
+
+    assert harness.store.confirmation(cid).outcome == "unconfirmed"
+    (message,) = harness.notifier.sent[sent:]
+    text = message["text"]
+    assert "перезапуск" in text and "Не знаю" in text and "экран" in text and "lamp-arm" in text
+    assert "—" not in text and ";" not in text
+    assert cid not in message["dedupe"]
+    conf = harness.store.confirmation(waiting)
+    assert (conf.state, conf.outcome) == ("pending", None)
+    assert sum(len(link.projects) for link in harness.links) == 0 and harness.uploader.calls == []
+
+    await harness.stop()  # told once
+    await harness.start()
+    await harness.service.settle()
+    await until(lambda: harness.store.outbox_count() == 0)
+    assert len(harness.notifier.sent) == sent + 1
+
+
+async def test_fetch_refusal_is_russian_for_the_owner_english_for_claude(harness):
+    service, job, _printer = await print_harness(harness)
+    harness.slicer.error = FetchError(
+        "slice-agent answered HTTP 404 for the sliced file", "ПК не отдал нарезанный файл (HTTP 404)"
+    )
+    with pytest.raises(PrintRefused) as info:
+        await service.prepare_print(job.id)
+    assert "HTTP 404" in str(info.value) and "slice-agent" in str(info.value)
+    (line,) = info.value.lines
+    assert "ПК не отдал" in line and "slice-agent" not in line

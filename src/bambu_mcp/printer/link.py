@@ -1,10 +1,13 @@
-"""MQTT link to the printer: reads, plus one validated write.
+"""MQTT link to the printer: reads, plus a closed set of validated writes.
 
 The only network path to the printer. It sends the two read commands in
-``READ_COMMANDS`` and, since phase 2, exactly one write: ``ams_filament_setting``
-built by ``tray_setting`` (AMS slot material and colour, every field checked).
-Nothing else is ever published, and only after the peer is verified as the
-configured printer.
+``READ_COMMANDS``, since phase 2 ``ams_filament_setting`` built by ``tray_setting``
+(AMS slot material and colour), and since phase 3 ``project_file`` built by
+``project_file``, ``PAUSE_PRINT`` and ``STOP_PRINT``. Every write is checked
+structurally before it is published: exact key set, exact types, rebuilt and
+compared as JSON. ``resume``, ``gcode_line`` and everything else are refused.
+Nothing is published until the peer is verified as the configured printer, and
+no write is ever retried or replayed.
 
 Peer identity is checked twice: in the TLS handshake (so the access code is
 never sent to an unverified peer) and again in the connect callback, before
@@ -60,6 +63,43 @@ _TRAY_KEYS: Final = frozenset(
 _COLOR_RE: Final = re.compile(r"[0-9A-F]{8}", re.ASCII)
 TRAY_INFO_IDX_RE: Final = re.compile(r"[A-Z0-9]{3,8}", re.ASCII)
 
+# Phase 3 writes. pause and stop as ha-bambulab sends them, resume is never allowed.
+PAUSE_PRINT: Final = {"print": {"sequence_id": "0", "command": "pause", "param": ""}}
+STOP_PRINT: Final = {"print": {"sequence_id": "0", "command": "stop", "param": ""}}
+PROJECT_FILE: Final = "project_file"
+GCODE_3MF_SUFFIX: Final = ".gcode.3mf"
+PLATES: Final = range(1, 51)
+_FILE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.gcode\.3mf", re.ASCII)
+_MD5_RE: Final = re.compile(r"[0-9a-f]{32}", re.ASCII)
+TASK_ID_RE: Final = re.compile(r"[0-9]{1,19}", re.ASCII)  # project_file task ids, stop buttons
+_PLATE_PARAM_RE: Final = re.compile(r"Metadata/plate_([1-9][0-9]?)\.gcode", re.ASCII)
+_PROJECT_KEYS: Final = frozenset(
+    {
+        "sequence_id",
+        "command",
+        "param",
+        "url",
+        "file",
+        "md5",
+        "subtask_name",
+        "project_id",
+        "profile_id",
+        "task_id",
+        "subtask_id",
+        "timelapse",
+        "bed_type",
+        "bed_leveling",
+        "bed_levelling",
+        "auto_bed_leveling",
+        "flow_cali",
+        "vibration_cali",
+        "layer_inspect",
+        "use_ams",
+        "ams_mapping",
+        "ams_mapping2",
+    }
+)
+
 PORT: Final = 8883
 USERNAME: Final = "bblp"
 KEEPALIVE_S: Final = 60
@@ -78,6 +118,28 @@ class PrinterNotConnected(RuntimeError):
 
 def _is_int(value: Any) -> bool:
     return type(value) is int  # not bool, not float
+
+
+def _check_unit_slot(ams: Any, slot: Any) -> None:
+    if not (_is_int(ams) and ams in AMS_UNITS):
+        raise ValueError("ams must be an integer 0..3")
+    if not (_is_int(slot) and slot in AMS_SLOTS):
+        raise ValueError("slot must be an integer 0..3")
+
+
+def _unit_slot_of(ams_id: Any, tray_id: Any) -> tuple[int, int] | None:
+    """The inverse of ``tray_ids``: (unit, slot) for printer ids, None outside its image."""
+    if not (_is_int(ams_id) and _is_int(tray_id)):  # True would hash like 1 in the lookup below
+        return None
+    return {tray_ids(a, s): (a, s) for a in AMS_UNITS for s in AMS_SLOTS}.get((ams_id, tray_id))
+
+
+def _same_json(a: Any, b: Any) -> bool:
+    """Equal as sent on the wire: ``True`` is not ``1`` and ``2.0`` is not ``2``."""
+    try:
+        return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+    except (TypeError, ValueError):
+        return False
 
 
 def tray_ids(ams: int, slot: int) -> tuple[int, int]:
@@ -101,10 +163,7 @@ def tray_setting(
     nozzle_temp_max: int,
 ) -> dict:
     """The ``ams_filament_setting`` payload for one AMS slot. ``ValueError`` on any bad field."""
-    if not (_is_int(ams) and ams in AMS_UNITS):
-        raise ValueError("ams must be an integer 0..3")
-    if not (_is_int(slot) and slot in AMS_SLOTS):
-        raise ValueError("slot must be an integer 0..3")
+    _check_unit_slot(ams, slot)
     if not (isinstance(tray_info_idx, str) and TRAY_INFO_IDX_RE.fullmatch(tray_info_idx)):
         raise ValueError("tray_info_idx must be 3..8 upper-case letters or digits")
     if not isinstance(tray_type, str) or tray_type not in TRAY_TYPES:
@@ -142,11 +201,8 @@ def _is_tray_setting(payload: Any) -> bool:
         return False
     if body["command"] != AMS_FILAMENT_SETTING or body["sequence_id"] != "0":
         return False
-    ids = (body["ams_id"], body["tray_id"])
-    if not all(_is_int(i) for i in ids):  # True would hash like 1 in the lookup below
-        return False
     # The inverse of tray_ids, so whatever mapping it holds is read back the same way.
-    unit_slot = {tray_ids(a, s): (a, s) for a in AMS_UNITS for s in AMS_SLOTS}.get(ids)
+    unit_slot = _unit_slot_of(body["ams_id"], body["tray_id"])
     if unit_slot is None:
         return False
     try:
@@ -162,6 +218,100 @@ def _is_tray_setting(payload: Any) -> bool:
     except (ValueError, TypeError):
         return False
     return rebuilt == payload
+
+
+def project_file(
+    *,
+    file: str,
+    plate: int,
+    md5: str,
+    subtask_name: str,
+    task_id: str,
+    ams: int,
+    slot: int,
+) -> dict:
+    """The ``project_file`` payload that prints ``plate`` of ``file`` from the USB root.
+
+    As verified on the P2S in phase 0 (docs/phase0-report.md, row 4), one AMS slot.
+    ``ValueError`` on any bad field.
+    """
+    if not (isinstance(file, str) and _FILE_RE.fullmatch(file)):
+        raise ValueError("file must be 1..121 letters, digits, '.', '_' or '-' (not leading) plus .gcode.3mf")
+    if not (_is_int(plate) and plate in PLATES):
+        raise ValueError(f"plate must be an integer {PLATES.start}..{PLATES.stop - 1}")
+    if not (isinstance(md5, str) and _MD5_RE.fullmatch(md5)):
+        raise ValueError("md5 must be 32 lower-case hex characters")
+    if not (isinstance(subtask_name, str) and subtask_name == file.removesuffix(GCODE_3MF_SUFFIX)):
+        raise ValueError("subtask_name must be the file name without .gcode.3mf")
+    if not (isinstance(task_id, str) and TASK_ID_RE.fullmatch(task_id)):
+        raise ValueError("task_id must be 1..19 digits")
+    _check_unit_slot(ams, slot)
+    ams_id, slot_id = tray_ids(ams, slot)
+    return {
+        "print": {
+            "sequence_id": "0",
+            "command": PROJECT_FILE,
+            "param": f"Metadata/plate_{plate}.gcode",
+            "url": f"ftp:///{file}",
+            "file": file,
+            "md5": md5,
+            "subtask_name": subtask_name,
+            "project_id": "0",
+            "profile_id": "0",
+            "task_id": task_id,
+            "subtask_id": "0",
+            "timelapse": False,
+            "bed_type": "auto",
+            "bed_leveling": True,
+            "bed_levelling": True,
+            "auto_bed_leveling": 2,
+            "flow_cali": False,
+            "vibration_cali": False,
+            "layer_inspect": True,
+            "use_ams": True,
+            "ams_mapping": [ams * len(AMS_SLOTS) + slot],
+            "ams_mapping2": [{"ams_id": ams_id, "slot_id": slot_id}],
+        }
+    }
+
+
+def _is_project_file(payload: Any) -> bool:
+    """True only for a payload ``project_file`` builds itself, key for key and type for type."""
+    if not isinstance(payload, dict) or set(payload) != {"print"}:
+        return False
+    body = payload["print"]
+    if not isinstance(body, dict) or set(body) != _PROJECT_KEYS or body["command"] != PROJECT_FILE:
+        return False
+    param, mapping2 = body["param"], body["ams_mapping2"]
+    match = _PLATE_PARAM_RE.fullmatch(param) if isinstance(param, str) else None
+    if match is None or not (isinstance(mapping2, list) and len(mapping2) == 1):
+        return False
+    entry = mapping2[0]
+    if not isinstance(entry, dict) or set(entry) != {"ams_id", "slot_id"}:
+        return False
+    unit_slot = _unit_slot_of(entry["ams_id"], entry["slot_id"])
+    if unit_slot is None:
+        return False
+    try:
+        rebuilt = project_file(
+            file=body["file"],
+            plate=int(match.group(1)),
+            md5=body["md5"],
+            subtask_name=body["subtask_name"],
+            task_id=body["task_id"],
+            ams=unit_slot[0],
+            slot=unit_slot[1],
+        )
+    except (ValueError, TypeError):
+        return False
+    return _same_json(rebuilt, payload)
+
+
+def _is_allowed(payload: Any) -> bool:
+    """The whole write allowlist: the reads, a tray setting, project_file, pause, stop."""
+    if any(_same_json(payload, fixed) for fixed in (*READ_COMMANDS, PAUSE_PRINT, STOP_PRINT)):
+        return True
+    return _is_tray_setting(payload) or _is_project_file(payload)
 
 
 class LinkStatus(Enum):
@@ -244,7 +394,7 @@ def build_tls_context(settings: Settings, serial: str | None = None) -> ssl.SSLC
 
 
 class PrinterLink:
-    """Keeps a verified MQTT session to the printer: reads and the one tray write."""
+    """Keeps a verified MQTT session to the printer: reads and the allowed writes."""
 
     def __init__(
         self,
@@ -345,12 +495,54 @@ class PrinterLink:
         )
         return payload
 
+    def start_project(
+        self,
+        *,
+        file: str,
+        plate: int,
+        md5: str,
+        subtask_name: str,
+        task_id: str,
+        ams: int,
+        slot: int,
+    ) -> None:
+        """Start printing ``plate`` of ``file`` (already on the USB root) from one AMS slot.
+
+        ``ValueError`` on a bad field, ``PrinterNotConnected`` when the message was not
+        handed to the connected printer. Sent at most once per call, never retried or
+        replayed on reconnect: whether the print started is read from the reports.
+        """
+        payload = project_file(
+            file=file, plate=plate, md5=md5, subtask_name=subtask_name, task_id=task_id, ams=ams, slot=slot
+        )
+        self._send_once(payload)
+        log.info("sent project_file: %s plate %d task_id %s AMS %d slot %d", file, plate, task_id, ams, slot)
+
+    def pause(self) -> None:
+        """Pause the running print. ``PrinterNotConnected`` when nothing was sent. No resume exists."""
+        self._send_once(PAUSE_PRINT)
+        log.info("sent pause")
+
+    def stop_print(self) -> None:
+        """Stop (cancel) the current print. ``PrinterNotConnected`` when nothing was sent.
+
+        Not ``stop()``: that closes this link at service shutdown.
+        """
+        self._send_once(STOP_PRINT)
+        log.info("sent stop")
+
     # --- internals ---------------------------------------------------------
+
+    def _send_once(self, payload: dict) -> None:
+        if not self._publish(payload):
+            raise PrinterNotConnected("printer link is not connected, nothing was sent")
 
     def _publish(self, payload: dict) -> bool:
         """Publish an allowed payload. False when the link is not verified or paho refuses it."""
-        if payload not in READ_COMMANDS and not _is_tray_setting(payload):
-            raise ValueError("only the read commands and a valid tray setting may be sent to the printer")
+        if not _is_allowed(payload):
+            raise ValueError(
+                "only the read commands, a valid tray setting, project_file, pause and stop may be sent"
+            )
         if not self._verified:
             log.debug("printer link not verified, request dropped")
             return False

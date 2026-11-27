@@ -30,7 +30,7 @@ def test_migrate_is_idempotent_and_seeds_tariff(tmp_path: Path):
     assert t.day_uah == 4.32
     assert t.night_uah is None
     assert t.valid_from == date(2024, 6, 1)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
     assert s._conn().execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     s.close()
 
@@ -186,7 +186,7 @@ def test_schema_tables_exist(tmp_path: Path):
     con = sqlite3.connect(path)
     tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     con.close()
-    assert {"seen", "meta", "spools", "slots", "plates", "tariffs", "prints"} <= tables
+    assert {"seen", "meta", "spools", "slots", "plates", "tariffs", "prints", "confirmations"} <= tables
 
 
 def _closed_print(store: Store) -> int:
@@ -215,7 +215,7 @@ def test_migrate_v1_database_adds_deduction_columns(tmp_path: Path):
     (row,) = s.history(None, 10)
     assert row.identity[0] == "old"
     assert (row.deducted_spool_id, row.deducted_g) == (None, None)
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
     s.close()
 
 
@@ -271,7 +271,7 @@ def test_migrate_v2_database_adds_outbox(tmp_path: Path):
         + "ALTER TABLE prints ADD COLUMN deducted_g REAL;\nPRAGMA user_version = 2;"
     )
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
     assert s.outbox_head() is None
     s.close()
 
@@ -371,7 +371,7 @@ def test_migrate_v3_to_v4(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
     (row,) = s.history(None, 10)
     assert row.identity[0] == "kept"
     assert s.outbox_head().dedupe == "k1"
@@ -409,7 +409,7 @@ def test_migrate_v4_to_v5_adds_print_job_columns(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
     row = s.print_by_id(print_id)
     assert (row.identity[0], row.spool_id, row.grams, row.deducted_g) == ("lamp-arm-1-p1", spool, 12.0, 12.0)
     assert (row.job_id, row.plate) == (None, None)
@@ -455,7 +455,7 @@ def test_migrate_v5_to_v6_adds_spool_tray_metadata(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
     (row,) = s.spools()
     assert (row.id, row.filament_preset, row.remaining_g) == (spool, "Bambu PLA Basic @BBL P2S", 988)
     assert (row.tray_info_idx, row.nozzle_temp_min, row.nozzle_temp_max) == (None, None, None)
@@ -493,7 +493,7 @@ def test_migrate_v6_to_v7_adds_the_job_slot(tmp_path: Path):
 
     s = Store(path)
     s.migrate()
-    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 7
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
     job = s.job(job_id)
     assert (job.name, job.status, job.settings_json, job.slot) == ("lamp-arm", "sliced", '{"wall_loops": 4}', None)
     s.update_job(job_id, slot=2)
@@ -503,4 +503,38 @@ def test_migrate_v6_to_v7_adds_the_job_slot(tmp_path: Path):
     for bad in (0, 17):
         with pytest.raises(sqlite3.IntegrityError):
             s.update_job(job_id, slot=bad)
+    s.close()
+
+
+def test_migrate_v7_to_v8_adds_confirmations(tmp_path: Path):
+    path = tmp_path / "v7.db"
+    conn = sqlite3.connect(path)
+    v1 = (Path(__file__).parents[2] / "src/bambu_mcp/store/schema.sql").read_text(encoding="utf-8")
+    conn.executescript(v1 + "".join(f"\n{_MIGRATIONS[v]}" for v in range(2, 8)) + "\nPRAGMA user_version = 7;")
+    job_id = conn.execute(
+        "INSERT INTO jobs (name, kind, manifest_json, file_sha256, created_at, status, slot)"
+        " VALUES ('lamp-arm', 'part', '{}', ?, '2026-11-23T00:00:00+00:00', 'sliced', 3)",
+        ("a" * 64,),
+    ).lastrowid
+    spool_id = conn.execute(
+        "INSERT INTO spools (brand, material, color_name, color_hex, price_uah, net_g, remaining_g)"
+        " VALUES ('Bambu', 'PLA', 'Black', '#000000', 700, 1000, 640)"
+    ).lastrowid
+    conn.commit()
+    conn.close()
+
+    s = Store(path)
+    s.migrate()
+    assert s._conn().execute("PRAGMA user_version").fetchone()[0] == 8
+    job = s.job(job_id)
+    assert (job.name, job.status, job.slot) == ("lamp-arm", "sliced", 3)
+    assert s.spools()[0].id == spool_id and s.spools()[0].remaining_g == 640
+    c = s.add_confirmation(
+        "f" * 32, "start", job_id=job_id, plate=1, gate_hash="b" * 64, payload_json="{}", now=100.0
+    )
+    assert s.claim_confirmation(c.id, now=101.0).job_id == job_id
+    for column, bad in (("kind", "resume"), ("state", "done")):
+        with pytest.raises(sqlite3.IntegrityError):
+            with s.transaction() as tx:
+                tx.execute(f"UPDATE confirmations SET {column} = ? WHERE id = ?", (bad, c.id))
     s.close()

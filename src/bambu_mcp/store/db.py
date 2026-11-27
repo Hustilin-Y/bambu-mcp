@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
+import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -11,7 +14,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 from bambu_mcp.store.models import (
+    CONFIRMATION_TTL_S,
     JOB_STATUSES,
+    Confirmation,
     Job,
     OutboxRow,
     Plate,
@@ -21,7 +26,8 @@ from bambu_mcp.store.models import (
 )
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
-_SCHEMA_VERSION = 7
+_CONFIRMATION_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
+_SCHEMA_VERSION = 8
 # schema.sql is the version-1 schema; each later version is one migration script.
 _MIGRATIONS = {
     2: "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
@@ -64,6 +70,20 @@ _MIGRATIONS = {
     "ALTER TABLE spools ADD COLUMN nozzle_temp_max INTEGER;",
     # The AMS slot the owner chose for a job (1..16 as the owner counts), NULL: by material.
     7: "ALTER TABLE jobs ADD COLUMN slot INTEGER CHECK (slot BETWEEN 1 AND 16);",
+    # Telegram buttons that start or stop a print. Single use: a press claims the row.
+    8: "CREATE TABLE confirmations (\n"
+    "    id TEXT PRIMARY KEY,\n"
+    "    kind TEXT NOT NULL CHECK (kind IN ('start', 'stop')),\n"
+    "    job_id INTEGER REFERENCES jobs(id),\n"
+    "    plate INTEGER,\n"
+    "    gate_hash TEXT,\n"
+    "    payload_json TEXT NOT NULL,\n"
+    "    created_at REAL NOT NULL,\n"
+    "    expires_at REAL NOT NULL,\n"
+    "    state TEXT NOT NULL DEFAULT 'pending'"
+    " CHECK (state IN ('pending', 'used', 'expired', 'cancelled')),\n"
+    "    outcome TEXT\n"
+    ");",
 }
 _SEEN_TTL_S = 30 * 24 * 3600
 _DEFAULT_TARIFF = (date(2024, 6, 1), 4.32, None)
@@ -133,6 +153,21 @@ def _print(row: sqlite3.Row) -> PrintRow:
         deducted_g=row["deducted_g"],
         job_id=row["job_id"],
         plate=row["plate"],
+    )
+
+
+def _confirmation(row: sqlite3.Row) -> Confirmation:
+    return Confirmation(
+        id=row["id"],
+        kind=row["kind"],
+        job_id=row["job_id"],
+        plate=row["plate"],
+        gate_hash=row["gate_hash"],
+        payload_json=row["payload_json"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+        state=row["state"],
+        outcome=row["outcome"],
     )
 
 
@@ -639,5 +674,88 @@ class Store:
             cur = conn.execute(
                 f"UPDATE jobs SET {assignments} WHERE id = ? AND status IN ({marks})",
                 (*fields.values(), id, *from_statuses),
+            )
+            return cur.rowcount == 1
+
+    # -- confirmations ---------------------------------------------------
+
+    def add_confirmation(
+        self,
+        id: str | None,
+        kind: str,
+        *,
+        job_id: int | None,
+        plate: int | None,
+        gate_hash: str | None,
+        payload_json: str,
+        now: float,
+        ttl_s: float = CONFIRMATION_TTL_S,
+    ) -> Confirmation:
+        """A new ``pending`` confirmation, valid from ``now`` for ``ttl_s`` seconds.
+
+        ``id`` None makes a random 128-bit one (``printgate.new_confirmation_id``), a given
+        one must be 32 lower-case hex characters. ``ttl_s`` is over 0 and at most 10 minutes.
+        """
+        if id is None:
+            id = secrets.token_hex(16)
+        elif not (isinstance(id, str) and _CONFIRMATION_ID_RE.fullmatch(id)):
+            raise ValueError("a confirmation id is 32 lower-case hex characters")
+        if not (isinstance(ttl_s, int | float) and math.isfinite(ttl_s) and 0 < ttl_s <= CONFIRMATION_TTL_S):
+            raise ValueError(f"ttl_s must be over 0 and at most {CONFIRMATION_TTL_S:g} seconds")
+        with self._tx() as conn:
+            row = conn.execute(
+                "INSERT INTO confirmations (id, kind, job_id, plate, gate_hash, payload_json,"
+                " created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+                (id, kind, job_id, plate, gate_hash, payload_json, now, now + ttl_s),
+            ).fetchone()
+            return _confirmation(row)
+
+    def confirmation(self, id: str) -> Confirmation | None:
+        row = self._conn().execute("SELECT * FROM confirmations WHERE id = ?", (id,)).fetchone()
+        return _confirmation(row) if row else None
+
+    def claim_confirmation(self, id: str, now: float) -> Confirmation | None:
+        """Move a pending, unexpired confirmation to ``used`` and return it, in one statement.
+
+        At most one caller ever gets it, also across connections. A pending one past
+        its expiry is marked ``expired``. None for expired, used, cancelled or unknown.
+        """
+        with self._tx() as conn:
+            row = conn.execute(
+                "UPDATE confirmations SET state = 'used'"
+                " WHERE id = ? AND state = 'pending' AND expires_at > ? RETURNING *",
+                (id, now),
+            ).fetchone()
+            if row is not None:
+                return _confirmation(row)
+            conn.execute(
+                "UPDATE confirmations SET state = 'expired'"
+                " WHERE id = ? AND state = 'pending' AND expires_at <= ?",
+                (id, now),
+            )
+            return None
+
+    def set_confirmation_outcome(self, id: str, outcome: str) -> None:
+        """What a press led to: ``started``, ``unconfirmed``, ``refused:<reason>`` or ``cancelled``."""
+        with self._tx() as conn:
+            cur = conn.execute("UPDATE confirmations SET outcome = ? WHERE id = ?", (outcome, id))
+            if cur.rowcount == 0:
+                raise KeyError("no such confirmation")  # the id stays out of logs and errors
+
+    def undecided_confirmations(self, kind: str) -> list[Confirmation]:
+        """``used`` confirmations of ``kind`` with no outcome: a press a restart cut off. Oldest first."""
+        rows = self._conn().execute(
+            "SELECT * FROM confirmations WHERE kind = ? AND state = 'used' AND outcome IS NULL"
+            " ORDER BY created_at",
+            (kind,),
+        )
+        return [_confirmation(r) for r in rows]
+
+    def cancel_confirmation(self, id: str) -> bool:
+        """Cancel a pending confirmation. False when it is not pending (or unknown)."""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE confirmations SET state = 'cancelled' WHERE id = ? AND state = 'pending'",
+                (id,),
             )
             return cur.rowcount == 1

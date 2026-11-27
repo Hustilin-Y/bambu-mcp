@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 JOB_STATUSES = ("new", "slicing", "sliced", "slice_failed")
+CONFIRMATION_TTL_S = 600.0  # a print start or stop confirmation is valid 10 minutes
 
 
 @dataclass(frozen=True)
@@ -91,3 +92,17 @@ class Job:
     sliced_file: str | None  # a file name, never a path
     error: str | None
     slot: int | None = None  # the owner's AMS slot choice (1..16), None: chosen by material
+
+
+@dataclass(frozen=True)
+class Confirmation:
+    id: str  # 128-bit random hex, the button's callback id
+    kind: str  # "start" or "stop"
+    job_id: int | None
+    plate: int | None
+    gate_hash: str | None  # printgate.gate_hash at the time the button was sent
+    payload_json: str  # what the press needs to act, opaque to the store
+    created_at: float  # epoch seconds
+    expires_at: float  # epoch seconds, claims at or after it fail
+    state: str  # "pending", "used", "expired" or "cancelled"
+    outcome: str | None  # what happened after the press, None until then

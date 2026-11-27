@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+import hashlib
 import json
 import os
 import threading
@@ -143,10 +144,12 @@ def test_slice_happy_path_names_output(tmp_path):
     cfg, slicer, pc, client = harness(tmp_path)
     r = client.post("/slice", files=files(), headers=AUTH)
     assert r.status_code == 200, r.text
+    out = cfg.sliced_dir / "example-bracket-7-p1.gcode.3mf"
     assert r.json() == {
         "file": "example-bracket-7-p1.gcode.3mf",
         "plates": [{"index": 1, "minutes": 10.0, "grams": {"1": 1.5}}],
         "slicer_version": "02.08.02.61",
+        "sha256": hashlib.sha256(out.read_bytes()).hexdigest(),  # recorded at slicing, checked at print
     }
     (call,) = slicer.calls
     assert call["out_name"] == "example-bracket-7-p1"

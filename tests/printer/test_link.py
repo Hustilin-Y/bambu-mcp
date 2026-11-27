@@ -24,13 +24,16 @@ from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.printer import link as link_module
 from bambu_mcp.printer.link import (
     GET_VERSION,
+    PAUSE_PRINT,
     PUSH_ALL,
     READ_COMMANDS,
+    STOP_PRINT,
     TRAY_TYPES,
     LinkStatus,
     PrinterLink,
     PrinterNotConnected,
     build_tls_context,
+    project_file,
     tray_setting,
 )
 
@@ -393,6 +396,294 @@ def test_publish_accepts_exactly_the_reads_and_a_valid_tray_setting(h):
     for payload in (GET_VERSION, PUSH_ALL, TRAY_PAYLOAD):
         h.link._publish(payload)
     assert [c[2] for c in h.client.calls] == [GET_VERSION, PUSH_ALL, TRAY_PAYLOAD]
+
+
+# -- phase 3 writes: project_file, pause, stop -----------------------------------------
+
+PROJECT = dict(
+    file="cube_v2.gcode.3mf",
+    plate=2,
+    md5="0123456789abcdef0123456789abcdef",
+    subtask_name="cube_v2",
+    task_id="1795385330",
+    ams=0,
+    slot=2,
+)
+PROJECT_PAYLOAD = {
+    "print": {
+        "sequence_id": "0",
+        "command": "project_file",
+        "param": "Metadata/plate_2.gcode",
+        "url": "ftp:///cube_v2.gcode.3mf",
+        "file": "cube_v2.gcode.3mf",
+        "md5": "0123456789abcdef0123456789abcdef",
+        "subtask_name": "cube_v2",
+        "project_id": "0",
+        "profile_id": "0",
+        "task_id": "1795385330",
+        "subtask_id": "0",
+        "timelapse": False,
+        "bed_type": "auto",
+        "bed_leveling": True,
+        "bed_levelling": True,
+        "auto_bed_leveling": 2,
+        "flow_cali": False,
+        "vibration_cali": False,
+        "layer_inspect": True,
+        "use_ams": True,
+        "ams_mapping": [2],
+        "ams_mapping2": [{"ams_id": 0, "slot_id": 2}],
+    }
+}
+
+
+def _sent(h) -> list[dict]:
+    return [c[2] for c in h.client.calls if c[0] == "publish"]
+
+
+def test_start_project_payload_exact(h):
+    assert project_file(**PROJECT) == PROJECT_PAYLOAD
+    h.client.fire_connect()
+    h.client.calls.clear()
+    assert h.link.start_project(**PROJECT) is None
+    assert h.client.calls == [("publish", f"device/{SERIAL}/request", PROJECT_PAYLOAD)]
+    # Booleans stay booleans and integers stay integers (dict equality alone would hide it).
+    body = project_file(**PROJECT)["print"]
+    assert json.dumps(body, sort_keys=True) == json.dumps(PROJECT_PAYLOAD["print"], sort_keys=True)
+
+
+def test_start_project_ams_mapping_is_global_slot_index(h):
+    h.client.fire_connect()
+    h.client.calls.clear()
+    pairs = [(ams, slot) for ams in range(4) for slot in range(4)]
+    for ams, slot in pairs:
+        h.link.start_project(**{**PROJECT, "ams": ams, "slot": slot})
+    sent = [p["print"] for p in _sent(h)]
+    assert [p["ams_mapping"] for p in sent] == [[a * 4 + s] for a, s in pairs]
+    assert [p["ams_mapping2"] for p in sent] == [[{"ams_id": a, "slot_id": s}] for a, s in pairs]
+
+
+def test_start_project_accepts_the_bounds(h):
+    h.client.fire_connect()
+    h.client.calls.clear()
+    longest = "a" * 121 + ".gcode.3mf"
+    h.link.start_project(**{**PROJECT, "file": "A.gcode.3mf", "subtask_name": "A", "plate": 1, "task_id": "0"})
+    h.link.start_project(
+        **{**PROJECT, "file": longest, "subtask_name": "a" * 121, "plate": 50, "task_id": "9" * 19}
+    )
+    sent = [p["print"] for p in _sent(h)]
+    assert [(p["param"], p["task_id"]) for p in sent] == [
+        ("Metadata/plate_1.gcode", "0"),
+        ("Metadata/plate_50.gcode", "9" * 19),
+    ]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"file": "cube_v2.3mf", "subtask_name": "cube_v2"},
+        {"file": "cube_v2.gcode", "subtask_name": "cube_v2"},
+        {"file": ".cube.gcode.3mf", "subtask_name": ".cube"},
+        {"file": "_cube.gcode.3mf", "subtask_name": "_cube"},
+        {"file": "dir/cube.gcode.3mf", "subtask_name": "dir/cube"},
+        {"file": "../cube.gcode.3mf", "subtask_name": "../cube"},
+        {"file": "cube v2.gcode.3mf", "subtask_name": "cube v2"},
+        {"file": "куб.gcode.3mf", "subtask_name": "куб"},
+        {"file": "cube.gcode.3mf\n", "subtask_name": "cube"},
+        {"file": "a" * 122 + ".gcode.3mf", "subtask_name": "a" * 122},
+        {"file": ".gcode.3mf", "subtask_name": ""},
+        {"file": None},
+        {"subtask_name": "other"},
+        {"subtask_name": "cube_v2.gcode.3mf"},
+        {"subtask_name": None},
+        {"md5": "0123456789ABCDEF0123456789ABCDEF"},
+        {"md5": "0123456789abcdef0123456789abcde"},
+        {"md5": "0123456789abcdef0123456789abcdef0"},
+        {"md5": "0123456789abcdef0123456789abcdeg"},
+        {"md5": "0123456789abcdef0123456789abcde\n"},
+        {"md5": None},
+        {"plate": 0},
+        {"plate": 51},
+        {"plate": -1},
+        {"plate": True},
+        {"plate": 2.0},
+        {"plate": "2"},
+        {"task_id": ""},
+        {"task_id": "1" * 20},
+        {"task_id": "-1"},
+        {"task_id": "12a"},
+        {"task_id": "123\n"},
+        {"task_id": "１２３"},
+        {"task_id": 123},
+        {"ams": -1},
+        {"ams": 4},
+        {"ams": True},
+        {"ams": "0"},
+        {"slot": 4},
+        {"slot": -1},
+        {"slot": 2.0},
+        {"slot": None},
+    ],
+)
+def test_start_project_rejects_bad_fields(h, change):
+    h.client.fire_connect()
+    h.client.calls.clear()
+    with pytest.raises(ValueError):
+        project_file(**{**PROJECT, **change})
+    with pytest.raises(ValueError):
+        h.link.start_project(**{**PROJECT, **change})
+    assert "publish" not in h.client.names()
+
+
+def test_pause_and_stop_payloads_exact(h):
+    assert PAUSE_PRINT == {"print": {"sequence_id": "0", "command": "pause", "param": ""}}
+    assert STOP_PRINT == {"print": {"sequence_id": "0", "command": "stop", "param": ""}}
+    h.client.fire_connect()
+    h.client.calls.clear()
+    assert h.link.pause() is None
+    assert h.link.stop_print() is None
+    assert h.client.calls == [
+        ("publish", f"device/{SERIAL}/request", PAUSE_PRINT),
+        ("publish", f"device/{SERIAL}/request", STOP_PRINT),
+    ]
+    assert LinkStatus.DISCONNECTED not in h.statuses  # stopping the print is not closing the link
+
+
+@pytest.mark.parametrize(
+    "send",
+    [
+        lambda link: link.start_project(**PROJECT),
+        lambda link: link.pause(),
+        lambda link: link.stop_print(),
+    ],
+    ids=["project_file", "pause", "stop"],
+)
+def test_new_writes_raise_when_not_sent(h, send):
+    h.client.calls.clear()
+    with pytest.raises(PrinterNotConnected):
+        send(h.link)  # peer not verified yet
+    assert "publish" not in h.client.names()
+    h.client.fire_connect()
+    h.client.calls.clear()
+    h.client.publish_rc = mqtt.MQTT_ERR_NO_CONN
+    with pytest.raises(PrinterNotConnected) as exc:
+        send(h.link)
+    assert SERIAL not in str(exc.value) and ACCESS_CODE not in str(exc.value)
+    assert len(_sent(h)) == 1  # one attempt, no retry
+
+
+def test_new_writes_are_never_resent_on_reconnect(h):
+    h.client.fire_connect()
+    h.client.publish_rc = mqtt.MQTT_ERR_NO_CONN
+    with pytest.raises(PrinterNotConnected):
+        h.link.start_project(**PROJECT)
+    h.client.publish_rc = mqtt.MQTT_ERR_SUCCESS
+    h.client.calls.clear()
+    h.client.fire_disconnect()
+    h.run_next()
+    h.client.fire_connect()  # a reconnect sends only the two reads
+    assert _sent(h) == [GET_VERSION, PUSH_ALL]
+
+
+def _pf(**changes) -> dict:
+    return {"print": {**PROJECT_PAYLOAD["print"], **changes}}
+
+
+def _pf_without(key: str) -> dict:
+    return {"print": {k: v for k, v in PROJECT_PAYLOAD["print"].items() if k != key}}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"print": {"sequence_id": "0", "command": "resume", "param": ""}},
+        {"print": {"sequence_id": "0", "command": "resume"}},
+        {"print": {"sequence_id": "0", "command": "gcode_line", "param": "G28"}},
+        {"print": {"sequence_id": "0", "command": "gcode_line", "param": ""}},
+        {"print": {"sequence_id": "0", "command": "pause", "param": "", "extra": 1}},
+        {"print": {"sequence_id": "0", "command": "stop", "param": "G28"}},
+        {"print": {"sequence_id": "1", "command": "stop", "param": ""}},
+        {"print": {"sequence_id": "0", "command": "pause"}},
+        {"print": {"sequence_id": "0", "command": "stop", "param": None}},
+        {**STOP_PRINT, "pushing": PUSH_ALL["pushing"]},
+        {"system": STOP_PRINT["print"]},
+        {"print": [PAUSE_PRINT["print"]]},
+        json.dumps(STOP_PRINT),
+        # project_file with an extra key, a missing key, or a second command key
+        _pf(extra=1),
+        _pf(gcode_line="G28"),
+        _pf(command="gcode_line"),
+        _pf(command2="stop"),
+        _pf_without("md5"),
+        _pf_without("ams_mapping2"),
+        {**PROJECT_PAYLOAD, "pushing": PUSH_ALL["pushing"]},
+        {**PROJECT_PAYLOAD, "system": {"sequence_id": "0", "command": "ledctrl"}},
+        _pf(inner={"command": "stop"}),
+        # url not ftp:///<file>
+        _pf(url="ftp:///other.gcode.3mf"),
+        _pf(url="ftp://192.0.2.1/cube_v2.gcode.3mf"),
+        _pf(url="file:///sdcard/cube_v2.gcode.3mf"),
+        _pf(url="https://example.com/cube_v2.gcode.3mf"),
+        _pf(url="ftp:///cube_v2.gcode.3mf "),
+        # every field must be what project_file builds
+        _pf(file="other.gcode.3mf"),
+        _pf(file="other.gcode.3mf", url="ftp:///other.gcode.3mf"),
+        _pf(subtask_name="other"),
+        _pf(param="Metadata/plate_0.gcode"),
+        _pf(param="Metadata/plate_51.gcode"),
+        _pf(param="Metadata/plate_02.gcode"),
+        _pf(param="G28"),
+        _pf(param=2),
+        _pf(md5="0123456789ABCDEF0123456789ABCDEF"),
+        _pf(task_id=1795385330),
+        _pf(task_id="abc"),
+        _pf(subtask_id="1"),
+        _pf(project_id="1"),
+        _pf(profile_id="1"),
+        _pf(sequence_id="1"),
+        _pf(timelapse=True),
+        _pf(timelapse=0),
+        _pf(use_ams=1),
+        _pf(bed_type="textured_plate"),
+        _pf(bed_leveling=False),
+        _pf(bed_levelling=1),
+        _pf(auto_bed_leveling=True),
+        _pf(auto_bed_leveling=2.0),
+        _pf(flow_cali=True),
+        _pf(vibration_cali=True),
+        _pf(layer_inspect=False),
+        _pf(ams_mapping=[3]),
+        _pf(ams_mapping=[True]),
+        _pf(ams_mapping=[2.0]),
+        _pf(ams_mapping=[2, 3]),
+        _pf(ams_mapping=2),
+        _pf(ams_mapping2=[{"ams_id": 0, "slot_id": 3}]),
+        _pf(ams_mapping2=[{"ams_id": 0, "slot_id": 2, "x": 1}]),
+        _pf(ams_mapping2=[{"ams_id": False, "slot_id": 2}]),
+        _pf(ams_mapping2=[{"ams_id": 0, "slot_id": 2.0}]),
+        _pf(ams_mapping2=[{"ams_id": 0, "slot_id": 9}]),
+        _pf(ams_mapping2=[{"ams_id": 0, "slot_id": 2}, {"ams_id": 0, "slot_id": 2}]),
+        _pf(ams_mapping2=[]),
+        _pf(ams_mapping2={"ams_id": 0, "slot_id": 2}),
+        _pf(ams_mapping2=["x"]),
+        None,
+    ],
+)
+def test_publish_refuses_everything_else(h, payload):
+    h.client.fire_connect()
+    h.client.calls.clear()
+    with pytest.raises(ValueError):
+        h.link._publish(payload)
+    assert "publish" not in h.client.names()
+
+
+def test_publish_accepts_exactly_the_allowed_payloads(h):
+    h.client.fire_connect()
+    h.client.calls.clear()
+    allowed = (GET_VERSION, PUSH_ALL, TRAY_PAYLOAD, PROJECT_PAYLOAD, PAUSE_PRINT, STOP_PRINT)
+    for payload in allowed:
+        h.link._publish(payload)
+    assert _sent(h) == list(allowed)
 
 
 def test_auth_failure_stops_reconnecting(h, caplog):

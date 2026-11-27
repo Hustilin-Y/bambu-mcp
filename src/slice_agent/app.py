@@ -4,6 +4,7 @@ Subcommands: `flatten` (write the flattened presets) and `serve` (HTTP API on cf
 
 API (bearer SLICE_AGENT_TOKEN on everything but /health):
 - POST /slice: multipart with a `file` part (3MF, max 50 MB) and a `job` part (JSON, max 64 KB).
+  200: {file, plates, slicer_version, sha256}, sha256 of the sliced file (lower-case hex).
 - GET /sliced/{name}: a sliced file from sliced_dir, only names the agent itself produces.
 - GET /sliced/{name}/plate/{n}.png: the plate preview inside that file.
 - GET /health: {"ok": true}.
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import hmac
 import json
 import logging
@@ -305,6 +307,14 @@ class Redactor:
         return text
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _error(status: int, error: str, **extra) -> JSONResponse:
     return JSONResponse({"error": error, **extra}, status_code=status)
 
@@ -452,7 +462,13 @@ class SliceAgent:
             for p in result.plates
             if p.index in wanted
         ]
-        return 200, {"file": final.name, "plates": plates, "slicer_version": result.slicer_version}
+        body = {"file": final.name, "plates": plates, "slicer_version": result.slicer_version}
+        try:
+            body["sha256"] = _file_sha256(final)  # the server checks the file it prints against it
+        except OSError as e:
+            final.unlink(missing_ok=True)
+            return 500, self._failed(f"cannot hash the sliced file: {type(e).__name__}", run.log_tail)
+        return 200, body
 
     def _sliced_path(self, name: str) -> Path | None:
         if not SLICED_RE.fullmatch(name):

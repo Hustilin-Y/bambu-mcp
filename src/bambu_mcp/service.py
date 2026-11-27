@@ -15,7 +15,10 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
+import re
+import secrets as _secrets
 import shutil
 import signal
 import uuid
@@ -42,19 +45,47 @@ from bambu_mcp.messages import (
     fit_question,
     job_name,
     md_literal,
+    plate_buttons,
+    plate_question,
     post_print_buttons,
+    print_buttons,
     render_event,
+    render_print_refused,
+    render_print_started,
     render_proposal,
     render_sliced,
+    render_start_confirmation,
+    render_start_unconfirmed,
+    render_stop_confirmation,
     slot_buttons,
     spool_buttons,
     spool_question,
+    start_buttons,
+    stop_ask_buttons,
+    stop_buttons,
 )
 from bambu_mcp.names import slug
 from bambu_mcp.notify import Button, LogNotifier, Notifier, Press, SendError, ServiceNotifyClient
+from bambu_mcp.printer import ftps
+from bambu_mcp.printer.ftps import UploadError
 from bambu_mcp.printer.hms import HmsTexts
-from bambu_mcp.printer.link import LinkStatus, PrinterLink, PrinterNotConnected
+from bambu_mcp.printer.link import (
+    GCODE_3MF_SUFFIX,
+    TASK_ID_RE,
+    LinkStatus,
+    PrinterLink,
+    PrinterNotConnected,
+)
 from bambu_mcp.printer.state import PrinterState, apply
+from bambu_mcp.printgate import (
+    ControlRefused,
+    PrintFileError,
+    PrintFileInfo,
+    PrintRefused,
+    gate_hash,
+    preflight,
+    print_file_info,
+)
 from bambu_mcp.proposal import (
     SlotChoice,
     SlotUnusable,
@@ -72,6 +103,7 @@ from bambu_mcp.proposal import (
 from bambu_mcp.redact import install_redaction
 from bambu_mcp.slicer import (
     WAKE_BUDGET_S,
+    FetchError,
     GatewayWaker,
     SliceClient,
     SliceOutcome,
@@ -126,10 +158,63 @@ _WAKE_TEXTS = {
     "not_configured": "ПК выключен, а шлюз для пробуждения не настроен",
 }
 ATTACHMENTS_DIR = "outbox-files"  # data_dir/<this>/<sha256 of the dedupe key>/<file>
+# Printing (phase 3).
+PRINT_CACHE_DIR = "print-cache"  # data_dir/<this>/<sliced file>, fetched from the PC
+PRINT_CACHE_KEEP = 3  # sliced files kept, newest first
+START_WATCH_S = 30.0  # after project_file: our task_id must show up PREPARE or RUNNING
+REPORT_WAIT_S = 5.0  # a fresh pushall before the checks
+START_REPORTED = frozenset({"PREPARE", "RUNNING"})
+STOPPABLE_STATES = frozenset({"PREPARE", "RUNNING", "PAUSE"})  # PREPARE: heating and levelling
+UPLOAD_TIMEOUT_S = 300.0  # the whole FTPS upload: ftps.upload has only per-socket timeouts
+_CONFIRM_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
+_HASH_CHUNK = 1 << 16
+UPLOADING_TEXT = "⏳ Загружаю на принтер…"
+STARTING_TEXT = "⏳ Уже запускаю печать"
+CANCELLED_TEXT = "Печать отменена"
+_SPENT_TEXTS = {
+    "used": "Эта кнопка уже нажата, второй раз печать не запускается",
+    "expired": "⌛ Подтверждение истекло, подготовь печать заново",
+    "cancelled": "Печать отменена, подготовь её заново, если нужно",
+}
+NOT_SLICED_TEXT = "Задание «{name}» не нарезано, сначала нарежь его"
+JOB_CHANGED_TEXT = "Задание изменилось после подтверждения, подготовь печать заново"
+FILE_GONE_TEXT = "Нарезанного файла уже нет на сервере, подготовь печать заново"
+FILE_CHANGED_TEXT = "Нарезанный файл изменился после подтверждения, подготовь печать заново"
+NOT_CONNECTED_TEXT = "Принтер не на связи, команда не отправлена"
+INTERNAL_TEXT = "внутренняя ошибка сервиса"
+INTERRUPTED_TEXT = (
+    "⚠️ Запуск печати «{name}» прервался из-за перезапуска сервиса. Не знаю, начал ли принтер печатать. "
+    "Посмотри на экран принтера. Команда повторно не отправляется."
+)
+UPLOAD_TIMEOUT_TEXT = "Файл не загрузился на принтер: загрузка на принтер не уложилась в 5 минут"
+NO_JOB_TEXT = "Задание не найдено"
+NO_PLATE_TEXT = "В задании нет пластины {plate}"
+# The confirmed stop.
+STOP_SENT_TEXT = "⏹ Команда остановки отправлена"
+STOP_CANCELLED_TEXT = "Остановка отменена"
+STOP_NOT_CONNECTED_TEXT = "Принтер не на связи, остановка не отправлена"
+STOP_NOT_FRESH_TEXT = "Принтер ещё не прислал свежий отчёт после переподключения, остановка не отправлена"
+STOP_OVER_TEXT = "Эта печать уже не идёт, останавливать нечего"
+STOP_UNSURE_TEXT = "⚠️ Не знаю, дошла ли команда остановки. Посмотри на принтер, повторно она не отправляется"
+STOP_OTHER_TEXT = "Сейчас идёт другая печать, а кнопка была для прежней. Остановка не отправлена"
+_STOP_SPENT_TEXTS = {
+    "used": "Эта кнопка уже нажата, остановка второй раз не отправляется",
+    "expired": "⌛ Подтверждение истекло, остановка не отправлена. Запроси её заново, если нужно",
+    "cancelled": STOP_CANCELLED_TEXT,
+}
+TLS_TEXT = (
+    "Загрузка на принтер идёт по TLS с проверкой сертификата: в настройках нужны "
+    + md_literal('tls_mode = "ca"')
+    + " и "
+    + md_literal("ca_file")
+)
+TLS_ERROR = 'printing needs tls_mode = "ca" and ca_file in the config: the FTPS upload checks the printer certificate'
 
 Camera = Callable[[], Awaitable[bytes | None]]
 Clock = Callable[[], datetime]
 Sleep = Callable[[float], Awaitable[None]]
+# ftps.upload(host, serial, access_code, ca_file, local, remote_name): blocking, run in a thread.
+Uploader = Callable[[str, str, str, Path, Path, str], None]
 
 
 class Link(Protocol):
@@ -150,6 +235,14 @@ class Link(Protocol):
         nozzle_temp_max: int,
     ) -> dict: ...
 
+    def start_project(
+        self, *, file: str, plate: int, md5: str, subtask_name: str, task_id: str, ams: int, slot: int
+    ) -> None: ...
+
+    def pause(self) -> None: ...
+
+    def stop_print(self) -> None: ...
+
 
 class Slicer(Protocol):
     """``slicer.SliceClient``."""
@@ -159,6 +252,8 @@ class Slicer(Protocol):
     async def slice(self, job: SliceRequest, file_bytes: bytes) -> SliceOutcome: ...
 
     async def fetch_png(self, name: str, plate: int) -> bytes | None: ...
+
+    async def fetch_file(self, name: str, dest: Path) -> str: ...
 
 
 class Waker(Protocol):
@@ -191,6 +286,71 @@ class SlicePlan:
     named_set: str  # its values are in ``settings``, the agent always gets PROCESS_SET
     filament: str | None  # the spool's Bambu Studio filament preset
     usable: tuple[UsableSlot, ...] = ()  # slots the owner may choose instead
+
+
+@dataclass(frozen=True)
+class PrepareResult:
+    """A start confirmation sent to Telegram: only the owner's press on it starts the print."""
+
+    confirm_id: str
+    text: str
+    warnings: list[str]
+
+
+@dataclass(frozen=True)
+class StopRequest:
+    """A stop confirmation sent to Telegram: only the owner's press on it stops the print."""
+
+    confirm_id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class _StopProblem:
+    """Why a stop is not asked for or not sent: ``reason`` for the outcome, English and Russian."""
+
+    reason: str
+    error: str
+    text: str
+
+
+@dataclass(frozen=True)
+class _PrintTarget:
+    """What a start prints, read from the job's slice result and the current slot mapping.
+
+    Built the same way at prepare and at the press, so the gate hash compares like with like.
+    """
+
+    job: Job
+    plate: int
+    file: str  # the sliced file name: on the PC, in the cache, on the USB stick
+    expected_sha256: str | None  # recorded at slicing
+    choice: SlotChoice
+    spool: Spool | None  # mapped to the slot now
+    nozzle: str  # "0.4"
+    plate_type: str
+
+
+class _StartSent(Exception):
+    """``project_file`` may have left: the outcome is ``unconfirmed``, never a refusal."""
+
+
+class _StartRefused(Exception):
+    """The press does not start the print. ``reason`` goes into the confirmation's outcome."""
+
+    def __init__(self, reason: str, lines: list[str]) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.lines = lines
+
+
+@dataclass
+class _StartWatch:
+    """The report the press waits for: our ``task_id``, PREPARE or RUNNING, after the send."""
+
+    task_id: str
+    event: asyncio.Event
+    announced: bool = False  # the STARTED event message (with the stop button) was queued
 
 
 LinkFactory = Callable[[Callable[[dict], None], Callable[[LinkStatus], None]], Link]
@@ -251,6 +411,10 @@ class Service:
         sleep: Sleep = asyncio.sleep,
         slicer: Slicer | None = None,
         waker: Waker | None = None,
+        uploader: Uploader = ftps.upload,
+        watch_s: float = START_WATCH_S,
+        report_wait_s: float = REPORT_WAIT_S,
+        upload_timeout_s: float = UPLOAD_TIMEOUT_S,
     ) -> None:
         self._secrets = secrets
         self._settings = settings
@@ -285,6 +449,18 @@ class Service:
         self._slicer = slicer
         self._waker = waker
         self._slice_tasks: set[asyncio.Task] = set()
+        # Printing (phase 3).
+        self._uploader = uploader
+        self._watch_s = watch_s
+        self._report_wait_s = report_wait_s
+        self._upload_timeout_s = upload_timeout_s
+        self._start_lock = asyncio.Lock()  # one start at a time
+        self._press_tasks: set[asyncio.Task] = set()  # starts and prepares run off the press loop
+        self._preparing: set[int] = set()  # job ids with a prepare from a button in flight
+        self._report_waiters: set[asyncio.Event] = set()
+        self._watch: _StartWatch | None = None
+        self._own_tasks: set[str] = set()  # task ids this process sent: their start gets the stop button
+        self._last_task_id = 0
 
     # -- public ----------------------------------------------------------------
 
@@ -345,6 +521,10 @@ class Service:
             self._sweep_attachments()
         except Exception:
             log.exception("removing unused message attachments failed")
+        try:
+            self._close_interrupted_starts()
+        except Exception:
+            log.exception("checking for interrupted print starts failed")
         link = self._link_factory(self._on_report_threadsafe, self._on_status_threadsafe)
         tasks = [
             asyncio.create_task(self._consume_inbox(), name="bambu-inbox"),
@@ -360,6 +540,7 @@ class Service:
             self._link = None
             await asyncio.to_thread(link.stop)  # joins paho's network thread
             tasks += self._slice_tasks  # a cancelled slice marks its job failed
+            tasks += self._press_tasks
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -552,6 +733,24 @@ class Service:
                 with contextlib.suppress(OSError):
                     entry.unlink()
 
+    def _close_interrupted_starts(self) -> None:
+        """Start presses a restart cut off: claimed, never decided. Never sent again.
+
+        The confirmation became ``unconfirmed`` and the owner is asked to look at the printer:
+        the ``project_file`` may or may not have left before the restart.
+        """
+        for confirmation in self._store.undecided_confirmations("start"):
+            job = self._store.job(confirmation.job_id) if confirmation.job_id is not None else None
+            name = job_name(job.name if job is not None else None)
+            with self._store.transaction():
+                self._store.set_confirmation_outcome(confirmation.id, "unconfirmed")
+                self._enqueue(
+                    "print_interrupted",
+                    INTERRUPTED_TEXT.format(name=name),
+                    f"start|{_id_tag(confirmation.id)}|interrupted",
+                )
+            log.warning("a print start was interrupted by a restart, the owner is asked to check the printer")
+
     def _attachments(self, dedupe: str) -> list[tuple[str, bytes]]:
         """Files stored for an outbox message (a plate picture), kept until it is dropped."""
         folder = self._attachments_dir(dedupe)
@@ -599,10 +798,15 @@ class Service:
     def _handle_status(self, status: LinkStatus) -> None:
         self._link_status = status
         self._state_fresh = False  # CONNECTED included: wait for the printer's next report
-        if status is not LinkStatus.CONNECTED and self._state.gcode_state != "UNKNOWN":
+        if status is not LinkStatus.CONNECTED:
             # The printer may change unseen while the link is down. The event detector
             # compares an UNKNOWN state with the last known one, so this announces nothing.
-            self._state = replace(self._state, gcode_state="UNKNOWN", raw_unknown_state=None)
+            # Pre-flight trusts the USB stick only from a report since the next CONNECTED, so
+            # it is forgotten too. The task id stays: the detector compares job identities,
+            # and a first report without it would announce the running job again.
+            forget = {"gcode_state": "UNKNOWN", "raw_unknown_state": None, "sdcard": None}
+            if any(getattr(self._state, key) != value for key, value in forget.items()):
+                self._state = replace(self._state, **forget)
         if status is LinkStatus.AUTH_FAILED and not self._auth_alerted:
             self._auth_alerted = True
             at = self._clock().astimezone(UTC)
@@ -610,6 +814,15 @@ class Service:
 
     async def _handle_press(self, press: Press) -> None:
         try:
+            if press.button_id.startswith("start:"):
+                await self._on_start_press(press)
+                return
+            if press.button_id.startswith("stop:"):
+                await self._on_stop_press(press)
+                return
+            if _print_press(press.button_id) is not None:
+                await self._on_print_press(press)
+                return
             if _slot_press(press.button_id) is not None:
                 await self._on_slot_press(press)
                 return
@@ -630,7 +843,8 @@ class Service:
         at = self._clock()
         self._state = new
         body = report.get("print")
-        if isinstance(body, dict) and "gcode_state" in body:
+        state_report = isinstance(body, dict) and "gcode_state" in body
+        if state_report:
             self._state_fresh = True
         if new.gcode_state != "UNKNOWN":
             identity = event_identity(new)
@@ -652,6 +866,13 @@ class Service:
                         self._process(event)
                 except Exception:
                     log.exception("handling a %s event failed", event.kind)
+        # After the events: a STARTED message for our task is queued before the press goes on.
+        if state_report:
+            for waiter in self._report_waiters:
+                waiter.set()
+        watch = self._watch
+        if watch is not None and new.task_id == watch.task_id and new.gcode_state in START_REPORTED:
+            watch.event.set()
 
     def _unseen_ends(self, new: PrinterState, at: datetime, ended: set[tuple]) -> list[Event]:
         """Close journal rows of prints whose end the service did not see.
@@ -715,21 +936,28 @@ class Service:
             print_id = cost = duration = None
 
         text = render_event(event, self._hms_texts, cost, duration, tz=self._tz)
+        buttons = None
+        task_id = event.state.task_id
+        if event.kind is EventKind.STARTED and task_id and task_id in self._own_tasks:
+            buttons = stop_ask_buttons(task_id)  # a print started from our button
         self._enqueue(
-            str(event.kind), text, event.dedupe_key, snapshot=event.kind in SNAPSHOT_KINDS
+            str(event.kind), text, event.dedupe_key, buttons=buttons, snapshot=event.kind in SNAPSHOT_KINDS
         )
+        if buttons is not None and self._watch is not None and self._watch.task_id == task_id:
+            self._watch.announced = True
         # No questions for a print interrupted unseen: there is no finished part to ask about.
         if event.kind in TERMINAL_KINDS and print_id is not None and not event.lost:
             self._ask_post_print(event, print_id)
 
     def _ask_post_print(self, event: Event, print_id: int) -> None:
         name = event.state.subtask_name
-        self._enqueue(
-            "fit",
-            fit_question(name),
-            f"{event.dedupe_key}|fit",
-            buttons=post_print_buttons(print_id),
-        )
+        if event.kind is EventKind.FINISHED:  # a failed or stopped print has no part to fit
+            self._enqueue(
+                "fit",
+                fit_question(name),
+                f"{event.dedupe_key}|fit",
+                buttons=post_print_buttons(print_id),
+            )
         row = self._store.print_by_id(print_id)
         spools = self._store.spools()
         if row is None or row.spool_id is not None or not spools:
@@ -1004,6 +1232,7 @@ class Service:
             "named_set": plan.named_set,
             "filament": plan.filament,
             "slicer_version": outcome.slicer_version,
+            "file_sha256": outcome.sha256,  # None from an older agent: the print asks for a re-slice
             "sliced_at": now.astimezone(UTC).isoformat(),
         }
         key = _job_key(job.id, "sliced")
@@ -1030,9 +1259,9 @@ class Service:
                 if split:
                     caption = f"{job_name(job.name)}: пластина {first}"
                     self._enqueue(SLICED_KIND, caption, picture_key)
-                    self._enqueue(SLICED_TEXT_KIND, text, key)
+                    self._enqueue(SLICED_TEXT_KIND, text, key, buttons=print_buttons(job.id))
                 else:
-                    self._enqueue(SLICED_KIND, text, key)
+                    self._enqueue(SLICED_KIND, text, key, buttons=print_buttons(job.id))
         except BaseException:
             if folder is not None:
                 shutil.rmtree(folder, ignore_errors=True)
@@ -1123,6 +1352,764 @@ class Service:
             log.exception("job %d: slice press failed", job.id)
             return f"Не получилось начать нарезку «{name}»: внутренняя ошибка сервиса"
         return f"✂️ Режу «{name}», пришлю результат"
+
+    # -- printing: prepare, confirm, start (phase 3) ------------------------------
+
+    async def prepare_print(self, job_id: int, plate: int = 1) -> PrepareResult:
+        """Check a sliced job against the printer and send the start confirmation to Telegram.
+
+        Wakes the PC, fetches the sliced file into the print cache, runs the pre-flight on a
+        fresh report, then stores a single-use confirmation bound to the gate hash and queues
+        the message with the start and cancel buttons. Starts nothing: only the owner's press
+        on that message does. Raises ``KeyError`` (unknown job), ``ValueError`` (no such
+        plate) or ``PrintRefused`` (anything that blocks), and then nothing is stored or sent.
+        """
+        target = self._print_target(self._job(job_id), plate)
+        problem = self._ftps_problem()
+        if problem is not None:
+            raise problem
+        slicer = self._slicer
+        if slicer is None:
+            raise PrintRefused(
+                [f"слайсер не настроен, нужны {md_literal('slice_agent_url')} и {md_literal('SLICE_AGENT_TOKEN')}"],
+                "slice-agent is not configured, the sliced file cannot be fetched",
+            )
+        await self._wake_pc(slicer)
+        cache = Path(self._settings.data_dir) / PRINT_CACHE_DIR
+        path = cache / target.file
+        try:
+            cache.mkdir(parents=True, exist_ok=True)
+            file_sha = await slicer.fetch_file(target.file, path)
+        except FetchError as exc:
+            raise PrintRefused([f"Не удалось забрать нарезанный файл с ПК: {exc.text}"], str(exc)) from None
+        except OSError as exc:
+            log.warning("print cache not writable: %s", type(exc).__name__)
+            raise PrintRefused(["Не удалось сохранить нарезанный файл на сервере"], "the print cache is not writable") from None
+        self._prune_print_cache(path)
+        info = await self._file_info(path, plate)
+        await self._refresh_state()
+        # The awaits above took time: the job and its slot mapping are read again.
+        target = self._print_target(self._job(job_id), plate)
+        check = preflight(
+            self._state,
+            target.job,
+            plate,
+            target.choice,
+            target.spool,
+            info,
+            target.expected_sha256,
+            file_sha,
+            target.nozzle,
+            fresh=self.state_fresh,
+        )
+        if check.blocking:
+            raise PrintRefused(check.blocking)
+        text = render_start_confirmation(
+            target.job.name,
+            plate=plate if target.job.kind == "kit" else None,
+            slot_choice=self._label_choice(target),
+            minutes=info.minutes,
+            grams=info.grams,
+            plate_type=target.plate_type,
+            warnings=check.warnings,
+        )
+        with self._store.transaction():
+            confirmation = self._store.add_confirmation(
+                None,
+                "start",
+                job_id=target.job.id,
+                plate=plate,
+                gate_hash=self._gate(target, file_sha),
+                payload_json=json.dumps({"file": target.file, "plate": plate}),
+                now=self._clock().timestamp(),
+            )
+            self._enqueue(
+                "print_confirm", text, f"start|{_id_tag(confirmation.id)}", buttons=start_buttons(confirmation.id)
+            )
+        log.info("job %d plate %d: start confirmation sent", target.job.id, plate)
+        return PrepareResult(confirmation.id, text, list(check.warnings))
+
+    def _print_target(self, job: Job, plate: int) -> _PrintTarget:
+        if job.status != "sliced" or not job.sliced_file:
+            raise PrintRefused(
+                [NOT_SLICED_TEXT.format(name=job_name(job.name))], f"job {job.id} is not sliced (status {job.status})"
+            )
+        try:
+            result = json.loads(job.result_json or "{}")
+        except (ValueError, RecursionError):
+            result = {}
+        if not isinstance(result, dict):
+            result = {}
+        raw_plates = result.get("plates")
+        plates = sorted(
+            p["index"] for p in (raw_plates if isinstance(raw_plates, list) else [])
+            if isinstance(p, dict) and type(p.get("index")) is int
+        )
+        if type(plate) is not int or plate not in plates or (job.kind != "kit" and plate != 1):
+            raise ValueError(f"job {job.id} has no plate {plate!r}, its plates are {plates}")
+        slot = result.get("slot") if isinstance(result.get("slot"), dict) else {}
+        ams, number = slot.get("ams"), slot.get("slot")
+        if type(ams) is not int or type(number) is not int:
+            ams = number = None
+        spool = self._store.slot_spool(ams, number) if ams is not None and number is not None else None
+        choice = SlotChoice(
+            ams,
+            number,
+            spool.id if spool else None,
+            None,
+            color_name=spool.color_name if spool else None,
+            remaining_g=spool.remaining_g if spool else None,
+        )
+        expected = result.get("file_sha256")
+        return _PrintTarget(
+            job=job,
+            plate=plate,
+            file=job.sliced_file,
+            expected_sha256=expected if isinstance(expected, str) and expected else None,
+            choice=choice,
+            spool=spool,
+            nozzle=_nozzle_text(result.get("nozzle")),
+            plate_type=str(result.get("plate_type") or ""),
+        )
+
+    def _label_choice(self, target: _PrintTarget) -> SlotChoice:
+        """The slot as the confirmation names it: number, the tray's material, the spool's colour."""
+        choice = target.choice
+        tray = next((t for t in self._state.trays if (t.ams, t.slot) == (choice.ams, choice.slot)), None)
+        return replace(choice, tray_type=tray.tray_type if tray else None)
+
+    def _gate(self, target: _PrintTarget, file_sha256: str) -> str:
+        """The gate hash, from the same normalized sources at prepare and at the press."""
+        assert target.choice.ams is not None and target.choice.slot is not None  # pre-flight passed
+        return gate_hash(
+            file_sha256=file_sha256,
+            plate=int(target.plate),
+            ams=int(target.choice.ams),
+            slot=int(target.choice.slot),
+            serial=str(self._secrets.serial),
+            nozzle=target.nozzle,
+            plate_type=target.plate_type,
+        )
+
+    def _ftps_problem(self) -> PrintRefused | None:
+        """``printer.ftps.upload`` checks the printer by its CA: other TLS modes cannot print."""
+        if self._settings.tls_mode != "ca" or self._settings.ca_file is None:
+            return PrintRefused([TLS_TEXT], TLS_ERROR)
+        return None
+
+    async def _wake_pc(self, slicer: Slicer) -> None:
+        try:
+            awake = await (self._waker.wake_and_wait(WAKE_BUDGET_S) if self._waker else slicer.health())
+        except WakeError as exc:
+            raise PrintRefused([_WAKE_TEXTS.get(exc.kind, "ПК не удалось разбудить")], str(exc)) from None
+        if not awake:
+            raise PrintRefused(
+                ["ПК не проснулся за 2 минуты, нарезанный файл не забран"], "the PC did not wake within 2 minutes"
+            )
+
+    async def _file_info(self, path: Path, plate: int) -> PrintFileInfo:
+        try:
+            return await asyncio.to_thread(print_file_info, path, plate)
+        except PrintFileError as exc:
+            raise PrintRefused(
+                [f"Нарезанный файл не годится для печати ({md_literal(str(exc))}), нарежь заново"], str(exc)
+            ) from None
+
+    def _prune_print_cache(self, keep: Path) -> None:
+        """Keep ``keep`` and the newest others, ``PRINT_CACHE_KEEP`` sliced files in all.
+
+        Only ``*.gcode.3mf`` count: a fetch's ``.part`` and a press's upload copy start with a dot.
+        """
+        try:
+            files = [
+                p
+                for p in keep.parent.iterdir()
+                if p.name.endswith(GCODE_3MF_SUFFIX) and not p.name.startswith(".") and p != keep and p.is_file()
+            ]
+            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            log.exception("listing the print cache failed")
+            return
+        for old in files[PRINT_CACHE_KEEP - 1 :]:
+            log.info("removing %s from the print cache", old.name)
+            with contextlib.suppress(OSError):
+                old.unlink()
+
+    async def _refresh_state(self) -> None:
+        """Ask the printer for a full report and wait for it (up to ``report_wait_s``)."""
+        link = self._link
+        if link is None or self._link_status is not LinkStatus.CONNECTED:
+            return
+        waiter = asyncio.Event()
+        self._report_waiters.add(waiter)
+        try:
+            try:
+                link.request_full_report()
+            except Exception:
+                log.exception("asking the printer for a full report failed")
+                return
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(waiter.wait(), self._report_wait_s)
+        finally:
+            self._report_waiters.discard(waiter)
+
+    async def _on_print_press(self, press: Press) -> None:
+        """``job:<id>:print`` prepares plate 1 of a part, or asks a kit's plate first.
+
+        ``job:<id>:print:<n>`` prepares plate ``n``. The sliced summary is never edited: the
+        confirmation, or the reason there is none, comes as a new message.
+        """
+        parsed = _print_press(press.button_id)
+        assert parsed is not None
+        job_id, plate = parsed
+        job = self._store.job(job_id)
+        if job is None:
+            log.warning("print press for unknown job %d ignored", job_id)
+            return
+        if plate is None and job.kind == "kit" and job.status == "sliced":
+            try:
+                plates = sorted(
+                    p["index"] for p in json.loads(job.result_json or "{}").get("plates", [])
+                    if isinstance(p, dict) and type(p.get("index")) is int
+                )
+            except (ValueError, RecursionError, AttributeError, TypeError):
+                plates = []
+            if plates:
+                self._enqueue(
+                    "print_plate", plate_question(job.name), _job_key(job.id, "print-plate"),
+                    buttons=plate_buttons(job.id, plates),
+                )
+                return
+        if job.id in self._preparing:
+            log.info("job %d: a print is being prepared already, press ignored", job.id)
+            return
+        if plate is not None:
+            await self._notifier.edit(press.message_id, f"Готовлю печать «{job_name(job.name)}», пластина {plate}…")
+        self._preparing.add(job.id)
+        try:
+            task = asyncio.create_task(self._prepare_pressed(job, plate or 1), name=f"bambu-prepare-{job.id}")
+        except BaseException:
+            self._preparing.discard(job.id)
+            raise
+        self._press_tasks.add(task)
+        task.add_done_callback(self._press_tasks.discard)
+
+    async def _prepare_pressed(self, job: Job, plate: int) -> None:
+        try:
+            await self.prepare_print(job.id, plate)
+        except PrintRefused as exc:
+            log.info("job %d plate %d: print not prepared: %s", job.id, plate, exc)
+            lines = exc.lines
+        except KeyError:
+            log.warning("job %d plate %d: print press for a job that is gone", job.id, plate)
+            lines = [NO_JOB_TEXT]
+        except ValueError as exc:
+            log.warning("job %d plate %d: print press refused: %s", job.id, plate, exc)
+            lines = [NO_PLATE_TEXT.format(plate=plate)]
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("job %d: preparing the print failed", job.id)
+            lines = [INTERNAL_TEXT]
+        else:
+            return
+        finally:
+            self._preparing.discard(job.id)
+        self._enqueue(
+            "print_refused", render_print_refused(job.name, lines, started=False), _job_key(job.id, "print-refused")
+        )
+
+    async def _on_start_press(self, press: Press) -> None:
+        """``start:<id>:go`` starts the print at most once, ``start:<id>:cancel`` cancels it."""
+        parsed = _start_press(press.button_id)
+        if parsed is None:
+            log.warning("malformed start button ignored")
+            return
+        confirm_id, action = parsed
+        confirmation = self._store.confirmation(confirm_id)
+        if confirmation is None or confirmation.kind != "start":
+            log.warning("start press for an unknown confirmation ignored")
+            return
+        if action == "cancel":
+            if self._store.cancel_confirmation(confirm_id):
+                self._store.set_confirmation_outcome(confirm_id, "cancelled")
+                await self._notifier.edit(press.message_id, CANCELLED_TEXT)
+            else:
+                await self._answer_spent(press, confirm_id)
+            return
+        if self._start_lock.locked():
+            await self._notifier.edit(press.message_id, STARTING_TEXT)
+            return
+        await self._start_lock.acquire()  # free, so it never waits: no other press gets in
+        try:
+            task = asyncio.create_task(self._start_pressed(press, confirm_id), name="bambu-start")
+        except BaseException:
+            self._start_lock.release()
+            raise
+        self._press_tasks.add(task)
+        task.add_done_callback(self._press_tasks.discard)
+
+    async def _answer_spent(self, press: Press, confirm_id: str, texts: Mapping[str, str] = _SPENT_TEXTS) -> None:
+        confirmation = self._store.confirmation(confirm_id)
+        text = texts.get(confirmation.state) if confirmation is not None else None
+        if text is not None:
+            await self._notifier.edit(press.message_id, text)
+
+    async def _start_pressed(self, press: Press, confirm_id: str) -> None:
+        """Holds the start lock (taken by the caller) until the start is decided."""
+        try:
+            confirmation = self._store.claim_confirmation(confirm_id, self._clock().timestamp())
+            if confirmation is None:
+                await self._answer_spent(press, confirm_id)
+                return
+            job = self._store.job(confirmation.job_id) if confirmation.job_id is not None else None
+            name = job.name if job is not None else None
+            try:
+                outcome = await self._start(press, confirmation, job)
+            except _StartRefused as exc:
+                log.warning("print start refused: %s", exc.reason)
+                self._finish_start(confirm_id, f"refused:{exc.reason}", name, exc.lines)
+            except _StartSent:
+                try:
+                    self._record_unconfirmed(confirm_id, name)
+                except Exception:
+                    log.exception("recording an unconfirmed print start failed")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("print start failed")
+                self._finish_start(confirm_id, "refused:internal", name, [INTERNAL_TEXT])
+            else:
+                log.info("print start %s", outcome)
+        finally:
+            self._start_lock.release()
+
+    def _finish_start(self, confirm_id: str, outcome: str, name: str | None, lines: list[str]) -> None:
+        """Record a refused start and tell the owner why. The confirmation stays used."""
+        try:
+            with self._store.transaction():
+                self._store.set_confirmation_outcome(confirm_id, outcome)
+                text = render_print_refused(name, lines, started=True)
+                self._enqueue("print_refused", text, f"start|{_id_tag(confirm_id)}|refused")
+        except Exception:
+            log.exception("recording a refused print start failed")
+
+    async def _start(self, press: Press, confirmation: Any, job: Job | None) -> str:
+        """The claimed press: check again, upload, send ``project_file`` once, watch. Its outcome."""
+        try:
+            await self._notifier.edit(press.message_id, UPLOADING_TEXT)
+        except Exception:
+            log.exception("answering the start press failed, starting anyway")
+        if job is None:
+            raise _StartRefused("job_changed", [JOB_CHANGED_TEXT])
+        try:
+            target = self._print_target(job, confirmation.plate)
+        except (PrintRefused, ValueError):
+            raise _StartRefused("job_changed", [JOB_CHANGED_TEXT]) from None
+        try:
+            payload = json.loads(confirmation.payload_json)
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict) or payload.get("file") != target.file:
+            raise _StartRefused("job_changed", [JOB_CHANGED_TEXT])
+        problem = self._ftps_problem()
+        if problem is not None:
+            raise _StartRefused("config", problem.lines)
+        await self._refresh_state()
+
+        cache = Path(self._settings.data_dir) / PRINT_CACHE_DIR
+        pinned = await asyncio.to_thread(_pin_file, cache / target.file)
+        if pinned is None:
+            raise _StartRefused("file_missing", [FILE_GONE_TEXT])
+        try:
+            return await self._start_pinned(confirmation, target, pinned)
+        finally:
+            with contextlib.suppress(OSError):
+                pinned.unlink()
+
+    async def _start_pinned(self, confirmation: Any, target: _PrintTarget, pinned: Path) -> str:
+        """``pinned``: this press's own link to the cached file, so a later fetch cannot swap it."""
+        file_sha = await asyncio.to_thread(_sha256_file, pinned)
+        if file_sha != target.expected_sha256:
+            raise _StartRefused("file_changed", [FILE_CHANGED_TEXT])
+        try:
+            info = await self._file_info(pinned, target.plate)
+        except PrintRefused as exc:
+            raise _StartRefused("file", exc.lines) from None
+        self._preflight_or_refuse(target, info, file_sha)
+        if self._gate(target, file_sha) != confirmation.gate_hash:
+            raise _StartRefused("gate", [JOB_CHANGED_TEXT])
+
+        secrets, settings = self._secrets, self._settings
+        assert settings.ca_file is not None  # _ftps_problem
+        upload = asyncio.to_thread(
+            self._uploader, secrets.host, secrets.serial, secrets.access_code, settings.ca_file, pinned, target.file
+        )
+        try:
+            # A worker thread cannot be killed: past the deadline it is left to finish or fail
+            # on its own, and nothing is sent to the printer for this press.
+            await asyncio.wait_for(upload, self._upload_timeout_s)
+        except TimeoutError:
+            log.warning("the upload did not finish in %.0f s, the print is not started", self._upload_timeout_s)
+            raise _StartRefused("upload_timeout", [UPLOAD_TIMEOUT_TEXT]) from None
+        except UploadError as exc:
+            log.warning("the upload failed: %s", exc)
+            raise _StartRefused("upload", [f"Файл не загрузился на принтер: {exc.text}"]) from None
+        except ValueError as exc:  # an unsafe remote name: the slice result is odd
+            log.warning("the upload was refused: %s", exc)
+            raise _StartRefused("upload", ["Файл не загрузился на принтер: недопустимое имя файла"]) from None
+        # The upload took a while: the printer is checked once more before the one send.
+        self._preflight_or_refuse(target, info, file_sha)
+        link = self._link
+        if link is None:
+            raise _StartRefused("not_connected", [NOT_CONNECTED_TEXT])
+        assert target.choice.ams is not None and target.choice.slot is not None  # pre-flight passed
+        task_id = self._new_task_id()
+        watch = _StartWatch(task_id, asyncio.Event())
+        self._watch = watch
+        self._own_tasks.add(task_id)
+        try:
+            # The one send. Never repeated: the confirmation is used, whatever follows.
+            link.start_project(
+                file=target.file,
+                plate=target.plate,
+                md5=info.md5.lower(),
+                subtask_name=target.file.removesuffix(GCODE_3MF_SUFFIX),
+                task_id=task_id,
+                ams=target.choice.ams,
+                slot=target.choice.slot,
+            )
+        except PrinterNotConnected:
+            self._watch = None
+            raise _StartRefused("not_connected", [NOT_CONNECTED_TEXT]) from None
+        except ValueError as exc:
+            self._watch = None
+            log.error("project_file refused by the link: %s", exc)
+            raise _StartRefused("payload", [INTERNAL_TEXT]) from None
+        except Exception:
+            # Raised after the publish may have happened: watched like a clean send.
+            log.exception("sending project_file raised, it may have reached the printer")
+        try:
+            return await self._watch_start(confirmation.id, target, watch)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("watching the print start failed")
+            raise _StartSent() from None
+
+    def _preflight_or_refuse(self, target: _PrintTarget, info: PrintFileInfo, file_sha: str) -> None:
+        check = preflight(
+            self._state,
+            target.job,
+            target.plate,
+            target.choice,
+            target.spool,
+            info,
+            target.expected_sha256,
+            file_sha,
+            target.nozzle,
+            fresh=self.state_fresh,
+        )
+        if check.blocking:
+            raise _StartRefused("preflight", check.blocking)
+
+    def _new_task_id(self) -> str:
+        """A fresh numeric task id: epoch seconds as in phase 0, never one seen or sent before."""
+        candidate = max(int(self._clock().timestamp()), self._last_task_id + 1)
+        if self._state.task_id == str(candidate):
+            candidate += 1
+        self._last_task_id = candidate
+        return str(candidate)
+
+    async def _watch_start(self, confirm_id: str, target: _PrintTarget, watch: _StartWatch) -> str:
+        try:
+            await asyncio.wait_for(watch.event.wait(), self._watch_s)
+            started = True
+        except TimeoutError:
+            started = False
+        finally:
+            if self._watch is watch:
+                self._watch = None
+        if not started:
+            self._record_unconfirmed(confirm_id, target.job.name)
+            return "unconfirmed"
+        plate = target.plate if target.job.kind == "kit" else None
+        with self._store.transaction():
+            self._store.set_confirmation_outcome(confirm_id, "started")
+            if not watch.announced:  # the STARTED event normally carries the stop button
+                self._enqueue(
+                    "print_started",
+                    render_print_started(target.job.name, plate),
+                    f"start|{_id_tag(confirm_id)}|started",
+                    buttons=stop_ask_buttons(watch.task_id),
+                )
+        return "started"
+
+    def _record_unconfirmed(self, confirm_id: str, name: str | None) -> None:
+        """The outcome ``unconfirmed`` and the owner's message, saying what the printer last sent."""
+        state = self._state
+        with self._store.transaction():
+            self._store.set_confirmation_outcome(confirm_id, "unconfirmed")
+            self._enqueue(
+                "print_unconfirmed",
+                render_start_unconfirmed(name, self._watch_s, state.gcode_state, state.subtask_name),
+                f"start|{_id_tag(confirm_id)}|unconfirmed",
+            )
+
+    # -- printing: pause and the confirmed stop (phase 3) -----------------------------
+
+    async def pause_print(self) -> dict[str, str | None]:
+        """Pause the running print, once. Only while ``RUNNING``. There is no resume.
+
+        Raises ``ControlRefused`` (English) when nothing was sent.
+        """
+        if not self.state_fresh:
+            await self._refresh_state()
+        # Synchronous from here on: no await between the checks and the send.
+        link = self._control_link()
+        state = self._state
+        if state.gcode_state != "RUNNING":
+            raise ControlRefused(
+                f"the printer is {state.gcode_state}: pause works only while RUNNING, nothing was sent"
+            )
+        try:
+            link.pause()
+        except PrinterNotConnected:
+            raise ControlRefused("the printer link is not connected, nothing was sent") from None
+        log.info("pause sent")
+        return {"task_id": state.task_id, "job_name": state.subtask_name}
+
+    async def request_stop(self) -> StopRequest:
+        """Send the stop confirmation for the current print to Telegram. Stops nothing itself.
+
+        Only the owner's press on "Да, остановить" sends ``stop``. Raises ``ControlRefused``
+        (English) when there is no print to stop, and then nothing is stored or sent.
+        """
+        if not self.state_fresh:
+            await self._refresh_state()
+        problem = self._stop_problem()
+        if problem is not None:
+            raise ControlRefused(problem.error)
+        return self._ask_stop()
+
+    def _control_link(self) -> Link:
+        link = self._link
+        if link is None or self._link_status is not LinkStatus.CONNECTED:
+            raise ControlRefused(
+                f"the printer is not connected (link {self._link_status.value}), nothing was sent"
+            )
+        if not self.state_fresh:
+            raise ControlRefused(
+                "waiting for the printer's first report since it connected, try again in a few seconds; "
+                "nothing was sent"
+            )
+        return link
+
+    def _stop_problem(self, task_id: str | None = None, name: str | None = None) -> _StopProblem | None:
+        """Why the current print cannot be stopped now, None when it can.
+
+        ``task_id`` and ``name``, when given, are the print the confirmation was asked for.
+        """
+        if self._link is None or self._link_status is not LinkStatus.CONNECTED:
+            return _StopProblem(
+                "not_connected",
+                f"the printer is not connected (link {self._link_status.value}), nothing was sent",
+                STOP_NOT_CONNECTED_TEXT,
+            )
+        if not self.state_fresh:
+            return _StopProblem(
+                "not_fresh",
+                "waiting for the printer's first report since it connected, try again in a few seconds; "
+                "nothing was sent",
+                STOP_NOT_FRESH_TEXT,
+            )
+        state = self._state
+        if state.gcode_state not in STOPPABLE_STATES:
+            return _StopProblem(
+                "print_over", f"the printer is {state.gcode_state}: there is no print to stop", STOP_OVER_TEXT
+            )
+        if (task_id is not None and (state.task_id or "") != task_id) or (
+            name is not None and (state.subtask_name or "") != name
+        ):
+            return _StopProblem("print_changed", "another print is running now", STOP_OTHER_TEXT)
+        return None
+
+    def _ask_stop(self) -> StopRequest:
+        """Store a stop confirmation bound to the current print and queue its message."""
+        state = self._state
+        task_id, name = state.task_id or "", state.subtask_name or ""
+        text = render_stop_confirmation(name)
+        with self._store.transaction():
+            confirmation = self._store.add_confirmation(
+                None,
+                "stop",
+                job_id=None,
+                plate=None,
+                gate_hash=None,
+                payload_json=json.dumps({"task_id": task_id, "subtask_name": name}),
+                now=self._clock().timestamp(),
+            )
+            self._enqueue(
+                "stop_confirm", text, f"stop|{_id_tag(confirmation.id)}", buttons=stop_buttons(confirmation.id)
+            )
+        log.info("stop confirmation sent")
+        return StopRequest(confirmation.id, text)
+
+    async def _on_stop_press(self, press: Press) -> None:
+        """``stop:ask:<task id>`` asks, ``stop:<id>:go`` sends ``stop`` at most once, ``:cancel`` cancels."""
+        parsed = _stop_press(press.button_id)
+        if parsed is None:
+            log.warning("malformed stop button ignored")
+            return
+        key, action = parsed
+        if action == "ask":
+            await self._on_stop_ask(key)
+            return
+        confirmation = self._store.confirmation(key)
+        if confirmation is None or confirmation.kind != "stop":
+            log.warning("stop press for an unknown confirmation ignored")
+            return
+        if action == "cancel":
+            if self._store.cancel_confirmation(key):
+                self._store.set_confirmation_outcome(key, "cancelled")
+                await self._notifier.edit(press.message_id, STOP_CANCELLED_TEXT)
+            else:
+                await self._answer_spent(press, key, _STOP_SPENT_TEXTS)
+            return
+        # The claim comes first: a double press, a replay after a restart or a press on an
+        # expired confirmation gets nothing past this line.
+        claimed = self._store.claim_confirmation(key, self._clock().timestamp())
+        if claimed is None:
+            await self._answer_spent(press, key, _STOP_SPENT_TEXTS)
+            return
+        outcome, text = await self._stop_claimed(claimed)
+        try:
+            self._store.set_confirmation_outcome(key, outcome)
+        except Exception:
+            log.exception("recording a stop outcome failed")
+        log.info("stop press: %s", outcome)
+        await self._notifier.edit(press.message_id, text)
+
+    async def _stop_claimed(self, confirmation: Any) -> tuple[str, str]:
+        """(outcome, the owner's answer) of a claimed stop. Sends ``stop`` at most once."""
+        try:
+            payload = json.loads(confirmation.payload_json)
+        except ValueError:
+            payload = None
+        task_id = payload.get("task_id") if isinstance(payload, dict) else None
+        name = payload.get("subtask_name") if isinstance(payload, dict) else None
+        if not isinstance(task_id, str) or not isinstance(name, str):
+            return "refused:internal", f"Остановка не отправлена: {INTERNAL_TEXT}"
+        if not self.state_fresh:
+            await self._refresh_state()
+        # Synchronous from here on: no await between the checks and the one send.
+        problem = self._stop_problem(task_id, name)
+        if problem is not None:
+            return f"refused:{problem.reason}", problem.text
+        link = self._link
+        assert link is not None  # _stop_problem
+        try:
+            link.stop_print()
+        except PrinterNotConnected:
+            return "refused:not_connected", STOP_NOT_CONNECTED_TEXT
+        except Exception:
+            # Raised after the publish may have happened: never sent again, the owner looks.
+            log.exception("sending stop raised, it may have reached the printer")
+            return "unconfirmed", STOP_UNSURE_TEXT
+        return "sent", STOP_SENT_TEXT
+
+    async def _on_stop_ask(self, task_id: str) -> None:
+        """The "Остановить…" button of a print this service started: a new stop confirmation."""
+        if not self.state_fresh:
+            await self._refresh_state()
+        problem = self._stop_problem()
+        if problem is None and (self._state.task_id or "") != task_id:
+            problem = _StopProblem("print_over", "the print of this button is over", STOP_OVER_TEXT)
+        if problem is not None:
+            log.info("stop ask press refused: %s", problem.reason)
+            self._enqueue("stop_refused", f"⏹ {problem.text}", f"stop-ask|{uuid.uuid4().hex}")
+            return
+        self._ask_stop()
+
+
+def _id_tag(confirm_id: str) -> str:
+    """A confirmation's stand-in for dedupe keys: the id itself never leaves the database."""
+    return hashlib.sha256(confirm_id.encode("ascii")).hexdigest()[:16]
+
+
+def _stop_press(button_id: str) -> tuple[str, str] | None:
+    """(task id, ``ask``) of ``stop:ask:<task id>``, (confirmation id, ``go`` or ``cancel``)
+    of ``stop:<id>:<action>``, else None."""
+    parts = button_id.split(":")
+    if len(parts) != 3 or parts[0] != "stop":
+        return None
+    if parts[1] == "ask":
+        return (parts[2], "ask") if TASK_ID_RE.fullmatch(parts[2]) else None
+    if parts[2] not in ("go", "cancel") or not _CONFIRM_ID_RE.fullmatch(parts[1]):
+        return None
+    return parts[1], parts[2]
+
+
+def _nozzle_text(value: object) -> str:
+    """A nozzle diameter as the manifest and the gate spell it: "0.4"."""
+    try:
+        number = float(str(value))
+    except ValueError:
+        return str(value or "")
+    return f"{number:g}" if math.isfinite(number) else str(value)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(_HASH_CHUNK):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _pin_file(path: Path) -> Path | None:
+    """A private hard link to ``path`` (a streamed copy where links fail), None when it is gone.
+
+    The press hashes, reads and uploads this one: a prepare fetching the same name meanwhile
+    replaces the cache entry, never the file the press checked.
+    """
+    pinned = path.with_name(f".{path.name}.{_secrets.token_hex(8)}.upload")
+    try:
+        os.link(path, pinned)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        try:
+            shutil.copyfile(path, pinned)
+        except FileNotFoundError:
+            with contextlib.suppress(OSError):
+                pinned.unlink()
+            return None
+    return pinned
+
+
+def _start_press(button_id: str) -> tuple[str, str] | None:
+    """(confirmation id, ``go`` or ``cancel``) of a ``start:<id>:<action>`` button, else None."""
+    parts = button_id.split(":")
+    if len(parts) != 3 or parts[0] != "start" or parts[2] not in ("go", "cancel"):
+        return None
+    if not _CONFIRM_ID_RE.fullmatch(parts[1]):
+        return None
+    return parts[1], parts[2]
+
+
+def _print_press(button_id: str) -> tuple[int, int | None] | None:
+    """(job id, plate or None) of ``job:<id>:print`` and ``job:<id>:print:<n>``, else None."""
+    parts = button_id.split(":")
+    if len(parts) not in (3, 4) or parts[0] != "job" or parts[2] != "print":
+        return None
+    numbers = [parts[1], *parts[3:]]
+    if not all(p.isascii() and p.isdigit() and len(p) <= 9 for p in numbers):
+        return None
+    plate = int(parts[3]) if len(parts) == 4 else None
+    if plate is not None and not 1 <= plate <= 50:
+        return None
+    return int(parts[1]), plate
 
 
 def _slot_press(button_id: str) -> tuple[int, int] | None:
