@@ -1036,6 +1036,7 @@ def test_job_status_has_no_paths_outside_names(jh):
     assert status["sliced_file"] == f"lamp-arm-{job_id}-p1.gcode.3mf"
     assert status["settings"]["curr_bed_type"] == "Cool Plate"
     assert status["settings"]["wall_loops"] == 4
+    assert status["goal"] == {"primary": "balanced", "secondary": None, "source": "fallback", "reason": None}
     assert (status["plate_type"], status["nozzle"]) == ("Cool Plate", "0.4")
     assert status["slot"] == {
         "ams": 0, "slot": 0, "number": 1, "material": "PETG", "color": "white",
@@ -1218,6 +1219,36 @@ def test_propose_job_with_a_slot_is_stored_and_shown_by_job_status(jh):
     result = jh.call("propose_job", job_id=job_id, slot=1)
     assert "слот 1 PETG white" in result["text"]
     assert jh.call("job_status", job_id=job_id)["chosen_slot"] == 1
+
+def test_propose_and_slice_job_take_the_owners_goal(jh):
+    job_id = jh.add_job(hints={})
+    text = jh.call("propose_job", job_id=job_id, goal="strength")["text"]
+    assert "цель: прочно (выбрал ты)" in text and "4 стенки, 40% gyroid" in text
+    assert json.loads(jh.store.job(job_id).goal_json)["primary"] == "strength"
+    assert jh.waker.calls == 0 and jh.slicer.requests == []
+    # slice_job: explicit settings win over the goal's base point, the goal is stored.
+    jh.call("slice_job", job_id=job_id, settings={"wall_loops": 6}, goal=["watertight", "quality"])
+    jh.wait_status(job_id, "sliced")
+    sent = dict(jh.slicer.requests[0].overrides)
+    assert sent["wall_loops"] == 6 and (sent["top_shell_layers"], sent["bottom_shell_layers"]) == (6, 6)
+    assert sent["layer_height"] == 0.16  # the secondary goal fills what the primary leaves
+    stored = json.loads(jh.store.job(job_id).goal_json)
+    assert stored == {"primary": "watertight", "secondary": "quality", "source": "owner"}
+    goal = jh.call("job_status", job_id=job_id)["goal"]
+    assert goal == {"primary": "watertight", "secondary": "quality", "source": "owner", "reason": None}
+
+
+def test_goal_parameter_is_checked(jh):
+    job_id = jh.add_job()
+    for tool in ("propose_job", "slice_job"):
+        for goal in ("ultra", ["fit", "fit"], ["fit", "quality", "speed"], []):
+            text = jh.error(tool, job_id=job_id, goal=goal)
+            assert "goal" in text and "balanced, speed, strength" in text, (tool, goal)
+    tools = {t["name"]: t for t in jh.rpc("tools/list")["tools"]}
+    for name in ("propose_job", "slice_job"):
+        assert "goal" in tools[name]["inputSchema"]["properties"], name
+    assert jh.waker.calls == 0 and jh.slicer.requests == [] and jh.store.outbox_count() == 0
+    assert jh.store.job(job_id).goal_json is None
 
 
 def test_slot_tool_descriptions_name_the_owners_choice(jh):

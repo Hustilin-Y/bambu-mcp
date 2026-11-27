@@ -43,12 +43,16 @@ from bambu_mcp.cost import (
     tariff_reminder_enabled,
 )
 from bambu_mcp.events import CANCEL_ERROR, Event, EventDetector, EventKind, event_identity
+from bambu_mcp.evaluation import goal_base, goal_record, job_goal, parse_goal
 from bambu_mcp.jobs import JobBusy, SliceStart
 from bambu_mcp.journal import NO_SPOOL, TERMINAL_KINDS, Journal, Slot
 from bambu_mcp.logthrottle import Throttle
-from bambu_mcp.manifest import Manifest, ManifestError, parse_manifest, verify_file
+from bambu_mcp.manifest import GOAL_KEYS, Manifest, ManifestError, parse_manifest, verify_file
 from bambu_mcp.messages import (
+    MAX_BUTTONS,
+    eval_buttons,
     fit_question,
+    goal_buttons,
     job_name,
     md_literal,
     plate_buttons,
@@ -63,6 +67,7 @@ from bambu_mcp.messages import (
     render_start_confirmation,
     render_start_unconfirmed,
     render_stop_confirmation,
+    goal_warning,
     slot_buttons,
     spool_buttons,
     spool_question,
@@ -296,6 +301,8 @@ class SlicePlan:
     named_set: str  # its values are in ``settings``, the agent always gets PROCESS_SET
     filament: str | None  # the spool's Bambu Studio filament preset
     usable: tuple[UsableSlot, ...] = ()  # slots the owner may choose instead
+    # (primary, secondary, source, reason) from evaluation.job_goal: its base point is in ``settings``
+    goal: tuple[str, str | None, str, str | None] = ("balanced", None, "fallback", None)
 
 
 @dataclass(frozen=True)
@@ -841,6 +848,9 @@ class Service:
             if _slot_press(press.button_id) is not None:
                 await self._on_slot_press(press)
                 return
+            if _goal_press(press.button_id) is not None:
+                await self._on_goal_press(press)
+                return
             if press.button_id.startswith("job:"):
                 text = self._on_job_press(press)
             else:
@@ -984,21 +994,27 @@ class Service:
 
     # -- jobs: proposal and slicing ----------------------------------------------
 
-    async def propose(self, job_id: int, slot: int | None = None) -> str:
-        """Queue the job's proposal with the slice, change and slot buttons. Returns its text.
+    async def propose(self, job_id: int, slot: int | None = None, goal: object = None) -> str:
+        """Queue the job's proposal with the slice, change, slot and goal buttons. Returns its text.
 
         ``slot`` (1..16) is the owner's AMS slot: stored with the job, it replaces the one
-        stored before. Raises ``KeyError`` for an unknown job, ``SlotUnusable`` for a slot
-        that cannot be printed from, ``ValueError`` when the settings do not resolve.
+        stored before. ``goal`` (a key or [primary, secondary]) is the owner's goal: stored
+        with the job, it applies its base point and drops a chosen variant. Raises
+        ``KeyError`` for an unknown job, ``SlotUnusable`` for a slot that cannot be printed
+        from, ``ValueError`` for an unknown goal or settings that do not resolve.
         """
+        owner_goal = parse_goal(goal) if goal is not None else None
         job = self._job(job_id)
-        if slot is not None and job.status == "slicing":
-            raise JobBusy(job.id)  # the slot of a running slice never changes under it
-        plan = self._plan(job, None, DEFAULT_NAMED_SET, slot)
+        if (slot is not None or owner_goal is not None) and job.status == "slicing":
+            raise JobBusy(job.id)  # the slot or goal of a running slice never changes under it
+        plan = self._plan(job, None, DEFAULT_NAMED_SET, slot, owner_goal)
+        chosen = _chosen_fields(slot, owner_goal)
+        if chosen:
+            job = replace(job, **chosen)
         text, buttons = self._proposal(job, plan)
         with self._store.transaction():
-            if slot is not None:
-                self._store.update_job(job.id, slot=slot)
+            if chosen:
+                self._store.update_job(job.id, **chosen)
             self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
         return text
 
@@ -1009,16 +1025,18 @@ class Service:
         *,
         named_set: str = DEFAULT_NAMED_SET,
         slot: int | None = None,
+        goal: object = None,
     ) -> Job:
         """Wake the PC, slice the job, store the result and queue the summary (or the failure).
 
         ``explicit`` is what the owner asked for (ruling R6). ``slot`` is the owner's AMS
-        slot, stored with the job (None: the stored one, else the material match). Raises
+        slot, stored with the job (None: the stored one, else the material match). ``goal``
+        is the owner's goal, stored with the job: its base point is under ``explicit``. Raises
         ``KeyError`` (unknown job), ``ValueError`` (settings outside the whitelist, or
         ``SlotUnusable``) or ``JobBusy`` before anything changes. Every later failure ends
         the job ``slice_failed`` and tells the owner.
         """
-        job, plan = self._claim(job_id, explicit, named_set, slot)
+        job, plan = self._claim(job_id, explicit, named_set, slot, goal)
         await self._slice_claimed(job, plan)
         return self._job(job.id)
 
@@ -1029,12 +1047,13 @@ class Service:
         *,
         named_set: str = DEFAULT_NAMED_SET,
         slot: int | None = None,
+        goal: object = None,
     ) -> SliceStart:
         """``slice_job`` in the background: the job is claimed before this returns.
 
         The slot warning is returned at once, so a caller that skipped the proposal sees it.
         """
-        job, plan = self._claim(job_id, explicit, named_set, slot)
+        job, plan = self._claim(job_id, explicit, named_set, slot, goal)
         task = asyncio.create_task(self._slice_claimed(job, plan), name=f"bambu-slice-{job.id}")
         self._slice_tasks.add(task)
         task.add_done_callback(self._slice_tasks.discard)
@@ -1047,11 +1066,17 @@ class Service:
         return job
 
     def _claim(
-        self, job_id: int, explicit: Mapping | None, named_set: str, slot: int | None = None
+        self,
+        job_id: int,
+        explicit: Mapping | None,
+        named_set: str,
+        slot: int | None = None,
+        goal: object = None,
     ) -> tuple[Job, SlicePlan]:
+        owner_goal = parse_goal(goal) if goal is not None else None
         job = self._job(job_id)
-        plan = self._plan(job, explicit, named_set, slot)
-        chosen = {"slot": slot} if slot is not None else {}
+        plan = self._plan(job, explicit, named_set, slot, owner_goal)
+        chosen = _chosen_fields(slot, owner_goal)
         claimed = self._store.transition_job(
             job.id,
             CLAIMABLE,
@@ -1067,17 +1092,37 @@ class Service:
         return job, plan
 
     def _plan(
-        self, job: Job, explicit: Mapping | None, named_set: str, slot: int | None = None
+        self,
+        job: Job,
+        explicit: Mapping | None,
+        named_set: str,
+        slot: int | None = None,
+        goal: tuple[str, str | None] | None = None,
     ) -> SlicePlan:
-        """``slot`` (1..16) wins over the job's stored slot, which wins over the material match."""
+        """``slot`` (1..16) wins over the job's stored slot, which wins over the material match.
+
+        ``goal`` (primary, secondary) is the owner's new goal: it replaces the job's and drops
+        its chosen variant. Without it the job's goal (``job_goal``) and variant apply.
+        """
         manifest = parse_manifest(json.loads(job.manifest_json))  # checked at intake
         nozzle = f"{manifest.nozzle_mm:g}"
         history = self._store.jobs(JOB_HISTORY)
+        if goal is not None:
+            goal_now: tuple[str, str | None, str, str | None] = (goal[0], goal[1], "owner", None)
+            variant = None
+        else:
+            goal_now = job_goal(job, manifest)
+            variant = _variant(job)
+        # The fallback goal applies no base point: the hints and the last job stay as before
+        # goals existed (controller ruling). Only the owner's or the CAD agent's goal sets one.
+        base = None if goal_now[2] == "fallback" else goal_base(goal_now[0], goal_now[1])
         settings = resolve_settings(
             explicit or {},
             last_settings(history, job.name),
             job_hints(manifest),
             named_set,
+            goal_base=base,
+            variant=variant,
             checks=manifest.checks,
             nozzle=nozzle,
         )
@@ -1107,6 +1152,7 @@ class Service:
             named_set=named_set,
             filament=(spool.filament_preset or None) if spool else None,
             usable=tuple(usable_slots(trays, spools)),
+            goal=goal_now,
         )
 
     def _predict(
@@ -1264,6 +1310,9 @@ class Service:
             plate_type=plan.plate_type,
             symbol=self._store.currency()[1],
         )
+        broken = goal_warning(plan.goal[0], plan.settings)
+        if broken:
+            text = f"{text}\n{broken}"
         choice = plan.choice
         result = {
             "plates": plates,
@@ -1366,6 +1415,41 @@ class Service:
             return
         # A slice claimed in the meantime keeps its own plan: the slot is not changed under it.
         if not self._store.transition_job(job.id, CLAIMABLE, slot=number):
+            await self._notifier.edit(press.message_id, f"Уже режу «{name}»")
+            return
+        text, buttons = self._proposal(self._job(job.id), plan)
+        if not await self._notifier.edit(press.message_id, text, buttons):
+            log.warning("job %d: editing the proposal failed, sending it again", job.id)
+            self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
+
+    async def _on_goal_press(self, press: Press) -> None:
+        """``job:<id>:goal:<key>``: store the owner's goal and edit the proposal in place.
+
+        The goal's base point replaces the settings shown, a chosen variant is dropped.
+        Nothing is sliced and the PC is not woken. While the job is slicing the press is
+        answered like the slice button and nothing changes.
+        """
+        parsed = _goal_press(press.button_id)
+        assert parsed is not None
+        job_id, key = parsed
+        job = self._store.job(job_id)
+        if job is None:
+            log.warning("goal press for unknown job %d ignored", job_id)
+            return
+        name = job_name(job.name)
+        if job.status == "slicing":
+            await self._notifier.edit(press.message_id, f"Уже режу «{name}»")
+            return
+        try:
+            plan = self._plan(job, None, DEFAULT_NAMED_SET, None, (key, None))
+        except ValueError as exc:  # SlotUnusable too: the stored slot was emptied since
+            log.warning("job %d: goal press refused: %s", job.id, exc)
+            text = f"Не получилось выбрать цель для «{name}»: {md_literal(str(exc))}"
+            self._enqueue("job_goal", text, _job_key(job.id, "goal"))
+            return
+        chosen = _chosen_fields(None, (key, None))
+        # A slice claimed in the meantime keeps its own plan: the goal is not changed under it.
+        if not self._store.transition_job(job.id, CLAIMABLE, **chosen):
             await self._notifier.edit(press.message_id, f"Уже режу «{name}»")
             return
         text, buttons = self._proposal(self._job(job.id), plan)
@@ -2206,26 +2290,53 @@ def _slot_press(button_id: str) -> tuple[int, int] | None:
     return job_id, number
 
 
+def _goal_press(button_id: str) -> tuple[int, str] | None:
+    """(job id, goal key) of a ``job:<id>:goal:<key>`` button, None for any other button."""
+    parts = button_id.split(":")
+    if len(parts) != 4 or parts[0] != "job" or parts[2] != "goal":
+        return None
+    if not (parts[1].isascii() and parts[1].isdigit()) or parts[3] not in GOAL_KEYS:
+        return None
+    return int(parts[1]), parts[3]
+
+
+def _chosen_fields(slot: int | None, goal: tuple[str, str | None] | None) -> dict[str, Any]:
+    """Job fields for the owner's slot and goal: a new goal drops the chosen variant."""
+    chosen: dict[str, Any] = {"slot": slot} if slot is not None else {}
+    if goal is not None:
+        chosen.update(goal_json=goal_record(*goal), variant_json=None)
+    return chosen
+
+
+def _variant(job: Job) -> dict | None:
+    """The job's chosen evaluation variant (a settings layer), None when it has none."""
+    try:
+        variant = json.loads(job.variant_json or "null")
+    except (ValueError, RecursionError):
+        return None
+    return variant if isinstance(variant, dict) else None
+
+
 def _proposal(
     job: Job, plan: SlicePlan, cost: CostBreakdown | CurrencyMismatch | None, symbol: str
 ) -> tuple[str, list[list[Button]]]:
-    """The proposal's text and buttons: slice and change, then the slot rows."""
-    text = render_proposal(job, plan.settings, plan.choice, plan.plate_type, None, cost, symbol=symbol)
-    warning = _preset_warning(plan)
-    if warning:
-        text = f"{text}\n{warning}"
+    """The proposal's text and buttons: slice and change, the slot rows, the goal rows and,
+    for a part, «Подобрать». At most ``MAX_BUTTONS``: the slot rows give way."""
+    text = render_proposal(
+        job, plan.settings, plan.choice, plan.plate_type, None, cost, symbol=symbol, goal=plan.goal
+    )
+    for warning in (goal_warning(plan.goal[0], plan.settings), _preset_warning(plan)):
+        if warning:
+            text = f"{text}\n{warning}"
     choice = plan.choice
     chosen = None
     if choice.ams is not None and choice.slot is not None:
         chosen = slot_number(choice.ams, choice.slot)
-    buttons = [
-        [
-            Button(f"job:{job.id}:slice", SLICE_BUTTON_TEXT),
-            Button(f"job:{job.id}:change", CHANGE_BUTTON_TEXT),
-        ],
-        *slot_buttons(job.id, plan.usable, chosen),
-    ]
-    return text, buttons
+    head = [Button(f"job:{job.id}:slice", SLICE_BUTTON_TEXT), Button(f"job:{job.id}:change", CHANGE_BUTTON_TEXT)]
+    goals = goal_buttons(job.id, plan.goal[0])
+    evaluate = eval_buttons(job.id) if plan.manifest.kind == "part" else []
+    room = MAX_BUTTONS - len(head) - sum(len(r) for r in (*goals, *evaluate))
+    return text, [head, *slot_buttons(job.id, plan.usable, chosen, room), *goals, *evaluate]
 
 
 def _sliced_minutes(job: Job) -> dict[int, float] | None:

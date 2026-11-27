@@ -18,6 +18,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from bambu_mcp import jobs as jobs_module
 from bambu_mcp import mcp_server
 from bambu_mcp.config import Secrets, Settings
+from bambu_mcp.evaluation import GOALS
 from bambu_mcp.messages import render_proposal, render_sliced
 from bambu_mcp.names import slug
 from bambu_mcp.notify import Button, LogNotifier, Press, SendError, ServiceNotifyClient
@@ -965,6 +966,7 @@ TRAYS = (
 )
 PLATES = ({"index": 1, "minutes": 100.0, "grams": {"PETG": 14.0}},)
 OVERRIDES = {"wall_loops": 4, "sparse_infill_density": 25, "sparse_infill_pattern": "gyroid", "enable_support": False}
+FALLBACK_GOAL = ("balanced", None, "fallback", None)
 
 
 def ok(file: str = "lamp-arm-1-p1.gcode.3mf", plates=PLATES) -> SliceOutcome:
@@ -1065,8 +1067,13 @@ async def test_propose_sends_the_summary_with_slice_and_change_buttons(tmp_path)
     spool_row = next(s for s in store.spools() if s.id == spool)
     cost = predict_cost(14.2, None, spool_row, "PETG", store.tariff_on(T0.date()), None, service._settings, T0,
                         currency="UAH")
-    assert notifier.sent[0]["text"] == render_proposal(job, OVERRIDES, choice, "Textured PEI Plate", None, cost)
-    assert notifier.button_ids(0) == [f"job:{job.id}:slice", f"job:{job.id}:change", f"job:{job.id}:slot:1"]
+    assert notifier.sent[0]["text"] == render_proposal(
+        job, OVERRIDES, choice, "Textured PEI Plate", None, cost, goal=FALLBACK_GOAL
+    )
+    goals = [f"job:{job.id}:goal:{key}" for key in GOALS]
+    assert notifier.button_ids(0) == [
+        f"job:{job.id}:slice", f"job:{job.id}:change", f"job:{job.id}:slot:1", *goals, f"job:{job.id}:eval"
+    ]
     # Only slot 1 has a spool with a preset: slots 2 and 3 are loaded but not mapped.
     assert notifier.sent[0]["buttons"][1] == [Button(f"job:{job.id}:slot:1", "✓ 1 petg белый")]
     assert store.job(job.id).status == "new"
@@ -1642,7 +1649,9 @@ async def test_propose_with_a_slot_stores_it_and_marks_its_button(tmp_path):
     assert "слот 2 PETG синий" in text
     await drain(service)
     assert notifier.sent[0]["text"] == text
-    assert [b.text for b in flat_buttons(notifier.sent[0]["buttons"][1:])] == ["1 petg белый", "✓ 2 PETG синий"]
+    assert [b.text for b in flat_buttons(notifier.sent[0]["buttons"][1:]) if ":slot:" in b.id] == [
+        "1 petg белый", "✓ 2 PETG синий"
+    ]
     # A later proposal without a slot keeps the stored one.
     assert "слот 2 PETG синий" in await service.propose(job.id)
     store.close()
@@ -1712,7 +1721,7 @@ async def test_slot_press_edits_the_proposal_and_a_later_slice_press_uses_it(har
     assert message_id == "m4" and "слот 2 PETG синий" in text
     rows = harness.notifier.edit_buttons[0]
     assert [b.id for b in rows[0]] == [f"job:{job.id}:slice", f"job:{job.id}:change"]
-    assert [(b.id, b.text) for b in flat_buttons(rows[1:])] == [
+    assert [(b.id, b.text) for b in flat_buttons(rows[1:]) if ":slot:" in b.id] == [
         (f"job:{job.id}:slot:1", "1 petg белый"),
         (f"job:{job.id}:slot:2", "✓ 2 PETG синий"),
     ]
@@ -1757,6 +1766,145 @@ async def test_slot_press_while_slicing_is_ignored_like_the_slice_button(harness
     assert harness.notifier.edits == [("m4", "Уже режу «lamp-arm»")]
     assert harness.store.job(job.id).slot is None
     assert harness.store.outbox_count() == 0
+
+
+# -- goals and base points (evaluation Task 5) -----------------------------------------
+
+GOAL_LABELS = ["Обычно", "Быстро", "Прочно", "Красиво", "Дёшево", "Легко", "Точно", "Герметично"]
+STRENGTH_BASE = {
+    "wall_loops": 4, "sparse_infill_density": 40, "sparse_infill_pattern": "gyroid",
+    "top_shell_layers": 7, "bottom_shell_layers": 5,
+}
+
+
+def goal_rows(rows) -> list[list[tuple[str, str]]]:
+    return [[(b.id, b.text) for b in row] for row in rows or [] if any(":goal:" in b.id for b in row)]
+
+
+async def test_proposal_names_the_goal_and_its_source(tmp_path):
+    service, store, _ = job_service(tmp_path)
+    add_spool(store)
+    fallback = add_job(store, service._settings)
+    assert "цель: обычно (по умолчанию)" in await service.propose(fallback.id)
+    hinted = add_job(store, service._settings, hints={
+        "goal": ["strength", "quality"], "goal_reason": "несущий кронштейн_1", "material": "PETG",
+    })
+    text = await service.propose(hinted.id)
+    assert r"цель: прочно, затем красиво (от ассистента: несущий кронштейн\_1)" in text
+    assert "4 стенки, 40% gyroid" in text  # the assistant's goal applies its base point
+    owner = await service.propose(hinted.id, goal="speed")
+    assert "цель: быстро (выбрал ты)" in owner
+    assert json.loads(store.job(hinted.id).goal_json) == {"primary": "speed", "secondary": None, "source": "owner"}
+    store.close()
+
+
+async def test_fallback_goal_keeps_the_hints(tmp_path):
+    # No goal in PRINT_HINTS: no base point, hints walls 4 / 25 % slice as 4 / 25 %.
+    slicer = FakeSlicer()
+    service, store, _ = job_service(tmp_path, slicer)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    text = await service.propose(job.id)
+    assert "цель: обычно (по умолчанию)" in text and "4 стенки, 25% gyroid" in text
+    await service.slice_job(job.id)
+    sent = dict(slicer.requests[0].overrides)
+    assert (sent["wall_loops"], sent["sparse_infill_density"]) == (4, 25)
+    store.close()
+
+
+async def test_explicit_setting_breaking_the_goal_rule_is_warned(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    assert "⚠️" not in await service.propose(job.id, goal="fit")
+    await drain(service)
+    await service.slice_job(job.id, {"wall_loops": 2})  # the owner's words win over the base point
+    await drain(service)
+    summary = notifier.sent[-1]["text"]
+    assert "⚠️ Цель «Точно» требует: стенок не меньше 3" in summary
+    store.close()
+
+
+async def test_goal_press_sets_base_point_no_slice(harness):
+    service, job, _blue = await slot_harness(harness)
+    queue = harness.notifier.press_queue
+    harness.store.update_job(job.id, variant_json=json.dumps({"wall_loops": 2}))
+
+    await queue.put(Press(1, "m4", f"job:{job.id}:goal:strength", T0))
+    await until(lambda: harness.notifier.edits)
+    message_id, text = harness.notifier.edits[0]
+    assert message_id == "m4" and "цель: прочно (выбрал ты)" in text
+    assert "4 стенки, 40% gyroid" in text and "верх/низ 7/5" in text
+    rows = goal_rows(harness.notifier.edit_buttons[0])
+    assert [len(r) for r in rows] == [4, 4]
+    assert [t for r in rows for _, t in r] == [("✓ " if t == "Прочно" else "") + t for t in GOAL_LABELS]
+    assert rows[0][2][0] == f"job:{job.id}:goal:strength"
+    stored = harness.store.job(job.id)
+    assert json.loads(stored.goal_json) == {"primary": "strength", "secondary": None, "source": "owner"}
+    assert stored.variant_json is None  # the old variant no longer hides the new base point
+    # No slice, no wake, nothing new sent: the proposal is edited in place.
+    assert harness.slicer.requests == [] and harness.waker.budgets == []
+    assert harness.store.outbox_count() == 0 and stored.status == "new"
+
+    await queue.put(Press(2, "m4", f"job:{job.id}:slice", T0))
+    await until(lambda: harness.store.job(job.id).status == "sliced")
+    sent = dict(harness.slicer.requests[0].overrides)
+    assert {k: sent[k] for k in STRENGTH_BASE} == STRENGTH_BASE
+
+
+async def test_goal_press_while_slicing_or_unknown_changes_nothing(harness):
+    _service, job, _blue = await slot_harness(harness)
+    queue = harness.notifier.press_queue
+    for seq, button in enumerate((f"job:{job.id}:goal:ultra", f"job:{job.id}:goal:", "job:x:goal:speed"), 1):
+        await queue.put(Press(seq, "m4", button, T0))
+    harness.store.update_job(job.id, status="slicing")
+    await queue.put(Press(9, "m4", f"job:{job.id}:goal:speed", T0))
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits == [("m4", "Уже режу «lamp-arm»")]
+    assert harness.store.job(job.id).goal_json is None
+    assert harness.slicer.requests == [] and harness.waker.budgets == []
+
+
+async def test_kit_has_no_podobrat_button(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)
+    part = add_job(store, service._settings)
+    kit = add_job(store, service._settings, kind="kit")
+    await service.propose(part.id)
+    await service.propose(kit.id)
+    await drain(service)
+    part_ids, kit_ids = notifier.button_ids(0), notifier.button_ids(1)
+    assert part_ids[-1] == f"job:{part.id}:eval"
+    assert notifier.sent[0]["buttons"][-1] == [Button(f"job:{part.id}:eval", "🔍 Подобрать")]
+    assert not any(i.endswith(":eval") for i in kit_ids)
+    # The goal buttons still set the kit's goal for the record.
+    assert sum(":goal:" in i for i in kit_ids) == 8
+    store.close()
+
+
+async def test_button_count_within_24(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    trays = []
+    for number in range(1, 17):
+        ams, slot = divmod(number - 1, 4)
+        trays.append(Tray(ams, slot, "PETG", "FFFFFFFF", None))
+        spool = store.add_spool("Elegoo", "PETG", f"цвет{number}", "#FFFFFF", PRESET, 550.0, 1000.0)
+        store.map_slot(ams, slot, spool)
+    service._state = replace(PrinterState.empty(), trays=tuple(trays))
+    part = add_job(store, service._settings)
+    kit = add_job(store, service._settings, kind="kit")
+    await service.propose(part.id, slot=16)
+    await service.propose(kit.id)
+    await drain(service)
+    for index in (0, 1):
+        ids = notifier.button_ids(index)
+        assert len(ids) <= 24, len(ids)
+        assert sum(":goal:" in i for i in ids) == 8
+        assert ids[:2][1].endswith(":change")
+    part_slots = [i for i in notifier.button_ids(0) if ":slot:" in i]
+    assert f"job:{part.id}:slot:16" in part_slots  # the chosen slot is always shown
+    assert len(notifier.button_ids(0)) == 24 and notifier.button_ids(0)[-1].endswith(":eval")
+    store.close()
 
 
 # -- phase 3: prepare, confirm and start a print -------------------------------------------

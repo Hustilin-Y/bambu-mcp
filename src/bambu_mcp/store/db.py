@@ -28,7 +28,7 @@ from bambu_mcp.store.models import (
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
 _CONFIRMATION_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 11
 # schema.sql is the version-1 schema; each later version is one migration script.
 _MIGRATIONS = {
     2: "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
@@ -102,6 +102,11 @@ _MIGRATIONS = {
     " ('currency', 'UAH'), ('currency_symbol', 'грн'), ('country', 'UA');",
     # When a message's buttons stop working (a start or stop confirmation's expiry), NULL: never.
     10: "ALTER TABLE outbox ADD COLUMN expires_at REAL;",
+    # The owner's print goal, the chosen evaluation variant (a settings layer) and the
+    # evaluated variants, all JSON. NULL: none yet.
+    11: "ALTER TABLE jobs ADD COLUMN goal_json TEXT;\n"
+    "ALTER TABLE jobs ADD COLUMN variant_json TEXT;\n"
+    "ALTER TABLE jobs ADD COLUMN variants_json TEXT;",
 }
 _SEEN_TTL_S = 30 * 24 * 3600
 _DEFAULT_TARIFF = (date(2024, 6, 1), 4.32, None)
@@ -139,7 +144,10 @@ _PRINT_FIELDS = frozenset(
         "plate",
     }
 )
-_JOB_FIELDS = frozenset({"status", "settings_json", "result_json", "sliced_file", "error", "slot"})
+_JOB_FIELDS = frozenset({
+    "status", "settings_json", "result_json", "sliced_file", "error", "slot",
+    "goal_json", "variant_json", "variants_json",
+})
 
 
 def _norm(identity: tuple) -> tuple[str, str, str]:
@@ -236,6 +244,9 @@ def _job(row: sqlite3.Row) -> Job:
         sliced_file=row["sliced_file"],
         error=row["error"],
         slot=row["slot"],
+        goal_json=row["goal_json"],
+        variant_json=row["variant_json"],
+        variants_json=row["variants_json"],
     )
 
 

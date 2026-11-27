@@ -78,14 +78,18 @@ def resolve_settings(
     hints: Mapping,
     named_set: str,
     *,
+    goal_base: Mapping | None = None,
+    variant: Mapping | None = None,
     checks: Mapping | None = None,
     nozzle: str = DEFAULT_NOZZLE,
 ) -> dict[str, object]:
-    """Overrides for a slice: explicit > the last sliced job of the part > hints > named set.
+    """Overrides for a slice: explicit > variant > goal base point > last job > hints > named set.
 
     ``explicit`` is the owner's request: anything outside the whitelist raises ``ValueError``
-    (the message names the key). ``last_job`` is that job's stored settings, entries that no
-    longer pass are dropped. ``checks`` are the manifest (or kit plate) checks.
+    (the message names the key). Only explicit fixes a setting (ruling R2). ``variant`` is the
+    chosen evaluation variant, ``goal_base`` the goal's base point (``evaluation.goal_base``)
+    and ``last_job`` the last sliced job's stored settings: entries of these three that do not
+    pass for ``nozzle`` are dropped. ``checks`` are the manifest (or kit plate) checks.
     """
     if named_set not in NAMED_SETS:
         raise ValueError(f"unknown named set: {named_set!r} (known: {', '.join(NAMED_SETS)})")
@@ -93,7 +97,13 @@ def resolve_settings(
     Overrides.parse(explicit, nozzle)
     if "support_type" in explicit and "enable_support" not in explicit:
         explicit["enable_support"] = True  # asking for a support type means wanting supports
-    above = {**hint_overrides(hints, checks), **_valid_entries(last_job, nozzle), **explicit}
+    above = {
+        **hint_overrides(hints, checks),
+        **_valid_entries(last_job, nozzle),
+        **_valid_entries(goal_base, nozzle),
+        **_valid_entries(variant, nozzle),
+        **explicit,
+    }
     for key, value in NAMED_SETS[named_set].items():
         if key in above:
             continue

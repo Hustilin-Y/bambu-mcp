@@ -615,3 +615,32 @@ def test_slot_buttons_mark_the_chosen_slot():
     assert len(flat[2].text) == 64 and flat[2].text.startswith("3 PETG x")
     assert flat[-1].id == "job:7:slot:16"
     assert slot_buttons(7, [], chosen=None) == []
+
+
+def test_precedence_with_goal_and_variant():
+    # explicit > variant > goal base point > last job > hints > named set (global constraints).
+    keys = ("wall_loops", "sparse_infill_density", "sparse_infill_pattern", "layer_height", "brim_type", "seam_position")
+    named = "strong"  # wall_loops 4, sparse_infill_density 25
+    hints = {"walls": 1, "infill_pct": 1, "infill_pattern": "grid", "brim": "outer"}
+    last = {"wall_loops": 2, "sparse_infill_density": 2, "sparse_infill_pattern": "honeycomb", "layer_height": 0.12}
+    base = {"wall_loops": 3, "sparse_infill_density": 3, "layer_height": 0.24}
+    variant = {"wall_loops": 5, "sparse_infill_density": 5}
+    explicit = {"wall_loops": 6}
+    out = resolve_settings(explicit, last, hints, named, goal_base=base, variant=variant, nozzle="0.4")
+    assert {k: out.get(k) for k in keys} == {
+        "wall_loops": 6,  # explicit
+        "sparse_infill_density": 5,  # variant
+        "sparse_infill_pattern": "honeycomb",  # last job: the base point does not set it
+        "layer_height": 0.24,  # goal base point
+        "brim_type": "outer_only",  # hints
+        "seam_position": None,  # nobody sets it: left to the process preset
+    }
+    # Without the new layers nothing changes.
+    assert resolve_settings(explicit, last, hints, named, nozzle="0.4") == resolve_settings(
+        explicit, last, hints, named, goal_base=None, variant=None, nozzle="0.4"
+    )
+    # A base point or variant entry the nozzle cannot take is dropped, like a stale last job's.
+    out = resolve_settings({}, None, {}, "standard", goal_base={"layer_height": 0.24}, variant={"wall_loops": 99},
+                           nozzle="0.6")
+    assert "layer_height" not in out and "wall_loops" not in out
+    Overrides.parse(out, "0.6")

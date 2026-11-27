@@ -112,6 +112,9 @@ class Job:
     sliced_file: str | None  # a file name, never a path
     error: str | None
     slot: int | None = None  # the owner's AMS slot choice (1..16), None: chosen by material
+    goal_json: str | None = None  # the owner's goal {"primary", "secondary", "source"}, None: not chosen
+    variant_json: str | None = None  # the chosen evaluation variant's settings (a settings layer)
+    variants_json: str | None = None  # the evaluated variants of the last run
 
 
 @dataclass(frozen=True)

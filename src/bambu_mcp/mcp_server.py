@@ -46,6 +46,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from bambu_mcp import camera as camera_module
 from bambu_mcp.config import Secrets, Settings, country_timezone, with_country
 from bambu_mcp.cost import tariff_reminder_enabled
+from bambu_mcp.evaluation import job_goal, parse_goal
 from bambu_mcp.jobs import (
     MAX_FILE_BYTES,
     JobBusy,
@@ -145,10 +146,16 @@ class StatusSource(Protocol):
     @property
     def state_fresh(self) -> bool: ...
 
-    async def propose(self, job_id: int, slot: int | None = None) -> str: ...
+    async def propose(self, job_id: int, slot: int | None = None, goal: object = None) -> str: ...
 
     def start_slice(
-        self, job_id: int, explicit: Mapping | None = None, *, named_set: str = ..., slot: int | None = None
+        self,
+        job_id: int,
+        explicit: Mapping | None = None,
+        *,
+        named_set: str = ...,
+        slot: int | None = None,
+        goal: object = None,
     ) -> SliceStart: ...
 
     def set_tray(
@@ -381,6 +388,15 @@ def explicit_settings(
     return explicit, named
 
 
+def _check_goal(goal: str | list[str] | None) -> None:
+    """``ToolError`` naming the allowed keys for a goal that is not one key or two different ones."""
+    if goal is not None:
+        try:
+            parse_goal(goal)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from None
+
+
 def _job_nozzle(job: Job) -> str:
     try:
         return f"{parse_manifest(json.loads(job.manifest_json)).nozzle_mm:g}"
@@ -472,12 +488,22 @@ def _job_status(store: Store, job: Job, tz: ZoneInfo) -> dict[str, Any]:
         "named_set": result.get("named_set"),
         "slot": _job_slot(store, result),
         "chosen_slot": job.slot,
+        "goal": _job_goal(job),
         "plate_type": result.get("plate_type"),
         "nozzle": result.get("nozzle") or _stored_nozzle(job),
         "plates": _job_plates(result),
         "warning": _slot_warning(result),
         "error": job.error,
     }
+
+
+def _job_goal(job: Job) -> dict[str, Any] | None:
+    """The job's goal: the owner's, the CAD agent's (with its reason) or the fallback."""
+    try:
+        primary, secondary, source, reason = job_goal(job, parse_manifest(json.loads(job.manifest_json)))
+    except (ValueError, RecursionError, ManifestError):
+        return None
+    return {"primary": primary, "secondary": secondary, "source": source, "reason": reason}
 
 
 def _slot_warning(result: Mapping) -> str | None:
@@ -951,19 +977,26 @@ def build_mcp(
         return {"job_id": job.id, "name": job.name, "kind": job.kind, "status": job.status}
 
     @mcp.tool(annotations=WRITE)
-    async def propose_job(job_id: int, slot: int | None = None) -> dict[str, Any]:
-        """Send the job's proposal (settings, AMS slot, plate) to Telegram with slice, change and
-        slot buttons.
+    async def propose_job(
+        job_id: int, slot: int | None = None, goal: str | list[str] | None = None
+    ) -> dict[str, Any]:
+        """Send the job's proposal (settings, AMS slot, plate, goal) to Telegram with slice, change,
+        slot and goal buttons.
 
         `slot` (1..16, AMS 1 is 1..4, AMS 2 is 5..8) is the owner's choice of AMS slot: pass it
         only when the owner names one. It is stored with the job and used by later slices.
         Without it the stored slot is used, else the slot whose material matches the part.
-        Returns the same text. Nothing is sliced or printed.
+        `goal` is the owner's print goal, pass it only when the owner names one: balanced,
+        speed, strength, quality, cheap, light, fit or watertight, or [primary, secondary].
+        It is stored with the job and sets that goal's base settings. Without it the stored
+        goal is used, else the CAD agent's, else balanced. Returns the same text. Nothing is
+        sliced or printed.
         """
         job_or_error(job_id)
         _check_slot_number(slot)
+        _check_goal(goal)
         try:
-            text = await service.propose(job_id, slot)
+            text = await service.propose(job_id, slot, goal)
         except JobBusy:
             raise ToolError(f"job {job_id} is being sliced already") from None
         except KeyError:
@@ -974,7 +1007,10 @@ def build_mcp(
 
     @mcp.tool(annotations=WRITE)
     async def slice_job(
-        job_id: int, settings: dict[str, Any] | None = None, slot: int | None = None
+        job_id: int,
+        settings: dict[str, Any] | None = None,
+        slot: int | None = None,
+        goal: str | list[str] | None = None,
     ) -> dict[str, Any]:
         """Start slicing a job on the owner's PC (woken if needed). Returns at once, never prints.
 
@@ -984,16 +1020,21 @@ def build_mcp(
         bottom_shell_layers (0..20), outer_wall_speed (20..300 mm/s), seam_position, ironing_type.
         They win over the part's last settings and its hints. `slot` (1..16) is the owner's
         choice of AMS slot: pass it only when the owner names one. It is stored with the job. Without it the job's stored slot
-        is used, else the slot whose material matches the part. Follow it with job_status; the
+        is used, else the slot whose material matches the part. `goal` (as in propose_job, only
+        when the owner names one) is stored with the job and its base settings apply under
+        `settings`. Follow it with job_status; the
         summary also goes to Telegram. `warning` is the AMS slot warning (a material mismatch,
         Russian) or null: tell the owner.
         """
         job = job_or_error(job_id)
         explicit, named = explicit_settings(settings, _job_nozzle(job))
         _check_slot_number(slot)
+        _check_goal(goal)
         options: dict[str, Any] = {"named_set": named} if named else {}
         if slot is not None:
             options["slot"] = slot
+        if goal is not None:
+            options["goal"] = goal
         try:
             # The Telegram button's path: claimed now, sliced in a background task, so a
             # cancelled tool call never interrupts the slice.

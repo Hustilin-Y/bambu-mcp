@@ -9,6 +9,7 @@ from datetime import date, tzinfo
 from zoneinfo import ZoneInfo
 
 from bambu_mcp.cost import CostBreakdown, CurrencyMismatch, sum_costs
+from bambu_mcp.evaluation import GOALS, broken_rules
 from bambu_mcp.events import Event, EventKind
 from bambu_mcp.manifest import Manifest, PlateInfo, parse_manifest
 from bambu_mcp.notify import Button
@@ -32,6 +33,9 @@ LOST_TITLE = "❌ Печать прервана, пока сервис не ви
 _BUTTON_TEXT_MAX = 64
 _SPOOLS_PER_ROW = 2
 _SLOTS_PER_ROW = 4
+_GOALS_PER_ROW = 4
+MAX_BUTTONS = 24  # per Telegram message (global constraints)
+EVAL_BUTTON_TEXT = "🔍 Подобрать"
 CHOSEN_MARK = "✓ "
 # Characters the add-in's rich Markdown reads as formatting (multiclaude telegram.markdown_literal).
 _MARKDOWN_SPECIAL = re.compile(r"([\\`*_~=|\[\]$])")
@@ -224,16 +228,73 @@ def spool_buttons(print_id: int, spools: Sequence[Spool]) -> list[list[Button]]:
     return rows
 
 
-def slot_buttons(job_id: int, usable: Sequence[UsableSlot], chosen: int | None) -> list[list[Button]]:
-    """The proposal's slot rows: ``job:<id>:slot:<n>``, the ``chosen`` number marked."""
+def slot_buttons(
+    job_id: int, usable: Sequence[UsableSlot], chosen: int | None, limit: int = MAX_SLOT_NUMBER
+) -> list[list[Button]]:
+    """The proposal's slot rows: ``job:<id>:slot:<n>``, the ``chosen`` number marked.
+
+    At most ``limit`` slots, in slot order. The chosen one is always among them.
+    """
+    shown = list(usable[: max(limit, 0)])
+    if limit > 0 and chosen is not None and all(u.number != chosen for u in shown):
+        extra = [u for u in usable if u.number == chosen]
+        if extra:
+            shown = sorted([*shown[:-1], extra[0]], key=lambda u: u.number)
     buttons = [
         Button(
             f"job:{job_id}:slot:{u.number}",
             f"{CHOSEN_MARK if u.number == chosen else ''}{u.label}"[:_BUTTON_TEXT_MAX],
         )
-        for u in usable[:MAX_SLOT_NUMBER]
+        for u in shown
     ]
     return [buttons[i : i + _SLOTS_PER_ROW] for i in range(0, len(buttons), _SLOTS_PER_ROW)]
+
+
+def goal_buttons(job_id: int, current: str) -> list[list[Button]]:
+    """The proposal's goal rows: ``job:<id>:goal:<key>``, two rows of 4, the ``current`` one marked."""
+    buttons = [
+        Button(f"job:{job_id}:goal:{g.key}", f"{CHOSEN_MARK if g.key == current else ''}{g.label}")
+        for g in GOALS.values()
+    ]
+    return [buttons[i : i + _GOALS_PER_ROW] for i in range(0, len(buttons), _GOALS_PER_ROW)]
+
+
+def eval_buttons(job_id: int) -> list[list[Button]]:
+    """«🔍 Подобрать»: a part's evaluation run (``job:<id>:eval``). A kit has none."""
+    return [[Button(f"job:{job_id}:eval", EVAL_BUTTON_TEXT)]]
+
+
+_GOAL_SOURCES = {"owner": "выбрал ты", "fallback": "по умолчанию"}
+
+
+def goal_warning(primary: str, settings: Mapping) -> str | None:
+    """A line when ``settings`` (an explicit setting wins over the base point) break the
+    goal's rules: '⚠️ Цель «Точно» требует: стенок не меньше 3, ...'. None when they hold."""
+    goal = GOALS[primary]
+    lim = goal.limits
+    words = {
+        "wall_loops": f"стенок не меньше {lim.min_walls}",
+        "wall_generator": f"генератор стенок {lim.wall_generator}",
+        "outer_wall_speed": f"внешняя стенка не быстрее {lim.max_outer_wall_speed or 0:g} мм/с",
+        "top_shell_layers": f"верх не меньше {lim.min_top_bottom} слоёв",
+        "bottom_shell_layers": f"низ не меньше {lim.min_top_bottom} слоёв",
+    }
+    broken = broken_rules(goal, settings)
+    if not broken:
+        return None
+    return f"⚠️ Цель «{goal.label}» требует: {', '.join(words[k] for k in broken)}"
+
+
+def goal_line(primary: str, secondary: str | None, source: str, reason: str | None) -> str:
+    """'цель: прочно, затем красиво (от ассистента: <reason>)'."""
+    words = GOALS[primary].label.lower()
+    if secondary is not None:
+        words += f", затем {GOALS[secondary].label.lower()}"
+    if source == "assistant":
+        why = f"от ассистента: {md_literal(reason)}" if reason else "от ассистента"
+    else:
+        why = _GOAL_SOURCES[source]
+    return f"цель: {words} ({why})"
 
 
 # -- job proposal and slice summary ------------------------------------------------
@@ -246,6 +307,8 @@ _HINT_WORDS = {
     "brim": "кайма",
     "material": "материал",
     "material_reason": "причина материала",
+    "goal": "цель",
+    "goal_reason": "причина цели",
 }
 _BRIM_WORDS = {"no_brim": "без каймы", "auto_brim": "кайма авто", "outer_only": "кайма снаружи"}
 _SEAM_WORDS = {"back": "шов сзади", "aligned": "шов по линии", "nearest": "шов ближайший", "random": "шов случайный"}
@@ -431,12 +494,14 @@ def render_proposal(
     cost: CostBreakdown | CurrencyMismatch | None = None,
     *,
     symbol: str = DEFAULT_SYMBOL,
+    goal: tuple[str, str | None, str, str | None] | None = None,
 ) -> str:
     """What the service is about to slice. ``estimate``: grams per plate index (None: the manifest's).
 
     Plain text, no buttons. ``plate_type`` is the bed when ``settings`` has no ``curr_bed_type``.
     ``cost``: the predicted cost of the whole job (its lines follow the grams), priced as
-    if the print started now.
+    if the print started now. ``goal``: (primary, secondary, source, reason) from
+    ``evaluation.job_goal``, its line follows the cost.
     """
     manifest = _job_manifest(job)
     grams = dict(estimate) if estimate is not None else {p.index: p.estimate_g for p in manifest.plates}
@@ -447,6 +512,8 @@ def render_proposal(
         lines = [f"{head} {_about(_grams(sum(grams.values())))}"]
     if cost is not None:
         lines += render_cost(cost, symbol, start_now=True)
+    if goal is not None:
+        lines.append(goal_line(*goal))
     material, reason = job_material(manifest)
     if reason:
         lines.append(f"Почему {md_literal(material)}: {md_literal(reason)}")
