@@ -1916,6 +1916,8 @@ EVAL_FEATURE_KEYS = (
     "outer_wall", "inner_wall", "top_surface", "bottom_surface", "sparse_infill", "internal_solid_infill",
     "support", "other",
 )
+# A strength run on the fixture: the balanced baseline (3 walls, 15 %), then the strength grid.
+STRENGTH_RUN = [(3, 15), (3, 25), (4, 30), (4, 40), (5, 50), (6, 60)]
 
 
 class EvalSlicer:
@@ -1977,6 +1979,10 @@ def variant_ids(rows) -> list[tuple[str, str]]:
     return [(b.id, b.text) for row in rows or [] for b in row if ":variant:" in b.id]
 
 
+def walls_infill(requests) -> list[tuple[int, int]]:
+    return [(dict(r.overrides)["wall_loops"], dict(r.overrides)["sparse_infill_density"]) for r in requests]
+
+
 async def eval_harness(harness, slicer):
     harness.slicer, harness.waker = slicer, FakeWaker()
     harness.settings = job_settings(harness.settings.data_dir)
@@ -1997,31 +2003,51 @@ async def test_evaluation_slices_baseline_then_variants_sequentially(tmp_path):
 
     assert waker.budgets == [120]  # woken once for the whole run
     assert slicer.max_active == 1  # one slice at a time
+    # The balanced base point first (spec 5.1), then the strength grid with its base point.
+    assert walls_infill(slicer.requests) == STRENGTH_RUN
     sent = [dict(r.overrides) for r in slicer.requests]
-    assert {k: sent[0][k] for k in STRENGTH_BASE} == STRENGTH_BASE  # the baseline first
-    assert [(s["wall_loops"], s["sparse_infill_density"]) for s in sent] == [
-        (4, 40), (3, 25), (4, 30), (5, 50), (6, 60)
-    ]
+    assert {k: sent[3][k] for k in STRENGTH_BASE} == STRENGTH_BASE
     assert all(r.name == "lamp-arm" and r.job_id == job.id for r in slicer.requests)
     rows = table(text)
-    assert len(rows) == 5
-    assert rows[0].startswith("1 4 стенки 40% gyroid · 120 мин · 12 г · ")
+    assert len(rows) == 6
+    assert rows[0].startswith("1 3 стенки 15% gyroid · 85 мин · 8 г · ")
     assert rows[0].endswith(" · прочность 1.0×")
+    assert rows[3].startswith("4 4 стенки 40% gyroid верх/низ 7/5 · 120 мин · 12 г · ")
+    assert rows[3].endswith(" · прочность 1.7×")  # 850 / 500: against the balanced baseline
     # The strongest within 2.5 x the baseline's time wins, and is shown as the proposal.
-    assert rows[4].startswith("5 ✓ 6 стенок 60% gyroid · 160 мин · 16 г · ")
-    assert rows[4].endswith(" грн · прочность 1.5×")  # 1250 / 850
+    assert rows[5].startswith("6 ✓ 6 стенок 60% gyroid верх/низ 7/5 · 160 мин · 16 г · ")
+    assert rows[5].endswith(" грн · прочность 2.5×")  # 1250 / 500
     assert text.startswith("lamp-arm, пластина 1: ") and "6 стенок, 60% gyroid" in text.split("\n")[0]
     stored = store.job(job.id)
     assert stored.status == "new"  # the run gives the job back as it was
     assert json.loads(stored.variant_json)["wall_loops"] == 6
     variants = json.loads(stored.variants_json)
-    assert [v["n"] for v in variants["variants"]] == [1, 2, 3, 4, 5] and variants["chosen"] == 5
+    assert [v["n"] for v in variants["variants"]] == [1, 2, 3, 4, 5, 6] and variants["chosen"] == 6
     await drain(service)
     assert notifier.sent[-1]["text"] == text
     assert variant_ids(notifier.sent[-1]["buttons"]) == [
-        (f"job:{job.id}:variant:{n}", f"{'✓ ' if n == 5 else ''}Вариант {n}") for n in range(1, 6)
+        (f"job:{job.id}:variant:{n}", f"{'✓ ' if n == 6 else ''}Вариант {n}") for n in range(1, 7)
     ]
     store.close()
+
+
+async def test_explicit_walls_stay_in_every_variant(harness):
+    # «4 стенки» (the owner's words through slice_job), then «Подобрать»: every variant has 4 walls.
+    slicer = EvalSlicer()
+    service, job = await eval_harness(harness, slicer)
+    await service.slice_job(job.id, {"wall_loops": 4})
+    stored = harness.store.job(job.id)
+    assert json.loads(stored.explicit_json) == {"wall_loops": 4}
+    await until(lambda: harness.store.outbox_count() == 0)
+
+    await harness.notifier.press_queue.put(Press(1, "m7", f"job:{job.id}:eval", T0))
+    await until(lambda: len(slicer.requests) == 7 and harness.store.job(job.id).status == "new")
+    run = slicer.requests[1:]
+    assert len(run) == 6 and {dict(r.overrides)["wall_loops"] for r in run} == {4}
+    assert [dict(r.overrides)["sparse_infill_density"] for r in run] == [15, 25, 30, 40, 50, 60]
+    # The explicit layer still wins after the run, and in a later slice.
+    await service.slice_job(job.id)
+    assert dict(slicer.requests[-1].overrides)["wall_loops"] == 4
 
 
 async def test_failed_variant_skipped_failed_baseline_restores(harness):
@@ -2030,14 +2056,14 @@ async def test_failed_variant_skipped_failed_baseline_restores(harness):
 
     text = await service.evaluate(job.id)
     rows = table(text)
-    assert rows[3] == "4 ✗ 5 стенок 50% adaptivecubic · не нарезан"
-    assert len(slicer.requests) == 5  # the run went on after the failure
+    assert rows[4] == "5 ✗ 5 стенок 50% adaptivecubic верх/низ 7/5 · не нарезан"
+    assert len(slicer.requests) == 6  # the run went on after the failure
     await until(lambda: harness.store.outbox_count() == 0)
-    assert f"job:{job.id}:variant:4" not in [i for i, _ in variant_ids(harness.notifier.sent[-1]["buttons"])]
+    assert f"job:{job.id}:variant:5" not in [i for i, _ in variant_ids(harness.notifier.sent[-1]["buttons"])]
 
     # A failed baseline fails the run: the proposal goes back to its text, nothing is stored.
     other = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
-    slicer.fail = lambda o: "агент: no preset" if o["sparse_infill_density"] == 40 else None
+    slicer.fail = lambda o: "агент: no preset" if o["sparse_infill_density"] == 15 else None
     before = await service.propose(other.id)
     await until(lambda: harness.store.outbox_count() == 0)
     count = len(slicer.requests)
@@ -2053,13 +2079,14 @@ async def test_failed_variant_skipped_failed_baseline_restores(harness):
 
 
 async def test_all_variants_fail_baseline_only(tmp_path):
-    slicer = EvalSlicer(fail=lambda o: None if o["sparse_infill_density"] == 40 else "boom")
+    slicer = EvalSlicer(fail=lambda o: None if o["sparse_infill_density"] == 15 else "boom")
     service, store, notifier = job_service(tmp_path, slicer)
     add_spool(store)
     job = add_job(store, service._settings, hints=STRENGTH_HINTS)
     rows = table(await service.evaluate(job.id))
-    assert rows[0].startswith("1 ✓ 4 стенки 40% gyroid · 120 мин")
-    assert all(r.endswith("не нарезан") for r in rows[1:])
+    assert rows[0].startswith("1 ✓ 3 стенки 15% gyroid · 85 мин")
+    assert all(r.endswith("не нарезан") for r in rows[1:6])
+    assert rows[6] == "Нарезался только базовый вариант, остальные не нарезались"
     await drain(service)
     assert variant_ids(notifier.sent[-1]["buttons"]) == [(f"job:{job.id}:variant:1", "✓ Вариант 1")]
     store.close()
@@ -2070,7 +2097,11 @@ async def test_no_features_strength_unknown(tmp_path):
     add_spool(store)
     job = add_job(store, service._settings, hints=STRENGTH_HINTS)
     rows = table(await service.evaluate(job.id))
-    assert len(rows) == 5 and all(r.endswith(" · прочность ?") for r in rows)
+    assert len(rows) == 7 and all(r.endswith(" · прочность ?") for r in rows[:6])
+    # Strength unknown: the strength goal keeps its base point, not the fastest variant.
+    assert rows[3].startswith("4 ✓ 4 стенки 40% gyroid")
+    assert rows[6] == "Прочность неизвестна: агент на ПК её не измерил, выбран базовый вариант цели"
+    assert json.loads(store.job(job.id).variants_json)["chosen"] == 4
     store.close()
 
 
@@ -2110,59 +2141,71 @@ async def test_second_press_and_goal_press_during_run_refused(harness):
     await until(lambda: len(harness.notifier.edits) == 7)
     message_id, text = harness.notifier.edits[-1]
     assert message_id == "m4" and "Варианты:" in text
-    assert len(variant_ids(harness.notifier.edit_buttons[-1])) == 5
+    assert len(variant_ids(harness.notifier.edit_buttons[-1])) == 6
     assert harness.store.job(job.id).status == "new"
-    assert len(harness.slicer.requests) == 5
+    assert len(harness.slicer.requests) == 6
 
 
-async def test_choose_variant_then_slice_reuses_file(harness):
+async def test_choose_variant_then_slice_slices_it_fresh(harness):
+    # Ruling R5: no file reuse, «Резать» after «Вариант N» always slices that variant.
     slicer = EvalSlicer()
     service, job = await eval_harness(harness, slicer)
     await service.evaluate(job.id)
     queue = harness.notifier.press_queue
 
-    # «Вариант 4» (5 walls): stored as the variant layer and marked, the proposal edited in place.
-    await queue.put(Press(1, "m5", f"job:{job.id}:variant:4", T0))
+    await queue.put(Press(1, "m5", f"job:{job.id}:variant:5", T0))
     await until(lambda: harness.notifier.edits)
     message_id, text = harness.notifier.edits[0]
     assert message_id == "m5" and "5 стенок, 50% adaptivecubic" in text.split("\n")[0]
-    assert table(text)[3].startswith("4 ✓ ")
-    assert "✓ Вариант 4" in [t for _, t in variant_ids(harness.notifier.edit_buttons[0])]
+    assert table(text)[4].startswith("5 ✓ ")
+    assert "✓ Вариант 5" in [t for _, t in variant_ids(harness.notifier.edit_buttons[0])]
     stored = harness.store.job(job.id)
     assert json.loads(stored.variant_json)["wall_loops"] == 5 and stored.goal_json is None
-    assert json.loads(stored.variants_json)["chosen"] == 4
+    assert json.loads(stored.variants_json)["chosen"] == 5
 
-    # Back to «Вариант 5», the last one sliced: its file is still the agent's, «Резать» reuses it.
-    await queue.put(Press(2, "m5", f"job:{job.id}:variant:5", T0))
-    await until(lambda: len(harness.notifier.edits) == 2)
-    woken = len(harness.waker.budgets)
-    await queue.put(Press(3, "m5", f"job:{job.id}:slice", T0))
-    await until(lambda: harness.store.job(job.id).status == "sliced")
-    assert len(slicer.requests) == 5 and len(harness.waker.budgets) == woken  # no slice, no wake
-    done = harness.store.job(job.id)
-    result = json.loads(done.result_json)
-    assert result["file_sha256"] == slicer.shas[4]
-    assert result["plates"][0]["minutes"] == 160.0
-    assert json.loads(done.settings_json)["wall_loops"] == 6
-    assert done.sliced_file == f"lamp-arm-{job.id}-p1.gcode.3mf"
-    await until(lambda: harness.store.outbox_count() == 0)
-    assert harness.notifier.sent[-1]["text"].startswith("lamp-arm, пластина 1:")
+    # Even «Вариант 6», the last one sliced, is sliced again.
+    for seq, n in ((2, 6), (4, 5)):
+        await queue.put(Press(seq, "m5", f"job:{job.id}:variant:{n}", T0))
+        await until(lambda seq=seq: len(harness.notifier.edits) == seq)
+        count = len(slicer.requests)
+        await queue.put(Press(seq + 1, "m5", f"job:{job.id}:slice", T0))
+        await until(lambda count=count: len(slicer.requests) == count + 1)
+        await until(lambda: harness.store.job(job.id).status == "sliced")
+        assert dict(slicer.requests[-1].overrides)["wall_loops"] == n
+        result = json.loads(harness.store.job(job.id).result_json)
+        assert result["file_sha256"] == slicer.shas[-1]
 
-    # «Вариант 4» was overwritten on the PC by later variants: «Резать» slices it again.
-    await queue.put(Press(4, "m5", f"job:{job.id}:variant:4", T0))
-    await until(lambda: len(harness.notifier.edits) == 4)
-    await queue.put(Press(5, "m5", f"job:{job.id}:slice", T0))
-    await until(lambda: len(slicer.requests) == 6)
-    await until(lambda: harness.store.job(job.id).status == "sliced")
-    assert dict(slicer.requests[5].overrides)["wall_loops"] == 5
-    assert json.loads(harness.store.job(job.id).result_json)["file_sha256"] == slicer.shas[5]
+
+async def test_evaluating_a_sliced_job_drops_its_result_and_expires_its_confirmations(harness):
+    slicer = EvalSlicer()
+    service, job = await eval_harness(harness, slicer)
+    await service.slice_job(job.id)
+    assert harness.store.job(job.id).status == "sliced"
+    confirm = harness.store.add_confirmation(
+        None, "start", job_id=job.id, plate=1, gate_hash="x", payload_json="{}", now=T0.timestamp()
+    )
+    other_job = add_job(harness.store, harness.settings)
+    other = harness.store.add_confirmation(
+        None, "start", job_id=other_job.id, plate=1, gate_hash="x", payload_json="{}", now=T0.timestamp()
+    )
+
+    await service.evaluate(job.id)
+
+    stored = harness.store.job(job.id)
+    assert stored.status == "new" and stored.result_json is None and stored.sliced_file is None
+    expired = harness.store.confirmation(confirm.id)
+    assert (expired.state, expired.outcome) == ("expired", "reevaluated")
+    assert harness.store.confirmation(other.id).state == "pending"  # another job's stays
+    await harness.notifier.press_queue.put(Press(1, "m8", f"start:{confirm.id}:go", T0))
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits[-1] == ("m8", "⌛ Настройки подбираются заново, подготовь печать после подбора")
 
 
 async def test_chosen_variant_is_inherited_by_the_next_job_with_the_same_goal(harness):
     # Ruling R4: the same primary goal inherits the last job's settings over the base point.
     service, job = await eval_harness(harness, EvalSlicer())
     await service.evaluate(job.id)
-    await service.choose_variant(job.id, 4)  # 5 walls, 50 % adaptivecubic
+    await service.choose_variant(job.id, 5)  # 5 walls, 50 % adaptivecubic
     await service.slice_job(job.id)
     assert json.loads(harness.store.job(job.id).settings_json)["wall_loops"] == 5
 
@@ -2182,10 +2225,10 @@ async def test_choose_variant_refusals(tmp_path):
     with pytest.raises(ValueError, match="no evaluation"):
         await service.choose_variant(job.id, 1)
     await service.evaluate(job.id)
-    for n in (0, 6, 4):  # out of range, and the failed one
+    for n in (0, 7, 5):  # out of range, and the failed one
         with pytest.raises(ValueError, match="variant"):
             await service.choose_variant(job.id, n)
-    assert json.loads(store.job(job.id).variants_json)["chosen"] == 5
+    assert json.loads(store.job(job.id).variants_json)["chosen"] == 6
     store.close()
 
 
@@ -2215,9 +2258,9 @@ async def test_button_count_within_24_after_an_evaluation(tmp_path):
     await service.evaluate(job.id)
     await drain(service)
     ids = notifier.button_ids(-1)
-    assert len(ids) <= 24, len(ids)
+    assert len(ids) == 24, len(ids)
     assert not any(":goal:" in i for i in ids)  # the variant row replaces the goal rows (spec 5.8)
-    assert sum(":variant:" in i for i in ids) == 5
+    assert sum(":variant:" in i for i in ids) == 6
     assert f"job:{job.id}:slot:16" in ids and f"job:{job.id}:eval" in ids
     store.close()
     # With one AMS everything fits: the goal rows stay.
@@ -2228,9 +2271,74 @@ async def test_button_count_within_24_after_an_evaluation(tmp_path):
     await small.evaluate(other.id)
     await drain(small)
     ids = small_notifier.button_ids(-1)
-    assert sum(":goal:" in i for i in ids) == 8 and sum(":variant:" in i for i in ids) == 5
+    assert sum(":goal:" in i for i in ids) == 8 and sum(":variant:" in i for i in ids) == 6
     assert len(ids) <= 24
     small_store.close()
+
+
+async def test_interrupted_evaluation_is_restored_at_startup(harness):
+    harness.slicer, harness.waker = EvalSlicer(), FakeWaker()
+    harness.settings = job_settings(harness.settings.data_dir)
+    add_spool(harness.store)
+    job = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
+    previous = json.dumps({"variants": [], "chosen": None})
+    marker = {
+        "state": "running", "prev_status": "new", "message_id": "m4", "previous": previous,
+        "before_text": "BEFORE", "before_buttons": [[{"id": f"job:{job.id}:eval", "text": "🔍 Подобрать"}]],
+    }
+    harness.store.update_job(job.id, status="slicing", variants_json=json.dumps(marker, ensure_ascii=False))
+
+    await harness.start()
+    await until(lambda: harness.store.outbox_count() == 0 and harness.notifier.sent)
+
+    stored = harness.store.job(job.id)
+    assert stored.status == "new" and stored.variants_json == previous
+    assert harness.notifier.edits == [("m4", "BEFORE")]
+    assert harness.notifier.edit_buttons[0] == [[Button(f"job:{job.id}:eval", "🔍 Подобрать")]]
+    sent = texts(harness.notifier)
+    assert sent == [
+        "Подбор вариантов для «lamp-arm» не закончен: подбор прерван перезапуском сервиса. "
+        "Нажми «🔍 Подобрать» ещё раз"
+    ]
+
+
+async def test_a_failed_edit_after_the_run_is_not_reported_as_a_failure(harness):
+    gate = asyncio.Event()
+    service, job = await eval_harness(harness, EvalSlicer(gate=gate))
+    await harness.notifier.press_queue.put(Press(1, "m4", f"job:{job.id}:eval", T0))
+    await until(lambda: harness.notifier.edits and harness.slicer.requests)
+
+    async def broken_edit(message_id, text=None, buttons=None):
+        raise RuntimeError("telegram is down")
+
+    harness.notifier.edit = broken_edit
+    gate.set()
+    await until(lambda: harness.store.job(job.id).status == "new")
+    await until(lambda: harness.store.outbox_count() == 0 and len(harness.notifier.sent) >= 1)
+    sent = texts(harness.notifier)
+    assert not any("не удался" in t for t in sent)
+    assert "Варианты:" in sent[-1]
+    assert json.loads(harness.store.job(job.id).variants_json)["chosen"] == 6
+
+
+async def test_proposal_marks_minutes_from_an_older_slice(tmp_path):
+    service, store, _ = job_service(tmp_path, EvalSlicer())
+    add_spool(store)
+    job = add_job(store, service._settings)
+    await service.slice_job(job.id)
+    same = await service.propose(job.id)
+    assert "по прошлой нарезке" not in same
+    changed = await service.propose(job.id, goal="strength")
+    assert "свет " in changed and "время и свет по прошлой нарезке, настройки с тех пор изменились" in changed
+    store.close()
+
+
+async def test_finished_print_with_a_currency_refusal_says_so(harness):
+    harness.store.set_currency("EUR", "€")  # the tariff stays in UAH: the close refuses the cost
+    await harness.start()
+    await harness.feed("running_layer0", "running_layer2", "finish")
+    finished = next(t for t in texts(harness.notifier) if t.startswith("✅ Печать завершена"))
+    assert finished.split("\n")[-1] == "Стоимость не посчитана: тариф с 01.06.2024 в UAH, а печать в EUR"
 
 
 # -- phase 3: prepare, confirm and start a print -------------------------------------------

@@ -180,7 +180,7 @@ Before coding, check each key name and value spelling against a flattened P2S pr
 
 ### Task 8: Deploy and live check (controller, the owner present)
 
-1. Back up `bambu.db`. Deploy the service and restart through `workshop-admin` (migrations v9 and v10). Restart the PC slice-agent task.
+1. Back up `bambu.db`. Deploy the service and restart through `workshop-admin` (migrations v9 to v12). Restart the PC slice-agent task.
 2. Set the owner's amortization (they give the printer price and life hours) and check the currency and country defaults.
-3. `example-bracket`: press «Прочно», check the base point and the cost lines, then press «Подобрать». Expect 4-6 variants, a table and a winner, with the walls kept when said in words. Pick «Вариант 2», then «Резать». The file is reused.
+3. `example-bracket`: press «Прочно», check the base point and the cost lines, then press «Подобрать». Expect up to 6 variants, the balanced baseline first, a table and a winner, with the walls kept when said in words (slice_job or evaluate_job settings). Pick «Вариант 2», then «Резать»: it slices that variant (ruling R5, no file reuse).
 4. Record the results in `docs/evaluation-notes.md`.

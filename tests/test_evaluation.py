@@ -219,3 +219,36 @@ def test_score_without_strength_uses_the_other_metrics():
     # The strength limit cannot be checked: no variant is dropped for it.
     assert score(runs, ("speed", None)) == [1, 2, 0]
     assert sorted(score(runs, ("balanced", None))) == [0, 1, 2]
+
+
+# -- final review fixes: the balanced baseline, rules and the unknown first metric -------
+
+from bambu_mcp.evaluation import base_variant  # noqa: E402
+
+
+def test_candidates_with_a_balanced_baseline_keep_the_goal_base_point():
+    balanced = {**HINTED, **GOALS["balanced"].base}
+    goal_settings = {**HINTED, **GOALS["strength"].base}
+    out = candidates("strength", {}, goal_settings, {}, "0.4", baseline=balanced)
+    assert out[0] == balanced and len(out) == 6
+    assert base_variant("strength", {}, goal_settings, "0.4") in out[1:]  # the base point is a variant
+    explicit = {"wall_loops": 4}
+    out = candidates("strength", explicit, {**goal_settings, **explicit}, {}, "0.4", baseline={**balanced, **explicit})
+    assert {c["wall_loops"] for c in out} == {4}
+
+
+def test_rule_breaking_variants_never_win_unless_fixed():
+    fit_ok = {"wall_loops": 3, "wall_generator": "classic", "outer_wall_speed": 50}
+    runs = [_m(50, **HINTED), _m(80, **fit_ok), _m(70, **{**fit_ok, "outer_wall_speed": 80})]
+    assert score(runs, ("fit", None)) == [1]  # the faster baseline and variant 3 break the rules
+    # A rule the owner's explicit setting breaks does not count against the variants.
+    assert score(runs, ("fit", None), fixed={"outer_wall_speed", "wall_generator", "wall_loops"}) == [1, 2, 0]
+
+
+def test_strength_unknown_falls_back_to_the_base_point():
+    runs = [_m(100, strength=None), _m(50, strength=None), _m(150, strength=None), _m(120, strength=None)]
+    assert score(runs, ("strength", None), base_index=3)[0] == 3
+    assert score(runs, ("strength", None))[0] == 1  # no base point given: the second metric
+    # Known strength: the base point gets no favour.
+    known = [_m(100), _m(50, strength=2000), _m(150, strength=1500), _m(120, strength=1200)]
+    assert score(known, ("strength", None), base_index=3)[0] == 1

@@ -256,3 +256,37 @@ def test_render_end_unknown_and_lost():
     text = render_event(lost, HmsTexts(), None)
     assert text.splitlines()[0] == "❌ Печать прервана, пока сервис не видел"
     assert "Benchy" in text
+
+
+# -- the final fix round: a cost in another currency, refusals at close, the variant table --
+
+
+def test_render_cost_in_another_currency_shows_its_iso_code():
+    cost = full_cost(8, SPOOL, 52, 0.4444, TARIFF, AMORT, currency="UAH")
+    lines = render_cost(cost, "€", code="EUR")  # recorded in UAH, the currency is EUR now
+    assert lines[-1] == "итого 14.45 UAH" and lines[0] == "пластик 5.60 UAH (8 г × 700 UAH/кг)"
+    assert not any("€" in line for line in lines)
+    assert render_cost(cost, "грн", code="UAH") == SAMPLE_LINES
+
+
+def test_render_finished_in_another_currency_and_refused():
+    cost = full_cost(8, SPOOL, 52, 0.4444, TARIFF, AMORT, currency="UAH")
+    text = render_event(event(EventKind.FINISHED), HmsTexts(), cost, symbol="€", code="EUR")
+    assert text.split("\n")[-1] == "итого 14.45 UAH" and "€" not in text
+    refused = full_cost(None, None, 52, 0.44, TARIFF, None, currency="EUR")
+    text = render_event(event(EventKind.FINISHED), HmsTexts(), refused, symbol="€", code="EUR")
+    assert text.split("\n")[-1] == "Стоимость не посчитана: тариф с 01.06.2024 в UAH, а печать в EUR"
+
+
+def test_render_variants_uses_each_entry_currency():
+    from bambu_mcp.messages import render_variants
+
+    base = {"n": 1, "status": "ok", "settings": {"wall_loops": 3}, "minutes": 50, "grams": 8.0,
+            "cost": 14.454, "currency": "UAH", "strength_ratio": 1.0}
+    other = {**base, "n": 2, "settings": {"wall_loops": 4}, "currency": "EUR", "cost": 1.5, "strength_ratio": None}
+    lines = render_variants([base, other], 1, "грн", code="UAH")
+    assert lines == [
+        "Варианты:",
+        "1 ✓ 3 стенки · 50 мин · 8 г · 14.45 грн · прочность 1.0×",
+        "2 4 стенки · 50 мин · 8 г · 1.50 EUR · прочность ?",
+    ]

@@ -28,7 +28,7 @@ from bambu_mcp.store.models import (
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
 _CONFIRMATION_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
-_SCHEMA_VERSION = 11
+_SCHEMA_VERSION = 12
 # schema.sql is the version-1 schema; each later version is one migration script.
 _MIGRATIONS = {
     2: "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
@@ -107,6 +107,8 @@ _MIGRATIONS = {
     11: "ALTER TABLE jobs ADD COLUMN goal_json TEXT;\n"
     "ALTER TABLE jobs ADD COLUMN variant_json TEXT;\n"
     "ALTER TABLE jobs ADD COLUMN variants_json TEXT;",
+    # The owner's explicit settings (their words, ruling R2), kept as their own layer. NULL: none.
+    12: "ALTER TABLE jobs ADD COLUMN explicit_json TEXT;",
 }
 _SEEN_TTL_S = 30 * 24 * 3600
 _DEFAULT_TARIFF = (date(2024, 6, 1), 4.32, None)
@@ -146,7 +148,7 @@ _PRINT_FIELDS = frozenset(
 )
 _JOB_FIELDS = frozenset({
     "status", "settings_json", "result_json", "sliced_file", "error", "slot",
-    "goal_json", "variant_json", "variants_json",
+    "goal_json", "variant_json", "variants_json", "explicit_json",
 })
 
 
@@ -247,6 +249,7 @@ def _job(row: sqlite3.Row) -> Job:
         goal_json=row["goal_json"],
         variant_json=row["variant_json"],
         variants_json=row["variants_json"],
+        explicit_json=row["explicit_json"],
     )
 
 
@@ -874,6 +877,19 @@ class Store:
             (kind,),
         )
         return [_confirmation(r) for r in rows]
+
+    def expire_pending_confirmations(self, job_id: int, kind: str, outcome: str) -> int:
+        """Expire the job's pending confirmations of ``kind`` now, with ``outcome`` saying why.
+
+        Returns how many. A press on one is then answered as spent.
+        """
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE confirmations SET state = 'expired', outcome = ?"
+                " WHERE job_id = ? AND kind = ? AND state = 'pending'",
+                (outcome, job_id, kind),
+            )
+            return cur.rowcount
 
     def cancel_confirmation(self, id: str) -> bool:
         """Cancel a pending confirmation. False when it is not pending (or unknown)."""

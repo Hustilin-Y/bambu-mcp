@@ -222,8 +222,14 @@ class Journal:
             cost_amort=cost.amort.amount if cost.amort is not None else None,
         )
 
-    def cost_line(self, row: PrintRow) -> CostBreakdown | None:
-        """The cost of a closed row as recorded, for the finished message. None: no power cost."""
+    def cost_line(self, row: PrintRow) -> CostBreakdown | CurrencyMismatch | None:
+        """The cost of a closed row as recorded, for the finished message. None: no power cost.
+
+        A row whose cost was refused at the close (an input in another currency) gives the
+        refusal, so the message can say why there is no cost.
+        """
+        if row.kwh is not None and row.cost_power_uah is None and row.actual_min is not None:
+            return self._refusal(row)
         if row.kwh is None or row.cost_power_uah is None:
             return None
         currency = row.currency
@@ -253,6 +259,20 @@ class Journal:
             minutes=minutes,
             amort_rate=row.cost_amort / hours if row.cost_amort is not None and hours > 0 else None,
         )
+
+    def _refusal(self, row: PrintRow) -> CurrencyMismatch | None:
+        """Why a closed row with energy has no power cost, when a currency refused it."""
+        started = _utc(row.started_at)
+        day = started.astimezone(self._tz).date()
+        try:
+            cost = full_cost(
+                None, None, row.actual_min, row.kwh, self._store.tariff_on(day), self._store.amortization_on(day),
+                currency=row.currency, start=started, settings=self._settings,
+            )
+        except Exception:
+            log.exception("print %d: checking why it has no cost failed", row.id)
+            return None
+        return cost if isinstance(cost, CurrencyMismatch) else None
 
     # -- presses -------------------------------------------------------------
 

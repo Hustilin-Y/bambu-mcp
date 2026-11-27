@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from bambu_mcp.manifest import GOAL_KEYS, Manifest, is_goal
@@ -346,22 +346,31 @@ def _fixed_by(explicit: Mapping, keys: list[str]) -> bool:
 
 
 def candidates(
-    goal: str, explicit: Mapping, base: Mapping, checks: Mapping | None, nozzle: str
+    goal: str,
+    explicit: Mapping,
+    base: Mapping,
+    checks: Mapping | None,
+    nozzle: str,
+    *,
+    baseline: Mapping | None = None,
 ) -> list[dict[str, object]]:
-    """The settings an evaluation run slices: ``base`` first (the baseline), then the goal's grid.
+    """The settings an evaluation run slices: the baseline first, then the goal's grid.
 
-    ``base`` is the job's resolved settings without a chosen variant. Each grid point goes over
-    it and ``explicit`` (the owner's words, ruling R2) over the point, so explicit keys are the
-    same in every variant. A point that breaks the goal's rules or the manifest's checks (unless
-    explicit keys are what breaks them), that fails the whitelist for ``nozzle``, or that
-    repeats an earlier one is dropped. At most ``MAX_VARIANTS``.
+    ``baseline`` is the job resolved with the balanced base point (spec 5.1: the ratio limits
+    compare with it), ``base`` the job resolved with the goal's own base point, both without a
+    chosen variant (``baseline`` None: ``base``). Each grid point goes over ``base`` and
+    ``explicit`` (the owner's words, ruling R2) over the point, so explicit keys are the same
+    in every variant. The goal's base point is one of the grid points, so it is sliced too.
+    A point that breaks the goal's rules or the manifest's checks (unless explicit keys are
+    what breaks them), that fails the whitelist for ``nozzle``, or that repeats an earlier one
+    is dropped. At most ``MAX_VARIANTS``.
     """
     target = GOALS[goal]
-    baseline = {**base, **explicit}
-    out = [baseline]
-    seen = {json.dumps(baseline, sort_keys=True)}
+    first = {**(base if baseline is None else baseline), **explicit}
+    out = [first]
+    seen = {json.dumps(first, sort_keys=True)}
     for point in target.grid:
-        settings = {**baseline, **point, **explicit}
+        settings = {**base, **point, **explicit}
         try:
             settings = dict(Overrides.parse(settings, nozzle).values)
         except ValueError:
@@ -380,6 +389,12 @@ def candidates(
         if len(out) == MAX_VARIANTS:
             break
     return out
+
+
+def base_variant(goal: str, explicit: Mapping, base: Mapping, nozzle: str) -> dict[str, object]:
+    """The candidate ``candidates`` builds from the goal's base point (to find it in a run)."""
+    settings = {**base, **GOALS[goal].base, **explicit}
+    return dict(Overrides.parse(settings, nozzle).values)
 
 
 @dataclass(frozen=True)
@@ -453,30 +468,64 @@ def _within_limits(goal: Goal, v: VariantMetrics, base: VariantMetrics, known: s
     return True
 
 
-def score(variants: Sequence[VariantMetrics], goal: tuple[str, str | None]) -> list[int]:
+def known_metrics(variants: Sequence[VariantMetrics]) -> set[str]:
+    """"strength" and "cost" when every sliced variant (and the baseline) has them."""
+    if not variants or not variants[0].ok:
+        return set()
+    ok = [v for v in variants if v.ok]
+    known = set()
+    if all(v.strength is not None for v in ok) and variants[0].strength:
+        known.add("strength")
+    if all(v.cost is not None for v in ok):
+        known.add("cost")
+    return known
+
+
+def first_metric_unknown(variants: Sequence[VariantMetrics], goal: str) -> bool:
+    """True when the goal's first score metric is "?" in this run (an agent without features)."""
+    first = GOALS[goal].score[0]
+    return first in ("strength", "cost") and first not in known_metrics(variants)
+
+
+def score(
+    variants: Sequence[VariantMetrics],
+    goal: tuple[str, str | None],
+    *,
+    fixed: Collection[str] = (),
+    base_index: int | None = None,
+) -> list[int]:
     """Indexes of the variants that pass the primary goal's limits, best first.
 
-    ``variants[0]`` is the baseline the ratio limits compare with. The primary goal's score
-    ranks, the secondary's breaks ties, then the slicing order. Strength counts only when
-    every sliced variant has it (else it is "?": the strength limits are not checked), the
-    same for the cost. A failed variant is never ranked. Empty when the baseline failed.
+    ``variants[0]`` is the baseline the ratio limits compare with. A variant that breaks the
+    primary goal's settings rules (fit, watertight) is not ranked, except for rules on the
+    ``fixed`` keys (the owner's explicit settings). The primary goal's score ranks, the
+    secondary's breaks ties, then the slicing order. Strength counts only when every sliced
+    variant has it (else it is "?": the strength limits are not checked), the same for the
+    cost. When the primary's first metric is "?", ``base_index`` (the goal's base point
+    variant) comes first: the next metric alone would pick, say, the weakest variant for
+    ``strength``. A failed variant is never ranked. Empty when the baseline failed.
     """
     if not variants or not variants[0].ok:
         return []
     base = variants[0]
-    ok = [i for i, v in enumerate(variants) if v.ok]
-    known = set()
-    if all(variants[i].strength is not None for i in ok) and base.strength:
-        known.add("strength")
-    if all(variants[i].cost is not None for i in ok):
-        known.add("cost")
+    known = known_metrics(variants)
     primary = GOALS[goal[0]]
     secondary = GOALS[goal[1]] if goal[1] is not None else None
-    eligible = [i for i in ok if _within_limits(primary, variants[i], base, known)]
+    eligible = [
+        i
+        for i, v in enumerate(variants)
+        if v.ok
+        and _within_limits(primary, v, base, known)
+        and not set(broken_rules(primary, v.settings)) - set(fixed)
+    ]
 
     def rank(i: int) -> tuple:
         v = variants[i]
         tie = _goal_key(secondary, v, base, known) if secondary is not None else ()
         return (*_goal_key(primary, v, base, known), *tie, i)
 
-    return sorted(eligible, key=rank)
+    ranking = sorted(eligible, key=rank)
+    if base_index is not None and base_index in ranking and first_metric_unknown(variants, goal[0]):
+        ranking.remove(base_index)
+        ranking.insert(0, base_index)
+    return ranking

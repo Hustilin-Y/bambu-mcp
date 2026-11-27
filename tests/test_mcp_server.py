@@ -15,6 +15,7 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
+from bambu_mcp import mcp_server
 from bambu_mcp.camera import CameraBusy
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.events import Event, EventKind
@@ -1284,20 +1285,28 @@ def test_set_country_without_a_timezone_says_so(h):
 
 # -- the evaluation run (Task 6) -------------------------------------------------------
 
+EVAL_HINTS = {"walls": 4, "infill_pct": 25, "infill_pattern": "gyroid", "material": "PETG", "goal": "strength"}
+
+
+def _rows(text: str) -> list[str]:
+    lines = text.split("\n")
+    return lines[lines.index("Варианты:") + 1:]
+
 
 def test_evaluate_job_tool_returns_table(jh):
-    hints = {"walls": 4, "infill_pct": 25, "infill_pattern": "gyroid", "material": "PETG"}
-    job_id = jh.add_job(hints={**hints, "goal": "strength"})
+    job_id = jh.add_job(hints=EVAL_HINTS)
     result = jh.call("evaluate_job", job_id=job_id)
-    assert result["job_id"] == job_id
-    lines = result["text"].split("\n")
-    rows = lines[lines.index("Варианты:") + 1:]
-    assert len(rows) == 5 and rows[0].startswith("1 ") and all("прочность ?" in r for r in rows)
-    assert result["chosen"] in range(1, 6)
-    assert [v["n"] for v in result["variants"]] == [1, 2, 3, 4, 5]
+    assert result["job_id"] == job_id and result["status"] == "done"
+    rows = _rows(result["text"])
+    assert rows[0].startswith("1 ") and all("прочность ?" in r for r in rows[:6])
+    # An agent without features: strength is unknown, the strength base point is kept (variant 4).
+    assert result["chosen"] == 4
+    assert [v["n"] for v in result["variants"]] == [1, 2, 3, 4, 5, 6]
     assert all(v["status"] == "ok" and v["minutes"] == 100.0 for v in result["variants"])
-    assert len(jh.slicer.requests) == 5 and jh.waker.calls == 1
+    assert len(jh.slicer.requests) == 6 and jh.waker.calls == 1
     assert jh.store.job(job_id).status == "new"
+    status = jh.call("job_status", job_id=job_id)["evaluation"]
+    assert status["state"] == "done" and status["chosen"] == 4 and status["table"] == rows
 
     chosen = jh.call("choose_variant", job_id=job_id, n=2)
     assert chosen["job_id"] == job_id and "3 стенки, 25% gyroid" in chosen["text"].split("\n")[0]
@@ -1314,5 +1323,36 @@ def test_evaluate_job_tool_returns_table(jh):
     kit = create_job_from_bytes(jh.store, jh.settings, json.dumps(raw).encode("utf-8"), THREE_MF).id
     assert "parts only" in jh.error("evaluate_job", job_id=kit)
     tools = {t["name"]: t for t in jh.rpc("tools/list")["tools"]}
-    assert set(tools["evaluate_job"]["inputSchema"]["properties"]) == {"job_id", "goal"}
+    assert set(tools["evaluate_job"]["inputSchema"]["properties"]) == {"job_id", "goal", "settings"}
     assert set(tools["choose_variant"]["inputSchema"]["properties"]) == {"job_id", "n"}
+
+
+def test_evaluate_job_settings_are_explicit(jh):
+    job_id = jh.add_job(hints=EVAL_HINTS)
+    jh.call("evaluate_job", job_id=job_id, settings={"wall_loops": 4})
+    assert {dict(r.overrides)["wall_loops"] for r in jh.slicer.requests} == {4}
+    assert json.loads(jh.store.job(job_id).explicit_json) == {"wall_loops": 4}
+    assert "1..10" in jh.error("evaluate_job", job_id=job_id, settings={"wall_loops": 99})
+
+
+def test_evaluate_job_returns_while_the_run_goes_on(jh, monkeypatch):
+    monkeypatch.setattr(mcp_server, "EVAL_WAIT_S", 0.2)
+    job_id = jh.add_job(hints=EVAL_HINTS)
+    jh.slicer.hold.set()
+    result = jh.call("evaluate_job", job_id=job_id)
+    assert result["status"] == "evaluating" and result["job_id"] == job_id
+    assert jh.call("job_status", job_id=job_id)["evaluation"] == {"state": "running"}
+    assert "already" in jh.error("evaluate_job", job_id=job_id)
+    jh.slicer.hold.clear()
+    jh.wait_status(job_id, "new")
+    evaluation = jh.call("job_status", job_id=job_id)["evaluation"]
+    assert evaluation["state"] == "done" and len(evaluation["table"]) == 7
+
+
+def test_rate_caps(jh):
+    for args in ({"day_uah": 1000.01}, {"day_uah": 4.32, "night_uah": 1001}):
+        assert "1000" in jh.error("set_tariff", valid_from="2027-01-01", **args)
+    assert jh.call("set_tariff", valid_from="2027-01-01", day_uah=1000)["day_uah"] == 1000
+    text = jh.error("set_amortization", valid_from="2027-01-01", printer_price=2e6, life_hours=1)
+    assert "1000000" in text
+    assert jh.store.amortization_on(datetime(2027, 2, 1).date()) is None

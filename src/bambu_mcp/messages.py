@@ -107,14 +107,34 @@ def render_cost_refused(m: CurrencyMismatch) -> str:
     )
 
 
-def render_cost(cost: CostBreakdown | CurrencyMismatch, symbol: str, *, start_now: bool = False) -> list[str]:
+def render_cost_refused_short(m: CurrencyMismatch) -> str:
+    """A refusal at a print's close: 'Стоимость не посчитана: тариф с 01.06.2024 в UAH, а печать в EUR'."""
+    return (
+        f"Стоимость не посчитана: {_mismatch_input(m)} в {md_literal(m.currency)}, "
+        f"а печать в {md_literal(m.expected)}"
+    )
+
+
+def currency_label(currency: str | None, symbol: str, code: str | None) -> str:
+    """The symbol to show for an amount in ``currency``: the current ``symbol``, or the amount's
+    own ISO code when it is not the current currency ``code`` (nothing is converted)."""
+    if code is not None and currency and currency != code:
+        return currency
+    return symbol
+
+
+def render_cost(
+    cost: CostBreakdown | CurrencyMismatch, symbol: str, *, start_now: bool = False, code: str | None = None
+) -> list[str]:
     """The Russian cost lines: plastic, electricity, amortization, total. Markdown-escaped.
 
     ``start_now``: a predicted cost priced as if the print started now, which the
-    electricity line says under a two-zone tariff.
+    electricity line says under a two-zone tariff. ``code``: the current currency. A cost
+    recorded in another one shows its own ISO code, never the current ``symbol``.
     """
     if isinstance(cost, CurrencyMismatch):
         return [render_cost_refused(cost)]
+    symbol = currency_label(cost.currency, symbol, code)
     sym = md_literal(symbol)
     lines = []
     if cost.plastic is None:
@@ -165,12 +185,15 @@ def _duration(minutes: int) -> str:
 def render_event(
     event: Event,
     texts: HmsTexts,
-    cost: CostBreakdown | None,
+    cost: CostBreakdown | CurrencyMismatch | None,
     duration_min: int | None = None,
     *,
     tz: tzinfo = DEFAULT_TZ,
     symbol: str = DEFAULT_SYMBOL,
+    code: str | None = None,
 ) -> str:
+    """``cost``: the closed print's, a ``CurrencyMismatch`` when it was refused at the close.
+    ``code``: the current currency (a cost recorded in another shows its ISO code)."""
     state = event.state
     name = job_name(state.subtask_name)
     when = event.at.astimezone(tz).strftime("%H:%M")
@@ -199,8 +222,10 @@ def render_event(
         EventKind.CANCELLED,
     ):
         lines.append(f"Длительность: {_duration(duration_min)}")
-    if event.kind is EventKind.FINISHED and cost is not None:
-        lines.extend(render_cost(cost, symbol))
+    if event.kind is EventKind.FINISHED and isinstance(cost, CurrencyMismatch):
+        lines.append(render_cost_refused_short(cost))
+    elif event.kind is EventKind.FINISHED and cost is not None:
+        lines.extend(render_cost(cost, symbol, code=code))
     return "\n".join(lines)
 
 
@@ -297,9 +322,25 @@ def _short_settings(settings: Mapping, baseline: Mapping) -> str:
     return " ".join(_setting_parts({k: settings[k] for k in keys if k in settings}))
 
 
-def render_variants(variants: Sequence[Mapping], chosen: int | None, symbol: str) -> list[str]:
+ONLY_BASELINE_TEXT = "Нарезался только базовый вариант, остальные не нарезались"
+STRENGTH_UNKNOWN_TEXT = "Прочность неизвестна: агент на ПК её не измерил, выбран базовый вариант цели"
+
+
+def render_variants(
+    variants: Sequence[Mapping],
+    chosen: int | None,
+    symbol: str,
+    *,
+    code: str | None = None,
+    strength_unknown: bool = False,
+) -> list[str]:
     """The evaluation table, at most 6 lines after its title:
-    '1 ✓ 4 стенки 40% gyroid · 52 мин · 8 г · 14.45 <symbol> · прочность 1.8×'."""
+    '1 ✓ 4 стенки 40% gyroid · 52 мин · 8 г · 14.45 <symbol> · прочность 1.8×'.
+
+    Strength is against the first (the balanced baseline). A variant priced in another
+    currency than ``code`` (the current one) shows its ISO code. Then a sentence when only
+    the baseline sliced, and one when ``strength_unknown`` kept the goal's base point.
+    """
     if not variants:
         return []
     baseline = variants[0].get("settings") or {}
@@ -311,12 +352,18 @@ def render_variants(variants: Sequence[Mapping], chosen: int | None, symbol: str
             continue
         mark = CHOSEN_MARK if n == chosen else ""
         cost = v.get("cost")
-        money = money_text(cost, symbol) if isinstance(cost, int | float) else f"? {md_literal(symbol)}"
+        label = currency_label(v.get("currency") if isinstance(v.get("currency"), str) else None, symbol, code)
+        money = money_text(cost, label) if isinstance(cost, int | float) else f"? {md_literal(label)}"
         ratio = v.get("strength_ratio")
         strength = f"{ratio:.1f}×" if isinstance(ratio, int | float) else "?"
         lines.append(
             f"{n} {mark}{short} · {round(v['minutes'])} мин · {v['grams']:.0f} г · {money} · прочность {strength}"
         )
+    shown = variants[:6]
+    if len(shown) > 1 and shown[0].get("status") == "ok" and all(v.get("status") != "ok" for v in shown[1:]):
+        lines.append(ONLY_BASELINE_TEXT)
+    if strength_unknown:
+        lines.append(STRENGTH_UNKNOWN_TEXT)
     return lines
 
 
@@ -551,12 +598,14 @@ def render_proposal(
     *,
     symbol: str = DEFAULT_SYMBOL,
     goal: tuple[str, str | None, str, str | None] | None = None,
+    stale_minutes: bool = False,
 ) -> str:
     """What the service is about to slice. ``estimate``: grams per plate index (None: the manifest's).
 
     Plain text, no buttons. ``plate_type`` is the bed when ``settings`` has no ``curr_bed_type``.
     ``cost``: the predicted cost of the whole job (its lines follow the grams), priced as
-    if the print started now. ``goal``: (primary, secondary, source, reason) from
+    if the print started now. ``stale_minutes``: its time comes from a slice made with other
+    settings, which a line says. ``goal``: (primary, secondary, source, reason) from
     ``evaluation.job_goal``, its line follows the cost.
     """
     manifest = _job_manifest(job)
@@ -568,6 +617,8 @@ def render_proposal(
         lines = [f"{head} {_about(_grams(sum(grams.values())))}"]
     if cost is not None:
         lines += render_cost(cost, symbol, start_now=True)
+        if stale_minutes:
+            lines.append(STALE_MINUTES_TEXT)
     if goal is not None:
         lines.append(goal_line(*goal))
     material, reason = job_material(manifest)
@@ -578,6 +629,9 @@ def render_proposal(
         lines.append(slot_choice.warning)
     lines += _spool_warnings(manifest, slot_choice, grams)
     return "\n".join(lines)
+
+
+STALE_MINUTES_TEXT = "время и свет по прошлой нарезке, настройки с тех пор изменились"
 
 
 def _result_text(minutes: float, grams: float) -> str:

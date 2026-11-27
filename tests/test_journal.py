@@ -527,4 +527,5 @@ def test_journal_refuses_a_cost_in_mixed_currencies(store, caplog):
     assert row.cost_power_uah is None and row.cost_amort is None and row.cost_filament_uah is None
     assert row.deducted_g == pytest.approx(20.0)  # the grams are deducted all the same
     assert "tariff from 2024-06-01 is in UAH" in caplog.text
-    assert journal.cost_line(row) is None
+    refused = journal.cost_line(row)  # the finished message says why there is no cost
+    assert (refused.kind, refused.currency, refused.expected) == ("tariff", "UAH", "EUR")

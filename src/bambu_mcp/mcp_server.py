@@ -60,6 +60,7 @@ from bambu_mcp.jobs import (
     incoming_dir,
 )
 from bambu_mcp.journal import FIT_VALUES, rebook_grams
+from bambu_mcp.messages import render_variants
 from bambu_mcp.manifest import INFILL_PATTERNS, MAX_MANIFEST_BYTES, ManifestError, parse_manifest
 from bambu_mcp.printer.hms import hms_code, severity
 from bambu_mcp.printer.link import (
@@ -101,6 +102,9 @@ SERVER_NAME = "bambu-mcp"
 GRACEFUL_SHUTDOWN_S = 5
 HISTORY_MAX = 200
 JOBS_MAX = 50
+EVAL_WAIT_S = 90.0  # evaluate_job waits this long for the run, then answers that it goes on
+TARIFF_MAX = 1000.0  # per kWh: a sanity cap, a finite huge rate must not overflow a cost
+AMORT_RATE_MAX = 1e6  # per hour of printing, the same reason
 SET_KEY = "set"  # slice_job settings: the named set to start from
 PATH_INTAKE_OFF = "path intake is off: upload with `bambu-mcp upload`"
 # gcode_state values (phase 1 names) in which the AMS may be reconfigured.
@@ -149,7 +153,9 @@ class StatusSource(Protocol):
 
     async def propose(self, job_id: int, slot: int | None = None, goal: object = None) -> str: ...
 
-    async def evaluate(self, job_id: int, goal: object = None) -> str: ...
+    def start_evaluate(
+        self, job_id: int, goal: object = None, explicit: Mapping | None = None
+    ) -> asyncio.Task: ...
 
     async def choose_variant(self, job_id: int, n: int) -> str: ...
 
@@ -494,6 +500,8 @@ def _job_status(store: Store, job: Job, tz: ZoneInfo) -> dict[str, Any]:
         "slot": _job_slot(store, result),
         "chosen_slot": job.slot,
         "goal": _job_goal(job),
+        "explicit": _loads(job.explicit_json),
+        "evaluation": _job_evaluation(store, job),
         "plate_type": result.get("plate_type"),
         "nozzle": result.get("nozzle") or _stored_nozzle(job),
         "plates": _job_plates(result),
@@ -513,6 +521,23 @@ def _job_variants(job: Job | None) -> dict[str, Any]:
         "chosen": data.get("chosen"),
         "variants": [{k: v.get(k) for k in keys} for v in entries if isinstance(v, dict)],
     }
+
+
+def _job_evaluation(store: Store, job: Job) -> dict[str, Any] | None:
+    """The job's evaluation: ``running``, or ``done`` with the variants and the table's lines."""
+    data = _loads(job.variants_json)
+    if data is None:
+        return None
+    if data.get("state") == "running":
+        return {"state": "running"}
+    entries = data.get("variants")
+    if not isinstance(entries, list) or not all(isinstance(v, dict) and type(v.get("n")) is int for v in entries):
+        return None
+    code, symbol = store.currency()
+    table = render_variants(
+        entries, data.get("chosen"), symbol, code=code, strength_unknown=bool(data.get("strength_unknown"))
+    )
+    return {"state": "done", **_job_variants(job), "table": table[1:]}
 
 
 def _job_goal(job: Job) -> dict[str, Any] | None:
@@ -878,6 +903,8 @@ def build_mcp(
             raise ToolError("tariff rates must be finite numbers")
         if day_uah <= 0 or (night_uah is not None and night_uah <= 0):
             raise ToolError("tariff rates must be positive")
+        if day_uah > TARIFF_MAX or (night_uah is not None and night_uah > TARIFF_MAX):
+            raise ToolError(f"tariff rates must be at most {TARIFF_MAX:g} per kWh")
         store.add_tariff(valid_from, day_uah, night_uah)
         return _tariff(store.tariff_on(valid_from))
 
@@ -896,8 +923,11 @@ def build_mcp(
             raise ToolError(
                 "printer_price and upkeep_per_hour must not be negative, life_hours must be positive"
             )
-        if not _finite(printer_price / life_hours + upkeep_per_hour):
+        rate = printer_price / life_hours + upkeep_per_hour
+        if not _finite(rate):
             raise ToolError("the rate per hour (printer_price / life_hours + upkeep_per_hour) is not finite")
+        if rate > AMORT_RATE_MAX:
+            raise ToolError(f"the rate per hour must be at most {AMORT_RATE_MAX:.0f}, got {rate:g}")
         store.add_amortization(valid_from, printer_price, life_hours, upkeep_per_hour)
         entry = store.amortization_on(valid_from)
         if entry is None:  # cannot happen: just written
@@ -1036,7 +1066,8 @@ def build_mcp(
         (0..100), sparse_infill_pattern, wall_loops (1..10), wall_generator, enable_support,
         support_type, brim_type, curr_bed_type, layer_height, top_shell_layers and
         bottom_shell_layers (0..20), outer_wall_speed (20..300 mm/s), seam_position, ironing_type.
-        They win over the part's last settings and its hints. `slot` (1..16) is the owner's
+        They win over the part's last settings and its hints, and are stored with the job:
+        later slices and evaluate_job keep them fixed. `slot` (1..16) is the owner's
         choice of AMS slot: pass it only when the owner names one. It is stored with the job. Without it the job's stored slot
         is used, else the slot whose material matches the part. `goal` (as in propose_job, only
         when the owner names one) is stored with the job and its base settings apply under
@@ -1066,35 +1097,54 @@ def build_mcp(
         return {"job_id": job_id, "status": "slicing", "warning": started.warning}
 
     @mcp.tool(annotations=WRITE)
-    async def evaluate_job(job_id: int, goal: str | list[str] | None = None) -> dict[str, Any]:
+    async def evaluate_job(
+        job_id: int, goal: str | list[str] | None = None, settings: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Find the best settings for a part's goal: wake the PC and slice up to 6 variants, one
-        after another (the job's current settings first, then the goal's candidates). Takes
-        minutes. Never prints.
+        after another (the balanced settings first, then the goal's candidates, its base point
+        among them). Never prints.
 
         `goal` (as in propose_job, only when the owner names one) is stored with the job first.
-        The best variant for the goal becomes the job's settings, and the proposal with the
-        table ("<n> [✓] <settings> · <min> мин · <g> г · <cost> · прочность <x>×", strength
-        against the first variant, "?" when the agent did not measure it) goes to Telegram
-        with «Вариант N» buttons. Returns the same text, `chosen` (the ✓ variant) and
-        `variants`. Kits are refused. Follow with choose_variant or slice_job.
+        `settings` (as in slice_job, only the owner's words) are stored with the job and fixed
+        in every variant. The best variant for the goal becomes the job's settings, and the
+        proposal with the table ("<n> [✓] <settings> · <min> мин · <g> г · <cost> · прочность
+        <x>×", strength against the first, balanced variant, "?" when the agent did not
+        measure it) goes to Telegram with «Вариант N» buttons. Kits are refused.
+
+        The run takes minutes. Within 90 s this returns `status` "done" with the same text,
+        `chosen` (the ✓ variant) and `variants`. Otherwise `status` "evaluating": the run goes
+        on, the table goes to Telegram, and job_status shows it under `evaluation` when done.
+        Follow with choose_variant or slice_job.
         """
-        job_or_error(job_id)
+        job = job_or_error(job_id)
+        explicit, _named = explicit_settings(settings, _job_nozzle(job))  # a set is expanded into it
         _check_goal(goal)
         try:
-            text = await service.evaluate(job_id, goal)
+            task = service.start_evaluate(job_id, goal, explicit or None)
         except JobBusy:
             raise ToolError(f"job {job_id} is being sliced or evaluated already") from None
         except KeyError:
             raise ToolError(f"job {job_id} not found") from None
-        except (ValueError, EvaluationFailed) as exc:
+        except ValueError as exc:
             raise ToolError(str(exc)) from None
-        return {"job_id": job_id, "text": text, **_job_variants(store.job(job_id))}
+        # asyncio.wait never cancels the run, also when this call is cancelled.
+        done, _pending = await asyncio.wait({task}, timeout=EVAL_WAIT_S)
+        if not done:
+            return {
+                "job_id": job_id,
+                "status": "evaluating",
+                "note": "the run goes on: the table goes to Telegram, job_status shows it when done",
+            }
+        text, error = task.result()
+        if error is not None:
+            raise ToolError(str(EvaluationFailed(error)))
+        return {"job_id": job_id, "status": "done", "text": text, **_job_variants(store.job(job_id))}
 
     @mcp.tool(annotations=WRITE)
     async def choose_variant(job_id: int, n: int) -> dict[str, Any]:
         """Choose variant `n` (1..6) of the job's last evaluate_job run as its settings, as the
-        «Вариант N» button does. The owner's words in slice_job settings still win over it. A
-        following slice_job reuses the variant's file when it is still the one on the PC.
+        «Вариант N» button does. The owner's words (stored from slice_job or evaluate_job
+        settings) still win over it. A following slice_job slices that variant again.
         Returns the proposal text, also sent to Telegram."""
         job_or_error(job_id)
         try:
@@ -1109,9 +1159,11 @@ def build_mcp(
 
     @mcp.tool(annotations=READ)
     async def job_status(job_id: int) -> dict[str, Any]:
-        """A job: status, settings, AMS slot it was sliced with, the owner's chosen slot (1..16 or
-        null: by material), plate type, nozzle, per-plate minutes, grams and cost (UAH), the
-        sliced file name, the slot warning (material mismatch) and the last error."""
+        """A job: status, settings, the owner's explicit settings, AMS slot it was sliced with,
+        the owner's chosen slot (1..16 or null: by material), goal, the evaluation (`running`, or
+        `done` with its variants and table lines), plate type, nozzle, per-plate minutes, grams
+        and cost (in its currency), the sliced file name, the slot warning (material mismatch)
+        and the last error."""
         return _job_status(store, job_or_error(job_id), tz)
 
     @mcp.tool(annotations=READ)

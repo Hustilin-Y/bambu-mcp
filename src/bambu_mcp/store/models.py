@@ -115,6 +115,7 @@ class Job:
     goal_json: str | None = None  # the owner's goal {"primary", "secondary", "source"}, None: not chosen
     variant_json: str | None = None  # the chosen evaluation variant's settings (a settings layer)
     variants_json: str | None = None  # the evaluated variants of the last run
+    explicit_json: str | None = None  # the owner's explicit settings (ruling R2), a settings layer
 
 
 @dataclass(frozen=True)
