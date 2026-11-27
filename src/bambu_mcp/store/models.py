@@ -23,6 +23,7 @@ class Spool:
     tray_info_idx: str | None = None  # Bambu filament_id of the preset, e.g. "GFA00"
     nozzle_temp_min: int | None = None  # nozzle_temperature_range_low
     nozzle_temp_max: int | None = None  # nozzle_temperature_range_high
+    currency: str = "UAH"  # ISO code of price_uah (the name predates currencies)
 
     @property
     def price_per_kg_uah(self) -> float:
@@ -42,6 +43,22 @@ class Tariff:
     valid_from: date
     day_uah: float
     night_uah: float | None
+    currency: str = "UAH"  # ISO code of both rates (the names predate currencies)
+
+
+@dataclass(frozen=True)
+class Amortization:
+    """The printer's wear per hour of printing, valid from ``valid_from`` on."""
+
+    valid_from: date
+    printer_price: float
+    life_hours: float  # expected service life in hours of printing
+    upkeep_per_hour: float  # nozzles, belts, plates
+    currency: str
+
+    @property
+    def rate_per_hour(self) -> float:
+        return self.printer_price / self.life_hours + self.upkeep_per_hour
 
 
 @dataclass(frozen=True)
@@ -63,6 +80,8 @@ class PrintRow:
     deducted_g: float | None = None  # grams actually removed (after the floor at 0)
     job_id: int | None = None  # the sliced job the print's file name matched
     plate: int | None = None  # its plate, None when the printer did not say
+    cost_amort: float | None = None  # amortization for the actual minutes
+    currency: str = "UAH"  # ISO code the row's costs are in
 
 
 @dataclass(frozen=True)

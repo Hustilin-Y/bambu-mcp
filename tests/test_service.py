@@ -362,6 +362,26 @@ async def test_tariff_reminder_quarterly(tmp_path):
     store.close()
 
 
+async def test_country_ua_keeps_reminder_other_disables(tmp_path):
+    store = Store(tmp_path / "bambu.db")
+    store.migrate()
+    notifier = RecordingNotifier()
+
+    async def camera():
+        return None
+
+    service = Service(
+        SECRETS, Settings(data_dir=tmp_path), store, notifier, FakeLink, camera, clock=Clock(T0)
+    )
+    assert store.country() == "UA"
+    store.set_country("PL")
+    assert await service.check_tariff() is False
+    assert store.get_meta(TARIFF_META_KEY) is None
+    store.set_country("UA")
+    assert await service.check_tariff() is True
+    store.close()
+
+
 async def test_tariff_reminder_is_queued_and_retried_by_the_outbox(tmp_path):
     store = Store(tmp_path / "bambu.db")
     store.migrate()

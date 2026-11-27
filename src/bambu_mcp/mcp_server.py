@@ -43,7 +43,8 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from bambu_mcp import camera as camera_module
-from bambu_mcp.config import Secrets, Settings
+from bambu_mcp.config import Secrets, Settings, with_country
+from bambu_mcp.cost import tariff_reminder_enabled
 from bambu_mcp.jobs import (
     MAX_FILE_BYTES,
     JobBusy,
@@ -71,7 +72,7 @@ from bambu_mcp.printer.state import PrinterState
 from bambu_mcp.printgate import ControlRefused, PrintRefused
 from bambu_mcp.proposal import MAX_SLOT_NUMBER, NAMED_SETS, slot_number
 from bambu_mcp.store.db import Store
-from bambu_mcp.store.models import Job, Plate, PrintRow, Spool, Tariff
+from bambu_mcp.store.models import Amortization, Job, Plate, PrintRow, Spool, Tariff
 from slice_agent.runner import (
     BRIM_TYPES,
     DENSITY_RANGE,
@@ -237,6 +238,7 @@ def _spool(s: Spool) -> dict[str, Any]:
         "tray_info_idx": s.tray_info_idx,
         "nozzle_temp_min": s.nozzle_temp_min,
         "nozzle_temp_max": s.nozzle_temp_max,
+        "currency": s.currency,
     }
 
 
@@ -245,11 +247,32 @@ def _plate(p: Plate) -> dict[str, Any]:
 
 
 def _tariff(t: Tariff) -> dict[str, Any]:
-    return {"valid_from": t.valid_from.isoformat(), "day_uah": t.day_uah, "night_uah": t.night_uah}
+    return {
+        "valid_from": t.valid_from.isoformat(),
+        "day_uah": t.day_uah,
+        "night_uah": t.night_uah,
+        "currency": t.currency,
+    }
+
+
+def _amortization(a: Amortization) -> dict[str, Any]:
+    return {
+        "valid_from": a.valid_from.isoformat(),
+        "printer_price": a.printer_price,
+        "life_hours": a.life_hours,
+        "upkeep_per_hour": a.upkeep_per_hour,
+        "rate_per_hour": _money(a.rate_per_hour),
+        "currency": a.currency,
+    }
+
+
+_CURRENCY_RE = re.compile(r"[A-Z]{3}", re.ASCII)
+_COUNTRY_RE = re.compile(r"[A-Z]{2}", re.ASCII)
+_SYMBOL_MAX = 8
 
 
 def _print(row: PrintRow, tz: ZoneInfo) -> dict[str, Any]:
-    costs = [c for c in (row.cost_filament_uah, row.cost_power_uah) if c is not None]
+    costs = [c for c in (row.cost_filament_uah, row.cost_power_uah, row.cost_amort) if c is not None]
     return {
         "id": row.id,
         "name": row.identity[0],
@@ -263,7 +286,9 @@ def _print(row: PrintRow, tz: ZoneInfo) -> dict[str, Any]:
         "kwh": None if row.kwh is None else round(row.kwh, 3),
         "cost_filament_uah": _money(row.cost_filament_uah),
         "cost_power_uah": _money(row.cost_power_uah),
+        "cost_amort": _money(row.cost_amort),
         "cost_total_uah": _money(sum(costs)) if costs else None,
+        "currency": row.currency,
         "fit": row.fit,
     }
 
@@ -610,7 +635,10 @@ def build_mcp(
 
     @mcp.tool(annotations=READ)
     async def print_history(part: str | None = None, limit: int = 20) -> dict[str, Any]:
-        """Print journal, newest first; `part` matches a substring of the job name. Costs in UAH."""
+        """Print journal, newest first; `part` matches a substring of the job name.
+
+        Costs are in the row's `currency` (the `_uah` names predate currencies).
+        """
         limit = max(1, min(limit, HISTORY_MAX))
         return {"prints": [_print(r, tz) for r in store.history(part, limit)]}
 
@@ -639,7 +667,8 @@ def build_mcp(
         nozzle_temp_min: int | None = None,
         nozzle_temp_max: int | None = None,
     ) -> dict[str, Any]:
-        """Add a full spool (remaining = net_g). Price in UAH for the whole spool.
+        """Add a full spool (remaining = net_g). price_uah is the whole spool's price in the
+        current currency (see set_currency), whatever the parameter's name says.
 
         tray_info_idx (the preset's filament_id) and nozzle_temp_min/max (°C) are what
         load_spool sends to the AMS; `slice-agent flatten` prints them per filament preset.
@@ -678,6 +707,8 @@ def build_mcp(
         nozzle_temp_max: int | None = None,
     ) -> dict[str, Any]:
         """Change spool fields; omitted fields stay as they are. active=false retires a spool.
+
+        A new price_uah is in the current currency (see set_currency), and so becomes the spool's.
 
         tray_info_idx and nozzle_temp_min/max: see add_spool (needed by load_spool).
         """
@@ -780,11 +811,63 @@ def build_mcp(
     async def set_tariff(
         valid_from: date, day_uah: float, night_uah: float | None = None
     ) -> dict[str, Any]:
-        """Electricity tariff (UAH/kWh) for prints from `valid_from` on; night_uah = two-zone."""
+        """Electricity tariff per kWh, in the current currency (see set_currency), for prints
+        from `valid_from` on; night_uah = two-zone."""
         if day_uah <= 0 or (night_uah is not None and night_uah <= 0):
             raise ToolError("tariff rates must be positive")
         store.add_tariff(valid_from, day_uah, night_uah)
         return _tariff(store.tariff_on(valid_from))
+
+    @mcp.tool(annotations=WRITE)
+    async def set_amortization(
+        valid_from: date, printer_price: float, life_hours: float, upkeep_per_hour: float = 0
+    ) -> dict[str, Any]:
+        """The printer's amortization for prints from `valid_from` on, in the current currency.
+
+        Rate per hour of printing = printer_price / life_hours (expected service life in
+        hours of printing) + upkeep_per_hour (nozzles, belts, plates). Same date: replaced.
+        """
+        if not (printer_price >= 0 and life_hours > 0 and upkeep_per_hour >= 0):
+            raise ToolError(
+                "printer_price and upkeep_per_hour must not be negative, life_hours must be positive"
+            )
+        store.add_amortization(valid_from, printer_price, life_hours, upkeep_per_hour)
+        entry = store.amortization_on(valid_from)
+        if entry is None:  # cannot happen: just written
+            raise ToolError("amortization was not stored")
+        return _amortization(entry)
+
+    @mcp.tool(annotations=WRITE)
+    async def set_currency(code: str, symbol: str) -> dict[str, Any]:
+        """The currency of new prices and rates: an ISO code (UAH, EUR) and the symbol shown
+        (грн, €). Nothing is converted: a cost whose inputs are in another currency is
+        refused until they are entered again in this one."""
+        code = code.strip().upper()
+        if not _CURRENCY_RE.fullmatch(code):
+            raise ToolError("code must be a 3-letter ISO currency code, like UAH or EUR")
+        if not symbol or symbol != symbol.strip() or len(symbol) > _SYMBOL_MAX or not symbol.isprintable():
+            raise ToolError(f"symbol must be 1-{_SYMBOL_MAX} printable characters, no outer spaces")
+        store.set_currency(code, symbol)
+        current, current_symbol = store.currency()
+        return {"currency": current, "currency_symbol": current_symbol}
+
+    @mcp.tool(annotations=WRITE)
+    async def set_country(code: str) -> dict[str, Any]:
+        """The owner's country, an ISO code (UA, PL). It sets the default timezone (unless
+        config.toml names one) and whether the quarterly tariff reminder runs (UA only)."""
+        code = code.strip().upper()
+        if not _COUNTRY_RE.fullmatch(code):
+            raise ToolError("code must be a 2-letter ISO country code, like UA or PL")
+        store.set_country(code)
+        timezone = with_country(settings, code).timezone
+        result: dict[str, Any] = {
+            "country": code,
+            "timezone": timezone,
+            "tariff_reminder": tariff_reminder_enabled(code),
+        }
+        if timezone != settings.timezone:
+            result["note"] = "the timezone applies after a service restart"
+        return result
 
     @mcp.tool(annotations=WRITE)
     async def update_print(

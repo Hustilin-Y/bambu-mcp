@@ -34,8 +34,8 @@ import httpx
 from bambu_mcp import camera as camera_module
 from bambu_mcp import jobs as jobs_module
 from bambu_mcp import mcp_server
-from bambu_mcp.config import Secrets, Settings
-from bambu_mcp.cost import tariff_check_due
+from bambu_mcp.config import Secrets, Settings, with_country
+from bambu_mcp.cost import tariff_check_due, tariff_reminder_enabled
 from bambu_mcp.events import CANCEL_ERROR, Event, EventDetector, EventKind, event_identity
 from bambu_mcp.jobs import JobBusy, SliceStart
 from bambu_mcp.journal import NO_SPOOL, TERMINAL_KINDS, Journal, Slot
@@ -559,7 +559,12 @@ class Service:
         await self._inbox.join()
 
     async def check_tariff(self) -> bool:
-        """Queue the quarterly tariff reminder when due. Returns True when it was queued."""
+        """Queue the quarterly tariff reminder when due. Returns True when it was queued.
+
+        Runs for the country UA only (`set_country`).
+        """
+        if not tariff_reminder_enabled(self._store.country()):
+            return False
         today = self._clock().astimezone(self._tz).date()
         raw = self._store.get_meta(TARIFF_META_KEY)
         last = date.fromisoformat(raw) if raw else None
@@ -2234,6 +2239,7 @@ def extra_coroutines(
 async def _amain(secrets: Secrets, settings: Settings) -> None:
     store = Store(Path(settings.data_dir) / DB_NAME)
     store.migrate()
+    settings = with_country(settings, store.country())  # its timezone, unless config.toml has one
     notifier = build_notifier(secrets, settings)
     http = httpx.AsyncClient(trust_env=False)  # LAN only: no proxies from the environment
     slicer, waker = build_slicer(secrets, settings, http)

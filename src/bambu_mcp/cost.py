@@ -1,4 +1,8 @@
-"""Electricity and filament cost of a print, in UAH (unrounded)."""
+"""Cost of a print: filament, electricity and amortization (unrounded).
+
+Every amount carries its ISO currency. Nothing is converted: a cost whose inputs are in
+different currencies is refused with the input named.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from bambu_mcp.config import Settings
-from bambu_mcp.store.models import Spool, Tariff
+from bambu_mcp.store.models import Amortization, Spool, Tariff
 
 log = logging.getLogger(__name__)
 
@@ -109,3 +113,88 @@ class CostLine:
 
 def tariff_check_due(last_reminded: date | None, today: date) -> bool:
     return last_reminded is None or (today - last_reminded).days >= TARIFF_CHECK_DAYS
+
+
+# -- money: the full cost -----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Money:
+    amount: float  # unrounded
+    currency: str  # ISO code
+
+
+@dataclass(frozen=True)
+class CostBreakdown:
+    plastic: Money | None  # None: no spool (or no grams), the price is unknown
+    power: Money
+    amort: Money | None  # None: no amortization set, the total excludes it
+    total: Money
+    currency: str
+
+
+@dataclass(frozen=True)
+class CurrencyMismatch:
+    """A cost refused because one input is priced in another currency."""
+
+    input_name: str  # "spool 3", "tariff from 2024-06-01", "amortization from 2027-01-01"
+    currency: str  # the input's currency
+    expected: str  # the currency of the cost (the current one)
+
+    @property
+    def reason(self) -> str:
+        return f"{self.input_name} is in {self.currency}, not {self.expected}: nothing is converted"
+
+
+def amortization_cost(minutes: float, rate_entry: Amortization) -> Money:
+    return Money(minutes / 60 * rate_entry.rate_per_hour, rate_entry.currency)
+
+
+def full_cost(
+    grams: float | None,
+    spool: Spool | None,
+    minutes: float,
+    kwh: float,
+    tariff: Tariff,
+    amort: Amortization | None,
+    *,
+    currency: str,
+    start: datetime | None = None,
+    settings: Settings | None = None,
+) -> CostBreakdown | CurrencyMismatch:
+    """Plastic, electricity and amortization of ``minutes`` of printing, in ``currency``.
+
+    A two-zone tariff needs ``start`` and ``settings`` (the night hours are local time).
+    Predicted costs pass the sliced minutes, the journal the actual ones.
+    """
+    inputs: list[tuple[str, str]] = []
+    if spool is not None:
+        inputs.append((f"spool {spool.id}", spool.currency))
+    inputs.append((f"tariff from {tariff.valid_from.isoformat()}", tariff.currency))
+    if amort is not None:
+        inputs.append((f"amortization from {amort.valid_from.isoformat()}", amort.currency))
+    for name, input_currency in inputs:
+        if input_currency != currency:
+            return CurrencyMismatch(name, input_currency, currency)
+
+    if tariff.night_uah is None:
+        power = kwh * tariff.day_uah
+    elif start is None or settings is None:
+        raise ValueError("a two-zone tariff needs the start time and settings")
+    else:
+        power = power_cost(start, start + timedelta(minutes=minutes), kwh, tariff, settings)
+    plastic = grams * spool.price_per_kg_uah / 1000 if spool is not None and grams is not None else None
+    amort_money = amortization_cost(minutes, amort) if amort is not None else None
+    total = power + (plastic or 0.0) + (amort_money.amount if amort_money else 0.0)
+    return CostBreakdown(
+        plastic=None if plastic is None else Money(plastic, currency),
+        power=Money(power, currency),
+        amort=amort_money,
+        total=Money(total, currency),
+        currency=currency,
+    )
+
+
+def tariff_reminder_enabled(country: str) -> bool:
+    """The quarterly tariff reminder is for Ukrainian household tariffs only."""
+    return country == "UA"

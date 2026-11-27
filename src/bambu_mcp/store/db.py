@@ -16,6 +16,7 @@ from typing import Any, Literal
 from bambu_mcp.store.models import (
     CONFIRMATION_TTL_S,
     JOB_STATUSES,
+    Amortization,
     Confirmation,
     Job,
     OutboxRow,
@@ -27,7 +28,7 @@ from bambu_mcp.store.models import (
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
 _CONFIRMATION_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 # schema.sql is the version-1 schema; each later version is one migration script.
 _MIGRATIONS = {
     2: "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
@@ -84,9 +85,26 @@ _MIGRATIONS = {
     " CHECK (state IN ('pending', 'used', 'expired', 'cancelled')),\n"
     "    outcome TEXT\n"
     ");",
+    # Money: every price, rate and journal row keeps its ISO currency, nothing is converted.
+    # The printer's amortization has a history by valid_from, like the tariff.
+    9: "ALTER TABLE spools ADD COLUMN currency TEXT NOT NULL DEFAULT 'UAH';\n"
+    "ALTER TABLE tariffs ADD COLUMN currency TEXT NOT NULL DEFAULT 'UAH';\n"
+    "ALTER TABLE prints ADD COLUMN currency TEXT NOT NULL DEFAULT 'UAH';\n"
+    "ALTER TABLE prints ADD COLUMN cost_amort REAL;\n"
+    "CREATE TABLE amortization (\n"
+    "    valid_from TEXT PRIMARY KEY,\n"
+    "    printer_price REAL NOT NULL CHECK (printer_price >= 0),\n"
+    "    life_hours REAL NOT NULL CHECK (life_hours > 0),\n"
+    "    upkeep_per_hour REAL NOT NULL DEFAULT 0 CHECK (upkeep_per_hour >= 0),\n"
+    "    currency TEXT NOT NULL\n"
+    ");\n"
+    "INSERT OR IGNORE INTO meta (key, value) VALUES"
+    " ('currency', 'UAH'), ('currency_symbol', 'грн'), ('country', 'UA');",
 }
 _SEEN_TTL_S = 30 * 24 * 3600
 _DEFAULT_TARIFF = (date(2024, 6, 1), 4.32, None)
+DEFAULT_CURRENCY = ("UAH", "грн")
+DEFAULT_COUNTRY = "UA"
 
 _SPOOL_FIELDS = frozenset(
     {
@@ -105,7 +123,19 @@ _SPOOL_FIELDS = frozenset(
     }
 )
 _PRINT_FIELDS = frozenset(
-    {"spool_id", "grams", "kwh", "cost_filament_uah", "cost_power_uah", "fit", "source", "job_id", "plate"}
+    {
+        "spool_id",
+        "grams",
+        "kwh",
+        "cost_filament_uah",
+        "cost_power_uah",
+        "cost_amort",
+        "currency",
+        "fit",
+        "source",
+        "job_id",
+        "plate",
+    }
 )
 _JOB_FIELDS = frozenset({"status", "settings_json", "result_json", "sliced_file", "error", "slot"})
 
@@ -130,6 +160,23 @@ def _spool(row: sqlite3.Row) -> Spool:
         tray_info_idx=row["tray_info_idx"],
         nozzle_temp_min=row["nozzle_temp_min"],
         nozzle_temp_max=row["nozzle_temp_max"],
+        currency=row["currency"],
+    )
+
+
+def _tariff(row: sqlite3.Row) -> Tariff:
+    return Tariff(
+        date.fromisoformat(row["valid_from"]), row["day_uah"], row["night_uah"], row["currency"]
+    )
+
+
+def _amortization(row: sqlite3.Row) -> Amortization:
+    return Amortization(
+        valid_from=date.fromisoformat(row["valid_from"]),
+        printer_price=row["printer_price"],
+        life_hours=row["life_hours"],
+        upkeep_per_hour=row["upkeep_per_hour"],
+        currency=row["currency"],
     )
 
 
@@ -153,6 +200,8 @@ def _print(row: sqlite3.Row) -> PrintRow:
         deducted_g=row["deducted_g"],
         job_id=row["job_id"],
         plate=row["plate"],
+        cost_amort=row["cost_amort"],
+        currency=row["currency"],
     )
 
 
@@ -302,6 +351,27 @@ class Store:
                 (key, value),
             )
 
+    # -- currency and country --------------------------------------------
+
+    def currency(self) -> tuple[str, str]:
+        """The current ISO currency code and its symbol. New prices and rates are in it."""
+        return (
+            self.get_meta("currency") or DEFAULT_CURRENCY[0],
+            self.get_meta("currency_symbol") or DEFAULT_CURRENCY[1],
+        )
+
+    def set_currency(self, code: str, symbol: str) -> None:
+        with self._tx():
+            self.set_meta("currency", code)
+            self.set_meta("currency_symbol", symbol)
+
+    def country(self) -> str:
+        """ISO country code: the default timezone and whether the tariff reminder runs."""
+        return self.get_meta("country") or DEFAULT_COUNTRY
+
+    def set_country(self, code: str) -> None:
+        self.set_meta("country", code)
+
     # -- spools ----------------------------------------------------------
 
     def add_spool(
@@ -321,8 +391,8 @@ class Store:
         with self._tx() as conn:
             cur = conn.execute(
                 "INSERT INTO spools (brand, material, color_name, color_hex, filament_preset,"
-                " price_uah, net_g, remaining_g, tray_info_idx, nozzle_temp_min, nozzle_temp_max)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " price_uah, net_g, remaining_g, tray_info_idx, nozzle_temp_min, nozzle_temp_max,"
+                " currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     brand,
                     material,
@@ -335,6 +405,7 @@ class Store:
                     tray_info_idx,
                     nozzle_temp_min,
                     nozzle_temp_max,
+                    self.currency()[0],
                 ),
             )
             return int(cur.lastrowid)
@@ -347,6 +418,8 @@ class Store:
             return
         if "active" in fields:
             fields["active"] = int(bool(fields["active"]))
+        if "price_uah" in fields:  # a new price is in the current currency
+            fields["currency"] = self.currency()[0]
         assignments = ", ".join(f"{name} = ?" for name in fields)
         with self._tx() as conn:
             cur = conn.execute(f"UPDATE spools SET {assignments} WHERE id = ?", (*fields.values(), id))
@@ -415,12 +488,13 @@ class Store:
     # -- tariffs ---------------------------------------------------------
 
     def add_tariff(self, valid_from: date, day_uah: float, night_uah: float | None) -> None:
+        """Rates in the current currency."""
         with self._tx() as conn:
             conn.execute(
-                "INSERT INTO tariffs (valid_from, day_uah, night_uah) VALUES (?, ?, ?) "
+                "INSERT INTO tariffs (valid_from, day_uah, night_uah, currency) VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(valid_from) DO UPDATE SET day_uah = excluded.day_uah,"
-                " night_uah = excluded.night_uah",
-                (valid_from.isoformat(), day_uah, night_uah),
+                " night_uah = excluded.night_uah, currency = excluded.currency",
+                (valid_from.isoformat(), day_uah, night_uah, self.currency()[0]),
             )
 
     def tariff_on(self, d: date) -> Tariff:
@@ -434,7 +508,38 @@ class Store:
         )
         if row is None:
             raise LookupError(f"no tariff valid on {d.isoformat()}")
-        return Tariff(date.fromisoformat(row["valid_from"]), row["day_uah"], row["night_uah"])
+        return _tariff(row)
+
+    # -- amortization ----------------------------------------------------
+
+    def add_amortization(
+        self,
+        valid_from: date,
+        printer_price: float,
+        life_hours: float,
+        upkeep_per_hour: float = 0.0,
+    ) -> None:
+        """The printer's amortization from ``valid_from`` on, in the current currency."""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO amortization (valid_from, printer_price, life_hours, upkeep_per_hour,"
+                " currency) VALUES (?, ?, ?, ?, ?) ON CONFLICT(valid_from) DO UPDATE SET"
+                " printer_price = excluded.printer_price, life_hours = excluded.life_hours,"
+                " upkeep_per_hour = excluded.upkeep_per_hour, currency = excluded.currency",
+                (valid_from.isoformat(), printer_price, life_hours, upkeep_per_hour, self.currency()[0]),
+            )
+
+    def amortization_on(self, d: date) -> Amortization | None:
+        """The entry valid on ``d``, None when none is set yet (no amortization line)."""
+        row = (
+            self._conn()
+            .execute(
+                "SELECT * FROM amortization WHERE valid_from <= ? ORDER BY valid_from DESC LIMIT 1",
+                (d.isoformat(),),
+            )
+            .fetchone()
+        )
+        return _amortization(row) if row else None
 
     # -- print journal ---------------------------------------------------
 

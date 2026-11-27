@@ -55,6 +55,9 @@ TOOL_NAMES = {
     "add_plate",
     "set_default_plate",
     "set_tariff",
+    "set_amortization",
+    "set_currency",
+    "set_country",
     "update_print",
     "create_job",
     "propose_job",
@@ -567,7 +570,7 @@ def _run_print(store: Store, settings: Settings, name: str, start: datetime, end
 
 def test_set_tariff_then_history_cost(h):
     tariff = h.call("set_tariff", valid_from="2027-01-01", day_uah=4.80)
-    assert tariff == {"valid_from": "2027-01-01", "day_uah": 4.80, "night_uah": None}
+    assert tariff == {"valid_from": "2027-01-01", "day_uah": 4.80, "night_uah": None, "currency": "UAH"}
     start = datetime(2027, 1, 2, 10, 0, tzinfo=KYIV)
     _run_print(h.store, h.settings, "bracket", start, start.replace(hour=11))
 
@@ -580,6 +583,65 @@ def test_set_tariff_then_history_cost(h):
     assert row["duration_min"] == 60
     assert row["ended_at"] == "2027-01-02T11:00:00+02:00"
     assert h.call("print_history", part="nothing")["prints"] == []
+
+
+def test_set_currency_then_new_spool_in_eur(h):
+    old = h.call("add_spool", brand="A", material="PLA", color_name="White",
+                 color_hex="#FFFFFF", price_uah=700, net_g=1000)
+    assert old["currency"] == "UAH"
+    assert h.call("set_currency", code="eur", symbol="€") == {"currency": "EUR", "currency_symbol": "€"}
+    new = h.call("add_spool", brand="B", material="PLA", color_name="Grey",
+                 color_hex="#888888", price_uah=25, net_g=1000)
+    assert new["currency"] == "EUR"
+    assert h.call("set_tariff", valid_from="2027-01-01", day_uah=0.25)["currency"] == "EUR"
+    amort = h.call("set_amortization", valid_from="2027-01-01", printer_price=600, life_hours=3000)
+    assert amort["currency"] == "EUR"
+    by_id = {s["id"]: s["currency"] for s in h.call("spools")["spools"]}
+    assert by_id == {old["id"]: "UAH", new["id"]: "EUR"}  # nothing is converted
+    assert h.call("update_spool", spool_id=old["id"], price_uah=22)["currency"] == "EUR"
+
+
+def test_set_currency_validates(h):
+    for code, symbol in (("EURO", "€"), ("E1R", "€"), ("", "€"), ("EUR", ""), ("EUR", "x" * 9),
+                         ("EUR", "€\n")):
+        result = h.call_raw("set_currency", code=code, symbol=symbol)
+        assert result["isError"], (code, symbol)
+    assert h.store.currency() == ("UAH", "грн")
+
+
+def test_set_amortization(h):
+    amort = h.call("set_amortization", valid_from="2027-01-01", printer_price=30000,
+                   life_hours=5000, upkeep_per_hour=2)
+    assert amort == {
+        "valid_from": "2027-01-01", "printer_price": 30000, "life_hours": 5000,
+        "upkeep_per_hour": 2, "rate_per_hour": 8.0, "currency": "UAH",
+    }
+    for bad in ({"printer_price": -1}, {"life_hours": 0}, {"upkeep_per_hour": -0.5}):
+        args = {"valid_from": "2027-02-01", "printer_price": 30000, "life_hours": 5000, **bad}
+        assert h.call_raw("set_amortization", **args)["isError"], bad
+    assert h.store.amortization_on(datetime(2027, 3, 1).date()).valid_from.isoformat() == "2027-01-01"
+
+
+def test_set_country(h):
+    assert h.call("set_country", code="pl") == {
+        "country": "PL", "timezone": "Europe/Warsaw", "tariff_reminder": False,
+        "note": "the timezone applies after a service restart",
+    }
+    assert h.store.country() == "PL"
+    assert h.call("set_country", code="UA") == {
+        "country": "UA", "timezone": "Europe/Kyiv", "tariff_reminder": True,
+    }
+    assert h.call_raw("set_country", code="UKR")["isError"]
+    assert h.store.country() == "UA"
+
+
+def test_print_history_shows_amortization_and_currency(h):
+    start = datetime(2027, 1, 2, 10, 0, tzinfo=KYIV)
+    print_id = _run_print(h.store, h.settings, "bracket", start, start.replace(hour=11))
+    h.store.set_print_fields(print_id, cost_amort=8.0)
+    (row,) = h.call("print_history")["prints"]
+    assert (row["cost_amort"], row["currency"]) == (8.0, "UAH")
+    assert row["cost_total_uah"] == round(row["cost_power_uah"] + 8.0, 2)
 
 
 def test_update_print_deducts_and_moves_grams(h):

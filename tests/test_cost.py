@@ -6,8 +6,19 @@ import pytest
 
 from bambu_mcp import cost
 from bambu_mcp.config import Settings
-from bambu_mcp.cost import CostLine, filament_cost, power_cost, print_kwh, tariff_check_due
-from bambu_mcp.store.models import Spool, Tariff
+from bambu_mcp.cost import (
+    CostBreakdown,
+    CostLine,
+    CurrencyMismatch,
+    Money,
+    amortization_cost,
+    filament_cost,
+    full_cost,
+    power_cost,
+    print_kwh,
+    tariff_check_due,
+)
+from bambu_mcp.store.models import Amortization, Spool, Tariff
 
 KYIV = ZoneInfo("Europe/Kyiv")
 SINGLE = Tariff(valid_from=date(2026, 1, 1), day_uah=4.32, night_uah=None)
@@ -172,3 +183,80 @@ def test_dst_fall_back_two_boundaries_split():
     end = datetime(2026, 10, 25, 12, 0, tzinfo=KYIV)
     expected = 15.0 * (1 * 4.32 + 9 * 2.16 + 5 * 4.32) / 15
     assert power_cost(start, end, 15.0, TWO_ZONE, s) == pytest.approx(expected)
+
+
+# -- money: full cost, currencies, amortization ------------------------------------
+
+AMORT = Amortization(
+    valid_from=date(2026, 1, 1), printer_price=30000.0, life_hours=5000.0, upkeep_per_hour=2.0, currency="UAH"
+)
+
+
+def _uah_spool(currency="UAH") -> Spool:
+    return Spool(
+        id=3, brand="Bambu", material="PLA", color_name="Black", color_hex="#000000",
+        filament_preset=None, price_uah=700.0, net_g=1000.0, remaining_g=1000.0, active=True,
+        currency=currency,
+    )
+
+
+def test_amortization_cost_is_minutes_times_rate():
+    assert AMORT.rate_per_hour == 8.0
+    m = amortization_cost(52, AMORT)
+    assert m.currency == "UAH" and m.amount == pytest.approx(52 / 60 * 8)
+
+
+def test_full_cost_breakdown():
+    b = full_cost(8, _uah_spool(), 52, 0.4444, SINGLE, AMORT, currency="UAH")
+    assert isinstance(b, CostBreakdown)
+    assert b.currency == "UAH"
+    assert b.plastic == Money(pytest.approx(5.6), "UAH")
+    assert round(b.power.amount, 2) == 1.92
+    assert round(b.amort.amount, 2) == 6.93
+    assert b.total.currency == "UAH"
+    assert b.total.amount == pytest.approx(b.plastic.amount + b.power.amount + b.amort.amount)
+    assert round(b.total.amount, 2) == 14.45
+
+
+def test_full_cost_two_zone_uses_the_start_time():
+    s = Settings()
+    start = datetime(2026, 6, 1, 22, 0, tzinfo=KYIV)
+    b = full_cost(8, _uah_spool(), 120, 0.45, TWO_ZONE, None, currency="UAH", start=start, settings=s)
+    end = datetime(2026, 6, 2, 0, 0, tzinfo=KYIV)
+    assert b.power.amount == pytest.approx(power_cost(start, end, 0.45, TWO_ZONE, s))
+    with pytest.raises(ValueError, match="start"):
+        full_cost(8, _uah_spool(), 120, 0.45, TWO_ZONE, None, currency="UAH")
+
+
+def test_full_cost_without_a_spool_has_no_plastic():
+    b = full_cost(8, None, 52, 0.4444, SINGLE, None, currency="UAH")
+    assert b.plastic is None
+    assert b.total.amount == pytest.approx(b.power.amount)
+
+
+def test_no_amortization_line_when_unset():
+    b = full_cost(8, _uah_spool(), 52, 0.4444, SINGLE, None, currency="UAH")
+    assert b.amort is None
+    assert b.total.amount == pytest.approx(5.6 + 0.4444 * 4.32)
+
+
+def test_mixed_currency_refused_names_input():
+    eur_tariff = Tariff(valid_from=date(2026, 1, 1), day_uah=0.25, night_uah=None, currency="EUR")
+    eur_amort = Amortization(date(2026, 1, 1), 600.0, 3000.0, 0.0, "EUR")
+
+    spool_off = full_cost(8, _uah_spool(), 52, 0.44, eur_tariff, eur_amort, currency="EUR")
+    assert isinstance(spool_off, CurrencyMismatch)
+    assert spool_off.input_name == "spool 3"
+    assert (spool_off.currency, spool_off.expected) == ("UAH", "EUR")
+    assert "spool 3" in spool_off.reason and "UAH" in spool_off.reason and "EUR" in spool_off.reason
+
+    tariff_off = full_cost(8, _uah_spool("EUR"), 52, 0.44, SINGLE, eur_amort, currency="EUR")
+    assert isinstance(tariff_off, CurrencyMismatch)
+    assert tariff_off.input_name == "tariff from 2026-01-01"
+
+    amort_off = full_cost(8, _uah_spool("EUR"), 52, 0.44, eur_tariff, AMORT, currency="EUR")
+    assert isinstance(amort_off, CurrencyMismatch)
+    assert amort_off.input_name == "amortization from 2026-01-01"
+
+    ok = full_cost(8, _uah_spool("EUR"), 52, 0.44, eur_tariff, eur_amort, currency="EUR")
+    assert isinstance(ok, CostBreakdown) and ok.currency == "EUR"
