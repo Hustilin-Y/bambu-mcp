@@ -164,6 +164,24 @@ A kit is sliced once, each plate is its own print, confirmation and journal row.
 
 **Later.** Multi-colour, queue, tolerance suggestions, OrcaSlicer, live camera, timelapse download, AMS drying.
 
+**Later, asked by the owner (2026-11-27): printer model as configuration.** Today the code assumes the owner's P2S. The owner wants a printer model to be a setting: a "model profile" that holds everything printer-specific, so that another Bambu model (or a second printer) is a new profile, not a code change. What is hard-coded now, file by file (2026-11-27, branch `phase3-print`):
+
+| Where | What is P2S-specific |
+|---|---|
+| `slice_agent/config.py` | Default presets: machine `Bambu Lab P2S 0.4 nozzle`, process `0.20mm Standard @BBL P2S`, filament `Generic PETG @BBL P2S`, resources folder `profiles\BBL` |
+| `slice_agent/profiles.py` | Flatten assertions: bed `256x256`, height `256` |
+| `slice_agent/output.py` | Output check: `printer_model == "Bambu Lab P2S"`, bed `(256, 256)` |
+| `slice_agent/runner.py` | Plate types list (5 Bambu plates), layer heights per nozzle (only `0.4`: 0.12-0.28), override ranges |
+| `bambu_mcp/config.py`, `cost.py` | Power per material (`PLA` 200 W from the P2S FAQ), heat-up kWh |
+| `bambu_mcp/service.py`, `scripts/extract_hms.py` | HMS table `hms_en_22E.json` (`22E` is the P2S device prefix) |
+| `bambu_mcp/printer/link.py` | AMS geometry: 4 units × 4 slots, `tray_ids` mapping and `ams_mapping = ams*4+slot`, tray types list, nozzle temp range 150-320 °C, the verified `project_file` payload fields (`bed_type`, levelling, `layer_inspect`) |
+| `bambu_mcp/proposal.py`, `mcp_server.py` | Slot numbers 1-16 (`MAX_SLOT_NUMBER`), "ams and slot 0..3" checks |
+| `bambu_mcp/printgate.py` | Nozzle diameter check against one nozzle, USB storage requirement (P2S without the closed plug-in needs a stick) |
+| `bambu_mcp/printer/state.py`, `events.py` | `gcode_state` names and the idle/stoppable sets as the P2S firmware 01.03 reports them |
+| Spec, README, phase 0 report | Bed 256³, firmware 01.03.00.00, the TLS chain and CN = serial (true for current Bambu printers) |
+
+Target shape: a `printers/<model>.toml` (or a section of the service config) with the model name, bed size, device prefix for HMS, preset names per nozzle, plate types, layer-height and temperature ranges, power per material, AMS geometry and the payload flags. A `printer` key in the config picks it, and the slice-agent reads the same profile name. The P2S becomes the first profile with today's values, and the tests run against it. Several printers at once (more than one printer section, jobs bound to a printer) is a step after that.
+
 **Later, asked by the owner (2026-11-27): evaluation mode.** On request ("оцени", or a button on the proposal) the service picks the best settings for the part and sets them on the job: infill density and pattern, wall loops, top and bottom shells, supports, brim, and layer height where the whitelist allows it. It slices a few candidate variants on the PC (within the existing override whitelist), compares time, grams and cost, and weighs them against the part's purpose: the manifest's checks, its `PRINT_HINTS`, and the load or strength intent when one is given. Then it proposes the winner with a short comparison table, and the owner keeps it, picks another variant, or edits it. The chosen settings are stored as the job's explicit settings (R6). The scoring follows a goal preset the owner names, "сделай прочно" for example. When none is named, it is taken from `PRINT_HINTS` or else defaults to Balanced. Each preset lists which settings vary, what the score weighs, and which hard limits a variant must keep. Strength is a proxy computed from the sliced file: perimeter and shell volume plus infill volume times a per-pattern factor. Time, grams and cost come from the slice itself.
 
 | Preset (owner's word) | Varies | Score weighs | Hard limits |
