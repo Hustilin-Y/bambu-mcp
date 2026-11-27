@@ -202,6 +202,9 @@ _STOP_SPENT_TEXTS = {
     "expired": "⌛ Подтверждение истекло, остановка не отправлена. Запроси её заново, если нужно",
     "cancelled": STOP_CANCELLED_TEXT,
 }
+# A confirmation that would reach Telegram with less than this left goes out without buttons.
+MIN_BUTTONS_LIFE_S = 5
+_EXPIRED_ON_SEND = {"print_confirm": _SPENT_TEXTS["expired"], "stop_confirm": _STOP_SPENT_TEXTS["expired"]}
 TLS_TEXT = (
     "Загрузка на принтер идёт по TLS с проверкой сертификата: в настройках нужны "
     + md_literal('tls_mode = "ca"')
@@ -595,10 +598,15 @@ class Service:
             files = [(SNAPSHOT_NAME, image)] if image else None
         if row.kind == SLICED_KIND:
             files = [*(files or []), *self._attachments(row.dedupe)] or None
+        text, buttons, expires_in = row.text, _rows_buttons(row.buttons), None
+        if row.expires_at is not None:
+            # The add-in takes the buttons off when the confirmation expires.
+            expires_in = math.ceil(row.expires_at - now)
+            if expires_in < MIN_BUTTONS_LIFE_S:
+                expired = _EXPIRED_ON_SEND.get(row.kind, _SPENT_TEXTS["expired"])
+                text, buttons, expires_in = f"{text}\n\n{expired}", None, None
         try:
-            await self._notifier.send(
-                row.text, buttons=_rows_buttons(row.buttons), files=files, dedupe=row.dedupe
-            )
+            await self._notifier.send(text, buttons=buttons, files=files, dedupe=row.dedupe, expires_in=expires_in)
         except SendError as exc:
             return self._delivery_failed(row, exc)
         except Exception as exc:  # a bug in the client must not stop the outbox
@@ -687,7 +695,9 @@ class Service:
         *,
         buttons: list[list[Button]] | None = None,
         snapshot: bool = False,
+        expires_at: float | None = None,
     ) -> None:
+        """Queue a message. ``expires_at`` (epoch seconds): when its buttons stop working."""
         self._store.outbox_add(
             kind,
             text,
@@ -695,6 +705,7 @@ class Service:
             buttons=_rows_json(buttons),
             snapshot=snapshot,
             now=self._clock().timestamp(),
+            expires_at=expires_at,
         )
         if self._outbox_wake is not None:
             self._outbox_wake.set()
@@ -1429,7 +1440,11 @@ class Service:
                 now=self._clock().timestamp(),
             )
             self._enqueue(
-                "print_confirm", text, f"start|{_id_tag(confirmation.id)}", buttons=start_buttons(confirmation.id)
+                "print_confirm",
+                text,
+                f"start|{_id_tag(confirmation.id)}",
+                buttons=start_buttons(confirmation.id),
+                expires_at=confirmation.expires_at,
             )
         log.info("job %d plate %d: start confirmation sent", target.job.id, plate)
         return PrepareResult(confirmation.id, text, list(check.warnings))
@@ -1655,10 +1670,23 @@ class Service:
         task.add_done_callback(self._press_tasks.discard)
 
     async def _answer_spent(self, press: Press, confirm_id: str, texts: Mapping[str, str] = _SPENT_TEXTS) -> None:
+        """Answer a press on a used, expired or cancelled confirmation, in place or as a new message."""
         confirmation = self._store.confirmation(confirm_id)
         text = texts.get(confirmation.state) if confirmation is not None else None
-        if text is not None:
-            await self._notifier.edit(press.message_id, text)
+        if text is None:
+            return
+        assert confirmation is not None
+        try:
+            edited = await self._notifier.edit(press.message_id, text)
+        except Exception:
+            log.exception("answering a spent %s press in place raised", confirmation.kind)
+            edited = False
+        if edited:
+            return
+        log.warning("answering a spent %s press in place failed, sending a new message", confirmation.kind)
+        self._enqueue(
+            f"{confirmation.kind}_spent", text, f"{confirmation.kind}|{_id_tag(confirm_id)}|spent|{press.seq}"
+        )
 
     async def _start_pressed(self, press: Press, confirm_id: str) -> None:
         """Holds the start lock (taken by the caller) until the start is decided."""
@@ -1955,7 +1983,11 @@ class Service:
                 now=self._clock().timestamp(),
             )
             self._enqueue(
-                "stop_confirm", text, f"stop|{_id_tag(confirmation.id)}", buttons=stop_buttons(confirmation.id)
+                "stop_confirm",
+                text,
+                f"stop|{_id_tag(confirmation.id)}",
+                buttons=stop_buttons(confirmation.id),
+                expires_at=confirmation.expires_at,
             )
         log.info("stop confirmation sent")
         return StopRequest(confirmation.id, text)

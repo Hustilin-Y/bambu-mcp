@@ -28,7 +28,7 @@ from bambu_mcp.store.models import (
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
 _CONFIRMATION_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 # schema.sql is the version-1 schema; each later version is one migration script.
 _MIGRATIONS = {
     2: "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
@@ -100,6 +100,8 @@ _MIGRATIONS = {
     ");\n"
     "INSERT OR IGNORE INTO meta (key, value) VALUES"
     " ('currency', 'UAH'), ('currency_symbol', 'грн'), ('country', 'UA');",
+    # When a message's buttons stop working (a start or stop confirmation's expiry), NULL: never.
+    10: "ALTER TABLE outbox ADD COLUMN expires_at REAL;",
 }
 _SEEN_TTL_S = 30 * 24 * 3600
 _DEFAULT_TARIFF = (date(2024, 6, 1), 4.32, None)
@@ -667,12 +669,16 @@ class Store:
         buttons: list[list[dict[str, str]]] | None = None,
         snapshot: bool = False,
         now: float,
+        expires_at: float | None = None,
     ) -> bool:
-        """Queue a message. False when one with the same dedupe key is already waiting."""
+        """Queue a message. False when one with the same dedupe key is already waiting.
+
+        ``expires_at`` (epoch seconds): when its buttons stop working, None for the add-in's default.
+        """
         with self._tx() as conn:
             cur = conn.execute(
                 "INSERT OR IGNORE INTO outbox (kind, text, buttons, snapshot, dedupe, created_at,"
-                " next_attempt_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " next_attempt_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     kind,
                     text,
@@ -681,6 +687,7 @@ class Store:
                     dedupe,
                     now,
                     now,
+                    expires_at,
                 ),
             )
             return cur.rowcount == 1
@@ -700,6 +707,7 @@ class Store:
             created_at=row["created_at"],
             attempts=row["attempts"],
             next_attempt_at=row["next_attempt_at"],
+            expires_at=row["expires_at"],
         )
 
     def outbox_defer(self, id: int, attempts: int, next_attempt_at: float) -> None:

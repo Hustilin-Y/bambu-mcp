@@ -95,6 +95,7 @@ class OutboxRow:
     created_at: float  # epoch seconds
     attempts: int
     next_attempt_at: float
+    expires_at: float | None = None  # epoch seconds the buttons stop working (a confirmation's)
 
 
 @dataclass(frozen=True)

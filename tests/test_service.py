@@ -100,7 +100,7 @@ class RecordingNotifier:
         if self.fail:
             raise SendError(503, "telegram_unreachable")
         self.sent.append(
-            {"text": text, "buttons": buttons or [], "files": files or [], "dedupe": dedupe}
+            {"text": text, "buttons": buttons or [], "files": files or [], "dedupe": dedupe, "expires_in": expires_in}
         )
         return f"m{len(self.sent)}"
 
@@ -2426,6 +2426,120 @@ async def test_start_and_stop_confirmations_do_not_cross(harness):
     assert harness.store.confirmation(start_cid).state == "pending"
     assert harness.store.confirmation(stop_cid).state == "pending"
     assert harness.events == []
+
+
+# -- Task X1: confirmation buttons expire in the add-in ---------------------------------------
+
+START_EXPIRED = "⌛ Подтверждение истекло, подготовь печать заново"
+STOP_EXPIRED = "⌛ Подтверждение истекло, остановка не отправлена. Запроси её заново, если нужно"
+
+
+async def _confirm(harness, service, job, printer, kind: str) -> str:
+    """Ask for a start or stop confirmation (a stop needs a running print), return its id."""
+    if kind == "start":
+        return (await service.prepare_print(job.id)).confirm_id
+    return (await service.request_stop()).confirm_id
+
+
+@pytest.mark.parametrize("kind", ["start", "stop"])
+async def test_confirmation_sent_with_expires_in(harness, kind):
+    service, job, printer = await print_harness(harness)
+    if kind == "stop":
+        await running(harness, printer)
+    sent = len(harness.notifier.sent)
+    attempts = harness.notifier.attempts
+    harness.notifier.fail = True  # the first attempt fails, the retry goes out 3 minutes later
+    cid = await _confirm(harness, service, job, printer, kind)
+    await until(lambda: harness.notifier.attempts > attempts)
+    assert harness.store.outbox_head().expires_at == harness.store.confirmation(cid).expires_at
+    harness.clock.advance(minutes=3)
+    harness.notifier.fail = False
+    await drain(service)
+    (message,) = harness.notifier.sent[sent:]
+    assert message["expires_in"] == 420
+    assert [b.id for row in message["buttons"] for b in row] == [f"{kind}:{cid}:go", f"{kind}:{cid}:cancel"]
+
+
+async def test_other_messages_have_no_expires_in(harness):
+    _service, _job, printer = await print_harness(harness)
+    await running(harness, printer)
+    assert harness.notifier.sent
+    assert all(m["expires_in"] is None for m in harness.notifier.sent)
+
+
+@pytest.mark.parametrize("kind", ["start", "stop"])
+async def test_late_outbox_send_drops_buttons_and_says_expired(harness, kind):
+    service, job, printer = await print_harness(harness)
+    if kind == "stop":
+        await running(harness, printer)
+    sent = len(harness.notifier.sent)
+    attempts = harness.notifier.attempts
+    harness.notifier.fail = True
+    cid = await _confirm(harness, service, job, printer, kind)
+    await until(lambda: harness.notifier.attempts > attempts)
+    text = harness.store.outbox_head().text
+    harness.clock.advance(seconds=596)  # 4 s left, under the 5 s minimum
+    harness.notifier.fail = False
+    await drain(service)
+    (message,) = harness.notifier.sent[sent:]
+    expired = START_EXPIRED if kind == "start" else STOP_EXPIRED
+    assert message["text"] == f"{text}\n\n{expired}"
+    assert message["buttons"] == [] and message["expires_in"] is None
+    assert harness.store.confirmation(cid).state == "pending"  # nothing else is marked
+    assert harness.store.outbox_count() == 0
+
+
+async def test_outbox_send_with_five_seconds_left_keeps_the_buttons(harness):
+    service, job, _printer = await print_harness(harness)
+    sent = len(harness.notifier.sent)
+    attempts = harness.notifier.attempts
+    harness.notifier.fail = True
+    await service.prepare_print(job.id)
+    await until(lambda: harness.notifier.attempts > attempts)
+    harness.clock.advance(seconds=595.5)  # 4.5 s left: ceil gives 5
+    harness.notifier.fail = False
+    await drain(service)
+    (message,) = harness.notifier.sent[sent:]
+    assert message["expires_in"] == 5 and message["buttons"]
+
+
+@pytest.mark.parametrize("kind", ["start", "stop"])
+async def test_expired_press_edit_failure_sends_new_message(harness, kind, caplog):
+    service, job, printer = await print_harness(harness)
+    if kind == "stop":
+        await running(harness, printer)
+    cid = await _confirm(harness, service, job, printer, kind)
+    await until(lambda: harness.store.outbox_count() == 0)
+    sent = len(harness.notifier.sent)
+    harness.clock.advance(minutes=10)
+    harness.notifier.edit_ok = False
+    with caplog.at_level(logging.INFO, logger="bambu_mcp"):
+        await press(harness, f"{kind}:{cid}:go", "m7")
+        await until(lambda: len(harness.notifier.sent) > sent)
+    expired = START_EXPIRED if kind == "start" else STOP_EXPIRED
+    assert harness.notifier.edits == [("m7", expired)]
+    (message,) = harness.notifier.sent[sent:]
+    assert message["text"] == expired and message["buttons"] == []
+    assert harness.store.confirmation(cid).state == "expired"
+    assert cid not in caplog.text and "m7" not in caplog.text
+    assert "spent" in caplog.text or "new message" in caplog.text
+    assert harness.uploader.calls == [] and "stop" not in harness.events
+
+
+async def test_spent_press_edit_that_raises_sends_new_message(harness):
+    service, job, _printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await until(lambda: harness.store.outbox_count() == 0)
+    sent = len(harness.notifier.sent)
+    harness.clock.advance(minutes=10)
+
+    async def broken(message_id, text=None, buttons=None):
+        raise RuntimeError("add-in client bug")
+
+    harness.notifier.edit = broken
+    await press(harness, f"start:{cid}:go", "m7")
+    await until(lambda: len(harness.notifier.sent) > sent)
+    assert harness.notifier.sent[-1]["text"] == START_EXPIRED
 
 
 # -- Task 5 review fixes -------------------------------------------------------------------
