@@ -4,7 +4,9 @@ Subcommands: `flatten` (write the flattened presets) and `serve` (HTTP API on cf
 
 API (bearer SLICE_AGENT_TOKEN on everything but /health):
 - POST /slice: multipart with a `file` part (3MF, max 50 MB) and a `job` part (JSON, max 64 KB).
-  200: {file, plates, slicer_version, sha256}, sha256 of the sliced file (lower-case hex).
+  200: {file, plates, slicer_version, sha256}, sha256 of the sliced file (lower-case hex). Each plate:
+  {index, minutes, grams, features?, layer_height?}, features = extruded mm³ per role (output.FEATURES),
+  left out when the gcode could not be measured, layer_height in mm, left out when unknown.
 - GET /sliced/{name}: a sliced file from sliced_dir, only names the agent itself produces.
 - GET /sliced/{name}/plate/{n}.png: the plate preview inside that file.
 - GET /health: {"ok": true}.
@@ -41,7 +43,7 @@ from starlette.routing import Route
 from bambu_mcp.manifest import NAME_RE
 from slice_agent.config import AgentConfig, load_config
 from slice_agent.lease import PC_AGENT_URL, RENEW_S, Lease
-from slice_agent.output import OutputError, check_output, read_output, read_plate_png
+from slice_agent.output import OutputError, PlateResult, check_output, read_output, read_plate_png
 from slice_agent.profiles import filament_tray_info, flatten_all
 from slice_agent.runner import OUT_SUFFIX, Overrides, build_command, check_out_name, slice_isolated
 
@@ -315,6 +317,19 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _plate_body(p: PlateResult) -> dict:
+    body: dict = {
+        "index": p.index,
+        "minutes": round(p.minutes, 2),
+        "grams": {k: round(v, 2) for k, v in p.grams_by_filament.items()},
+    }
+    if p.features is not None:
+        body["features"] = {k: round(v, 2) for k, v in p.features.items()}
+    if p.layer_height is not None:
+        body["layer_height"] = p.layer_height
+    return body
+
+
 def _error(status: int, error: str, **extra) -> JSONResponse:
     return JSONResponse({"error": error, **extra}, status_code=status)
 
@@ -443,7 +458,7 @@ class SliceAgent:
                 detail = "the slicer produced no output file"
             return 500, self._failed(detail, run.log_tail)
         try:
-            result = read_output(final, job.plates[0])
+            result = read_output(final, job.plates[0], feature_plates=job.plates)
             check_output(result, job.nozzle)
             present = {p.index for p in result.plates}
             for plate in job.plates:
@@ -453,15 +468,7 @@ class SliceAgent:
             final.unlink(missing_ok=True)  # never leave a file that failed the checks to be printed
             return 500, self._failed(str(e), run.log_tail)
         wanted = set(job.plates)
-        plates = [
-            {
-                "index": p.index,
-                "minutes": round(p.minutes, 2),
-                "grams": {k: round(v, 2) for k, v in p.grams_by_filament.items()},
-            }
-            for p in result.plates
-            if p.index in wanted
-        ]
+        plates = [_plate_body(p) for p in result.plates if p.index in wanted]
         body = {"file": final.name, "plates": plates, "slicer_version": result.slicer_version}
         try:
             body["sha256"] = _file_sha256(final)  # the server checks the file it prints against it

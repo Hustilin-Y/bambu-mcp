@@ -1,10 +1,12 @@
 import json
+import math
 import zipfile
 from pathlib import Path
 
 import pytest
 
-from slice_agent.output import OutputError, check_output, read_output
+from slice_agent import output
+from slice_agent.output import FEATURES, OutputError, check_output, read_output
 
 PNG = b"\x89PNG\r\n\x1a\nfake"
 MB = 1024 * 1024
@@ -184,3 +186,147 @@ def test_slicer_version_from_header(tmp_path):
         z.writestr("Metadata/project_settings.config", json.dumps({"nozzle_diameter": ["0.4"], "printable_area": ["0x0"]}))
         z.writestr("Metadata/plate_1.gcode", "G1")
     assert read_output(path, plate=1).slicer_version == "02.08.02.61"
+
+
+# --- feature volumes (evaluation, Task 4) ---------------------------------
+
+AREA = math.pi * (1.75 / 2) ** 2  # mm² of 1.75 mm filament
+ZERO = dict.fromkeys(FEATURES, 0.0)
+
+
+def make_gcode_3mf(path: Path, gcode: str, *, diameter="1.75", layer_height="0.2", plates=(1,)) -> Path:
+    settings = {"printable_area": ["0x0", "256x0", "256x256", "0x256"], "printer_model": "Bambu Lab P2S",
+                "nozzle_diameter": ["0.4"]}
+    if diameter is not None:
+        settings["filament_diameter"] = [diameter]
+    if layer_height is not None:
+        settings["layer_height"] = layer_height
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("Metadata/slice_info.config", slice_info(tuple((i, 600, "1.0") for i in plates)))
+        z.writestr("Metadata/project_settings.config", json.dumps(settings))
+        for i in plates:
+            z.writestr(f"Metadata/plate_{i}.gcode", gcode)
+    return path
+
+
+def volumes(**mm_of_filament) -> dict:
+    return {**ZERO, **{k: pytest.approx(v * AREA) for k, v in mm_of_filament.items()}}
+
+
+SMALL_GCODE = """\
+; HEADER_BLOCK_START
+M83 ; relative extrusion
+G1 X5 Y5 E2 ; purge before any feature marker counts as other
+;TYPE:Outer wall
+G1 X10 Y0 E1.0
+G1 X20 Y0 E2.0 ; trailing comment
+G1 E-0.8
+G1 E0.8
+G0 X30 Y30
+; FEATURE: Inner wall
+G1 X0 Y10 E3
+;TYPE:Sparse infill
+G2 X5 Y5 I1 J1 E0.5
+G1 X1 Y1 E-0.1
+;TYPE:Internal solid infill
+G3 X6 Y6 I1 J1 E0.75
+;TYPE:Top surface
+G1 X1 E0.2
+;TYPE:Bottom surface
+G1 Y1 E0.3
+;TYPE:Support interface
+G1 X2 E0.25
+;TYPE:Support
+G1 X3 E0.25
+;TYPE:Bridge
+G1 X3 E0.1
+"""
+
+
+def test_feature_volumes_from_small_gcode(tmp_path):
+    path = make_gcode_3mf(tmp_path / "f.gcode.3mf", SMALL_GCODE)
+    res = read_output(path, plate=1, feature_plates=(1,))
+    (p,) = res.plates
+    assert p.features == volumes(
+        outer_wall=3.0, inner_wall=3.0, sparse_infill=0.5, internal_solid_infill=0.75,
+        top_surface=0.2, bottom_surface=0.3, support=0.5, other=2.1,
+    )
+    assert set(p.features) == set(FEATURES)
+    assert p.layer_height == pytest.approx(0.2)
+
+
+def test_features_only_for_the_asked_plates(tmp_path):
+    path = make_gcode_3mf(tmp_path / "k.gcode.3mf", SMALL_GCODE, plates=(1, 2))
+    res = read_output(path, plate=2, feature_plates=(2,))
+    assert res.plates[0].features is None and res.plates[1].features is not None
+    assert read_output(path, plate=1).plates[0].features is None  # not asked: not parsed
+
+
+def test_relative_and_absolute_e(tmp_path):
+    gcode = """\
+M82
+G92 E0
+;TYPE:Outer wall
+G1 X1 E1.0
+G1 X2 E2.5
+G1 E1.7
+G1 E2.5
+G1 X3 E3.0
+G92 E0
+;TYPE:Top surface
+G1 X4 E0.4
+M83
+G1 X5 E0.6
+M82
+G92 E10
+G1 X6 E10.5
+g1 x7 e11.0
+"""
+    res = read_output(make_gcode_3mf(tmp_path / "e.gcode.3mf", gcode), plate=1, feature_plates=(1,))
+    assert res.plates[0].features == volumes(outer_wall=3.0, top_surface=2.0)
+
+
+def test_parse_stops_at_cap(tmp_path, monkeypatch):
+    gcode = ";TYPE:Outer wall\nM83\n" + "G1 X1 Y1 E0.5\n" * 1000
+    path = make_gcode_3mf(tmp_path / "c.gcode.3mf", gcode)
+    monkeypatch.setattr(output, "MAX_GCODE_BYTES", 1000)
+    res = read_output(path, plate=1, feature_plates=(1,))
+    assert res.plates[0].features is None  # a partial count would mislead: unknown instead
+    check_output(res, "0.4")  # the slice itself is still fine
+    monkeypatch.setattr(output, "MAX_GCODE_BYTES", len(gcode))  # exactly at the cap is parsed
+    assert read_output(path, plate=1, feature_plates=(1,)).plates[0].features == volumes(outer_wall=500.0)
+
+
+@pytest.mark.parametrize(
+    ("diameter", "layer_height"),
+    [(None, "0.2"), ("nan", "0.2"), ("-1", "0.2"), ("abc", "0.2")],
+)
+def test_no_usable_filament_diameter_means_no_features(tmp_path, diameter, layer_height):
+    path = make_gcode_3mf(tmp_path / "n.gcode.3mf", SMALL_GCODE, diameter=diameter, layer_height=layer_height)
+    res = read_output(path, plate=1, feature_plates=(1,))
+    assert res.plates[0].features is None
+    check_output(res, "0.4")
+
+
+@pytest.mark.parametrize("layer_height", [None, "abc", "inf", "0", 0.28])
+def test_layer_height_is_optional(tmp_path, layer_height):
+    path = make_gcode_3mf(tmp_path / "l.gcode.3mf", SMALL_GCODE, layer_height=layer_height)
+    p = read_output(path, plate=1, feature_plates=(1,)).plates[0]
+    assert p.features is not None
+    assert p.layer_height == (pytest.approx(0.28) if layer_height == 0.28 else None)
+
+
+@pytest.mark.parametrize(
+    "gcode",
+    [
+        "M83\nG1 X1 Enan\n",
+        "M83\nG1 X1 Einf\n",
+        "M83\nG1 X1 Eabc\n",
+        "M83\nG1 X1 E1e400\n",
+        "\xff\xfe garbage \x00\nG1 X1 E1\n",
+    ],
+)
+def test_garbage_extrusion_is_skipped_not_fatal(tmp_path, gcode):
+    res = read_output(make_gcode_3mf(tmp_path / "g.gcode.3mf", gcode), plate=1, feature_plates=(1,))
+    feats = res.plates[0].features
+    assert feats is not None and all(math.isfinite(v) and v >= 0 for v in feats.values())

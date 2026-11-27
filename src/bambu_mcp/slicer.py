@@ -25,6 +25,8 @@ from typing import Literal
 
 import httpx
 
+from bambu_mcp.evaluation import FEATURE_KEYS
+
 log = logging.getLogger(__name__)
 
 WAKE_BUDGET_S = 120.0
@@ -203,7 +205,9 @@ class SliceRequest:
 
 @dataclass(frozen=True)
 class SliceOutcome:
-    """``ok``: the file and its plates (``{"index", "minutes", "grams": {filament: g}}``).
+    """``ok``: the file and its plates (``{"index", "minutes", "grams": {filament: g}}``, plus
+    ``"features": {role: mm³}`` and ``"layer_height"`` when the agent measured them: an agent older
+    than the evaluation, or a plate it could not measure, leaves them out).
 
     ``sha256``: of the sliced file, None from an agent older than phase 3 (such a job is
     sliced again before it is printed).
@@ -231,6 +235,18 @@ def _grams(value: object) -> float | None:
     return value if math.isfinite(value) and value >= 0 else None
 
 
+def _features(raw: object) -> dict[str, float] | None:
+    """The agent's feature volumes, or None when absent or unusable: they only feed the strength
+    column of an evaluation, so a bad value costs that column, never the slice."""
+    if raw is None:
+        return None
+    volumes = {k: _grams(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+    if set(volumes) != set(FEATURE_KEYS) or any(v is None for v in volumes.values()):
+        log.warning("slice-agent answered 200 with unusable features")
+        return None
+    return volumes  # type: ignore[return-value]
+
+
 def _plates(raw: object, wanted: tuple[int, ...]) -> tuple[dict, ...] | None:
     """The agent's plates, checked: exactly the plates asked for, sane numbers."""
     if not isinstance(raw, list):
@@ -248,7 +264,14 @@ def _plates(raw: object, wanted: tuple[int, ...]) -> tuple[dict, ...] | None:
             if not isinstance(key, str) or g is None:
                 return None
             by_filament[key] = g
-        out.append({"index": index, "minutes": minutes, "grams": by_filament})
+        plate = {"index": index, "minutes": minutes, "grams": by_filament}
+        features = _features(item.get("features"))
+        if features is not None:
+            plate["features"] = features
+        layer_height = _grams(item.get("layer_height"))
+        if layer_height:  # zero is no layer height
+            plate["layer_height"] = layer_height
+        out.append(plate)
     if sorted(p["index"] for p in out) != sorted(wanted):
         return None
     return tuple(out)
