@@ -164,7 +164,22 @@ A kit is sliced once, each plate is its own print, confirmation and journal row.
 
 **Later.** Multi-colour, queue, tolerance suggestions, OrcaSlicer, live camera, timelapse download, AMS drying.
 
-**Later, asked by the owner (2026-11-27): evaluation mode.** On request ("оцени", or a button on the proposal) the service picks the best settings for the part and sets them on the job: infill density and pattern, wall loops, top and bottom shells, supports, brim, and layer height where the whitelist allows it. It slices a few candidate variants on the PC (within the existing override whitelist), compares time, grams and cost, and weighs them against the part's purpose: the manifest's checks, its `PRINT_HINTS`, and the load or strength intent when one is given. Then it proposes the winner with a short comparison table, and the owner keeps it, picks another variant, or edits it. The chosen settings are stored as the job's explicit settings (R6). Open for the design: the scoring rule (strength proxy vs time and cost), the number of variants per run (each is a slice on the PC), and whether the PC stays awake through the batch under one lease.
+**Later, asked by the owner (2026-11-27): evaluation mode.** On request ("оцени", or a button on the proposal) the service picks the best settings for the part and sets them on the job: infill density and pattern, wall loops, top and bottom shells, supports, brim, and layer height where the whitelist allows it. It slices a few candidate variants on the PC (within the existing override whitelist), compares time, grams and cost, and weighs them against the part's purpose: the manifest's checks, its `PRINT_HINTS`, and the load or strength intent when one is given. Then it proposes the winner with a short comparison table, and the owner keeps it, picks another variant, or edits it. The chosen settings are stored as the job's explicit settings (R6). The scoring follows a goal preset the owner names, "сделай прочно" for example. When none is named, it is taken from `PRINT_HINTS` or else defaults to Balanced. Each preset lists which settings vary, what the score weighs, and which hard limits a variant must keep. Strength is a proxy computed from the sliced file: perimeter and shell volume plus infill volume times a per-pattern factor. Time, grams and cost come from the slice itself.
+
+| Preset (owner's word) | Varies | Score weighs | Hard limits |
+|---|---|---|---|
+| Balanced, «обычно» (default) | infill 10-25 %, walls 2-3, pattern grid/gyroid | equal weights on time, cost and strength | the manifest's checks pass |
+| Speed, «быстро» | layer 0.24-0.28, infill 5-15 %, walls 2, lightning/grid, support only where needed | time | strength at least 0.6 of Balanced |
+| Strength, «прочно» | walls 3-6, infill 25-60 %, gyroid/cubic/adaptive, top/bottom +2 | strength, then time | time at most 2.5 times Balanced |
+| Quality, «красиво» | layer 0.12-0.16, outer wall first, slower outer wall, seam aligned or back, ironing on top if flat | surface: smallest layer, fewest visible seams | time at most 3 times Balanced |
+| Cheap, «дёшево» | infill 0-12 %, walls 2, lightning, thinner shells, no brim unless the checks ask | cost (filament plus power) | strength at least 0.5 of Balanced, the checks pass |
+| Light, «легко» | infill 0-10 %, lightning or honeycomb, walls 2, minimum shells | grams | strength at least 0.4 of Balanced |
+| Fit, «точно» (holes, snaps, threads from CAD Workshop) | classic wall generator, walls 3+, slow outer wall, no fuzzy skin, layer 0.12-0.2 | dimensional risk (outer wall speed, layer, wall count), then time | none of the part's tolerance features are thinned by infill or shells |
+| Watertight, «герметично» (jars, boxes, liquids) | walls 4-6, top/bottom 5+, 100 % infill below a size cap | shell thickness | no sparse layer reaches an outer surface |
+
+Presets can be combined as primary and secondary, "прочно и быстро" for example: the primary sets the hard limits, the secondary breaks ties. Settings outside the current override whitelist, such as ironing, seam position, the wall generator and outer wall speed, need the whitelist extended first, each with its own range. The table above lists the target set.
+
+Still open for the design: the number of variants per run (each is a slice on the PC, so 3 to 6 is a sane cap), whether the PC stays awake through the batch under one lease, and calibrating the strength proxy against a few real prints (break test or flex test).
 
 ## 13. MCP tools
 
