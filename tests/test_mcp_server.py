@@ -24,7 +24,7 @@ from bambu_mcp.mcp_server import build_app
 from bambu_mcp.notify import LogNotifier, Press
 from bambu_mcp.printer.link import LinkStatus, PrinterNotConnected, tray_setting
 from bambu_mcp.printer.state import Hms, PrinterState, Tray
-from bambu_mcp.service import Service
+from bambu_mcp.service import ControlRefused, PrepareResult, PrintRefused, Service, StopRequest
 from bambu_mcp.slicer import SliceClient, SliceOutcome
 from bambu_mcp.store.db import Store
 
@@ -62,8 +62,12 @@ TOOL_NAMES = {
     "job_status",
     "jobs",
     "load_spool",
+    "prepare_print",
+    "pause_print",
+    "request_stop",
 }
-WRITE_TOOLS = TOOL_NAMES - {
+DESTRUCTIVE_TOOLS = {"prepare_print", "pause_print", "request_stop", "load_spool"}
+WRITE_TOOLS = TOOL_NAMES - DESTRUCTIVE_TOOLS - {
     "printer_status",
     "ams_status",
     "camera_snapshot",
@@ -94,6 +98,26 @@ class FakeService:
         self.full_reports = 0
         self.set_tray_error: Exception | None = None
         self.state_fresh = True
+        self.control_error: Exception | None = None
+        self.calls: list[tuple] = []
+
+    async def prepare_print(self, job_id: int, plate: int = 1) -> PrepareResult:
+        self.calls.append(("prepare_print", job_id, plate))
+        if self.control_error is not None:
+            raise self.control_error
+        return PrepareResult("a" * 32, "🖨 Печатать «bracket»?", ["Цвет слота другой"])
+
+    async def pause_print(self) -> dict:
+        self.calls.append(("pause_print",))
+        if self.control_error is not None:
+            raise self.control_error
+        return {"task_id": "123", "job_name": "bracket"}
+
+    async def request_stop(self) -> StopRequest:
+        self.calls.append(("request_stop",))
+        if self.control_error is not None:
+            raise self.control_error
+        return StopRequest("b" * 32, "⏹ Остановить печать «bracket»?")
 
     def set_tray(self, **fields) -> dict:
         if self.set_tray_error is not None:
@@ -190,7 +214,10 @@ def test_lists_exact_tool_names(h):
     assert {t["name"] for t in tools} == TOOL_NAMES
     for tool in tools:
         hints = tool["annotations"]
-        if tool["name"] in WRITE_TOOLS:
+        if tool["name"] in DESTRUCTIVE_TOOLS:
+            assert hints["readOnlyHint"] is False
+            assert hints["destructiveHint"] is True
+        elif tool["name"] in WRITE_TOOLS:
             assert hints["readOnlyHint"] is False
             assert hints["destructiveHint"] is False
         else:
@@ -198,6 +225,56 @@ def test_lists_exact_tool_names(h):
     text = json.dumps(tools).lower()
     for word in ("access_code", "serial", "token", "host"):
         assert word not in text
+
+
+def test_tool_list_has_no_start_print(h):
+    tools = {t["name"]: t for t in h.rpc("tools/list")["tools"]}
+    assert not {name for name in tools if "start" in name or "resume" in name}
+    for name in DESTRUCTIVE_TOOLS:
+        assert tools[name]["annotations"]["destructiveHint"] is True
+    assert "Telegram" in tools["prepare_print"]["description"]
+    assert "Telegram" in tools["request_stop"]["description"]
+    assert "RUNNING" in tools["pause_print"]["description"]
+
+
+# -- printing tools ------------------------------------------------------------------
+
+
+def test_prepare_print_returns_the_confirmation_and_starts_nothing(h):
+    result = h.call("prepare_print", job_id=5, plate=2)
+    assert result["confirm_id"] == "a" * 32
+    assert result["text"].startswith("🖨 Печатать")
+    assert result["warnings"] == ["Цвет слота другой"]
+    assert "Telegram" in result["note"] and "press" in result["note"]
+    assert h.service.calls == [("prepare_print", 5, 2)]
+
+
+def test_pause_and_request_stop_tools(h):
+    paused = h.call("pause_print")
+    assert paused["sent"] == "pause" and paused["task_id"] == "123"
+    assert "resume" in paused["note"].lower()
+    stop = h.call("request_stop")
+    assert stop["confirm_id"] == "b" * 32 and "Остановить" in stop["text"]
+    assert "nothing" in stop["note"].lower() and "Telegram" in stop["note"]
+    assert h.service.calls == [("pause_print",), ("request_stop",)]
+
+
+@pytest.mark.parametrize(
+    ("tool", "error", "message"),
+    [
+        ("prepare_print", PrintRefused(["Принтер занят"], "the printer is busy"), "the printer is busy"),
+        ("prepare_print", KeyError("job 9"), "job 9 not found"),
+        ("prepare_print", ValueError("job 9 has no plate 3, its plates are [1]"), "no plate 3"),
+        ("pause_print", ControlRefused("the printer is IDLE: pause works only while RUNNING"), "IDLE"),
+        ("request_stop", ControlRefused("the printer is FINISH: there is no print to stop"), "no print to stop"),
+    ],
+)
+def test_printing_tool_refusals_are_tool_errors(h, tool, error, message):
+    h.service.control_error = error
+    args = {"job_id": 9, "plate": 3} if tool == "prepare_print" else {}
+    result = h.call_raw(tool, **args)
+    assert result.get("isError") is True
+    assert message in result["content"][0]["text"]
 
 
 # -- read tools --------------------------------------------------------------------

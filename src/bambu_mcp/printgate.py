@@ -22,7 +22,9 @@ from slice_agent.output import OutputError, read_output
 __all__ = [
     "CONFIRMATION_TTL_S",
     "SPOOL_MARGIN",
+    "ControlRefused",
     "Preflight",
+    "PrintRefused",
     "PrintFileError",
     "PrintFileInfo",
     "gate_hash",
@@ -37,6 +39,21 @@ BLOCKING_HMS = {"fatal": "критическая", "serious": "серьёзна�
 NOZZLE_TOLERANCE_MM = 0.001
 _MD5_RE = re.compile(r"[0-9A-Fa-f]{32}")
 _MD5_MAX_BYTES = 256
+
+
+class PrintRefused(Exception):
+    """A print was not prepared. ``lines``: Russian, Markdown-escaped, one per reason.
+
+    ``str()`` is for Claude: the English ``detail`` when there is one, else the lines.
+    """
+
+    def __init__(self, lines: list[str], detail: str | None = None) -> None:
+        self.lines = list(lines)
+        super().__init__(detail or "print refused: " + " / ".join(self.lines))
+
+
+class ControlRefused(Exception):
+    """``pause_print`` or ``request_stop`` sent nothing. The message is English, for Claude."""
 
 
 def new_confirmation_id() -> str:

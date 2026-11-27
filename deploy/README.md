@@ -183,7 +183,7 @@ How a slice runs: the service sends `POST /wake` to the gateway with `GATEWAY_KE
 - The PC needs only the `standard` process set: the service always asks for it, and a named set from the conversation travels as overrides of the whitelisted settings.
 - The filament preset sent is the `filament_preset` of the spool in the chosen AMS slot. It must be one of the agent's `filaments`, or the slice is refused.
 - The sliced summary goes to Telegram with the first plate's picture (fetched from the agent). A summary longer than a photo caption (1024 characters) is sent as a separate message right after the picture. The picture waits in `data_dir/outbox-files/` until its message is sent or dropped.
-- The owner prints the sliced file from Bambu Studio on the PC, under the agent's name for it.
+- The owner prints the sliced file from Bambu Studio on the PC, under the agent's name for it, or from Telegram (step 8).
 
 ### Booking a sliced print
 
@@ -193,7 +193,7 @@ A print whose file name matches a sliced job (`<name>-<job id>-p1` or `-kit`, as
 
 Spool records have three new fields for `load_spool`: `tray_info_idx`, `nozzle_temp_min` and `nozzle_temp_max`. Copy them from the `slice-agent flatten` output on the PC (one line per filament preset) with `add_spool` or `update_spool`. `update_spool` can set or change them but **cannot clear** them.
 
-`load_spool(spool_id, ams, slot)` sets the AMS slot's material, colour and nozzle range on the printer and maps the spool to the slot. It is the only printer write: the link now sends exactly one kind of write, `ams_filament_setting`, besides the phase 1 `get_version` and `pushall` requests. It refuses, sending nothing, unless all of these hold:
+`load_spool(spool_id, ams, slot)` sets the AMS slot's material, colour and nozzle range on the printer and maps the spool to the slot. In phase 2 it is the only printer write: the link sends exactly one kind of write, `ams_filament_setting`, besides the phase 1 `get_version` and `pushall` requests. Phase 3 adds `project_file`, `pause` and `stop` (step 8). It refuses, sending nothing, unless all of these hold:
 
 - the printer is connected and has sent a fresh report since it (re)connected,
 - the printer is idle (`IDLE`, `FINISH` or `FAILED`),
@@ -203,6 +203,47 @@ Spool records have three new fields for `load_spool`: `tray_info_idx`, `nozzle_t
 It sends once and does not retry: check the slot on the printer screen. Nothing checks that the spool's material belongs to the `tray_info_idx` filament family, so a wrong id sets the wrong filament profile on the printer.
 
 Checked live on 2026-11-24 (plan Task 10, Step 6): `ams_id` is the AMS unit and `tray_id` the slot within it (slot 2 of AMS 0 is `tray_id` 1), the printer takes the type, colour and nozzle range, and the next report shows them while the other slots stay as they were. `PLA-S` is not checked yet.
+
+## 8. Phase 3: printing, pause and stop
+
+Phase 3 starts prints on the printer, pauses them and stops them. There is no `start_print` tool, and no client token starts or stops a print: only the owner's press on a button the service sent to Telegram does. MCP clients can only ask for that button.
+
+### Requirements
+
+- **A USB stick in the printer.** The sliced file is uploaded to the root of the stick over implicit FTPS (port 990). The pre-flight refuses while the printer reports no USB storage (`sdcard` false), or has not reported it since it last reconnected.
+- `tls_mode = "ca"` and `ca_file` (step 3). The FTPS upload checks the printer's certificate against the CA bundle and the peer CN against `BAMBU_SERIAL`, as MQTT does. With another TLS mode `prepare_print` refuses.
+- Slicing set up (step 7): the sliced file is fetched from the PC, which is woken first.
+- The printer in LAN-only mode with Developer Mode on, as for the earlier phases.
+
+### Starting a print
+
+1. `prepare_print(job_id, plate)` or the "Печатать…" button under the sliced summary (a kit asks for the plate first) wakes the PC, fetches the sliced file into the print cache, asks the printer for a full report and runs the pre-flight. Hard stops: printer not connected or no fresh report, printer not `IDLE`/`FINISH`/`FAILED`, a fatal or serious HMS, no USB stick, another nozzle diameter, the slot empty or unmapped or holding another material, a plate that uses more than one filament, a retired spool, a spool remainder below the plate's grams x 1.15, the sliced file missing or changed since slicing. Warnings (shown, not blocking): another colour in the slot than at slicing, the part's material intent, the plate's hints. Every blocking reason is listed, and nothing is stored or sent.
+2. Otherwise the service sends a confirmation that names the plate type, with "Стол чистый, печатать" and "Отмена". The owner confirms the bed and the plate in the press itself. The button works for 10 minutes and once. It is bound to the file's sha256, the plate, the AMS slot, the printer serial, the nozzle and the plate type.
+3. The press runs the pre-flight again, uploads the file (5 minute deadline), checks once more and sends `project_file` once. Then it watches for **30 s** for a report with the new task id in `PREPARE` or `RUNNING`. Seen: "Печать началась" with a "Остановить…" button. Not seen: the owner is told what the printer last reported, and the start counts as `unconfirmed`.
+
+`project_file` is never sent twice for one confirmation: not on a double press, not on a press replayed after a service restart, not after an `unconfirmed` start or a failed upload. Prepare the print again instead.
+
+### The print cache
+
+Sliced files are streamed from the PC to `data_dir/print-cache/` (`/srv/bambu/data/print-cache/`) and from there to the printer, never held whole in memory. The cache keeps the last 3 `*.gcode.3mf` files. Names starting with a dot (`.part` from a fetch, `.upload` from a press) are temporary. A crash can leave one behind: delete it while the service is stopped.
+
+### The USB stick
+
+The service never deletes anything from the stick. Every printed file stays at its root under its sliced name (a reprint of the same job overwrites it). Clean the stick from the printer screen or on a PC now and then.
+
+### Pause and stop
+
+- `pause_print()` sends `pause` once, only while the printer is `RUNNING`. There is no resume tool and no resume button: resume on the printer screen or in Bambu Studio.
+- `request_stop()` and the "Остановить…" button stop nothing themselves. They send "Остановить печать …?" with "Да, остановить" and "Отмена" (10 minutes, once). The press sends `stop` once, and only while the same print (task id and name) is still `RUNNING` or `PAUSE`. Otherwise it says why and sends nothing.
+
+### Never exposed
+
+- Printer commands not reachable from any tool or button: resume, raw G-code, axis moves, heating, AMS load or unload, HMS clearing, file deletion, LAN and Developer Mode settings. The link sends only `get_version`, `pushall`, `ams_filament_setting`, `project_file`, `pause` and `stop`, each checked field by field before it leaves.
+- Tool results and Telegram texts carry file and job names only: no server paths, printer address, serial, access code or tokens. Confirmation ids stay out of the log, and the outbox dedupe keys carry a hash of them. `prepare_print` and `request_stop` return the id to the client, but it confirms nothing: presses come only from the service-notify add-in.
+
+### Not yet checked on the printer
+
+The live check with the owner present confirms: that the P2S reports the task id the service sent (otherwise every start ends as `unconfirmed`), that it accepts the plate md5 in lower case, the `pause` and `stop` payload shape, and the FTPS upload path form.
 
 ## Checks after deploy
 

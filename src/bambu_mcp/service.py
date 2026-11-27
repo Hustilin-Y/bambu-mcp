@@ -56,11 +56,13 @@ from bambu_mcp.messages import (
     render_sliced,
     render_start_confirmation,
     render_start_unconfirmed,
+    render_stop_confirmation,
     slot_buttons,
     spool_buttons,
     spool_question,
     start_buttons,
     stop_ask_buttons,
+    stop_buttons,
 )
 from bambu_mcp.names import slug
 from bambu_mcp.notify import Button, LogNotifier, Notifier, Press, SendError, ServiceNotifyClient
@@ -69,7 +71,15 @@ from bambu_mcp.printer.ftps import UploadError
 from bambu_mcp.printer.hms import HmsTexts
 from bambu_mcp.printer.link import GCODE_3MF_SUFFIX, LinkStatus, PrinterLink, PrinterNotConnected
 from bambu_mcp.printer.state import PrinterState, apply
-from bambu_mcp.printgate import PrintFileError, PrintFileInfo, gate_hash, preflight, print_file_info
+from bambu_mcp.printgate import (
+    ControlRefused,
+    PrintFileError,
+    PrintFileInfo,
+    PrintRefused,
+    gate_hash,
+    preflight,
+    print_file_info,
+)
 from bambu_mcp.proposal import (
     SlotChoice,
     SlotUnusable,
@@ -148,6 +158,9 @@ PRINT_CACHE_KEEP = 3  # sliced files kept, newest first
 START_WATCH_S = 30.0  # after project_file: our task_id must show up PREPARE or RUNNING
 REPORT_WAIT_S = 5.0  # a fresh pushall before the checks
 START_REPORTED = frozenset({"PREPARE", "RUNNING"})
+STOPPABLE_STATES = frozenset({"RUNNING", "PAUSE"})
+UPLOAD_TIMEOUT_S = 300.0  # the whole FTPS upload: ftps.upload has only per-socket timeouts
+_TASK_ID_RE = re.compile(r"[0-9]{1,20}", re.ASCII)
 _CONFIRM_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
 _HASH_CHUNK = 1 << 16
 UPLOADING_TEXT = "⏳ Загружаю на принтер…"
@@ -164,6 +177,22 @@ FILE_GONE_TEXT = "Нарезанного файла уже нет на серв�
 FILE_CHANGED_TEXT = "Нарезанный файл изменился после подтверждения, подготовь печать заново"
 NOT_CONNECTED_TEXT = "Принтер не на связи, команда не отправлена"
 INTERNAL_TEXT = "внутренняя ошибка сервиса"
+UPLOAD_TIMEOUT_TEXT = "Файл не загрузился на принтер: загрузка на принтер не уложилась в 5 минут"
+NO_JOB_TEXT = "Задание не найдено"
+NO_PLATE_TEXT = "В задании нет пластины {plate}"
+# The confirmed stop.
+STOP_SENT_TEXT = "⏹ Команда остановки отправлена"
+STOP_CANCELLED_TEXT = "Остановка отменена"
+STOP_NOT_CONNECTED_TEXT = "Принтер не на связи, остановка не отправлена"
+STOP_NOT_FRESH_TEXT = "Принтер ещё не прислал свежий отчёт после переподключения, остановка не отправлена"
+STOP_OVER_TEXT = "Эта печать уже не идёт, останавливать нечего"
+STOP_UNSURE_TEXT = "⚠️ Не знаю, дошла ли команда остановки. Посмотри на принтер, повторно она не отправляется"
+STOP_OTHER_TEXT = "Сейчас идёт другая печать, а кнопка была для прежней. Остановка не отправлена"
+_STOP_SPENT_TEXTS = {
+    "used": "Эта кнопка уже нажата, остановка второй раз не отправляется",
+    "expired": "⌛ Подтверждение истекло, остановка не отправлена. Запроси её заново, если нужно",
+    "cancelled": STOP_CANCELLED_TEXT,
+}
 TLS_TEXT = (
     "Загрузка на принтер идёт по TLS с проверкой сертификата: в настройках нужны "
     + md_literal('tls_mode = "ca"')
@@ -200,6 +229,10 @@ class Link(Protocol):
     def start_project(
         self, *, file: str, plate: int, md5: str, subtask_name: str, task_id: str, ams: int, slot: int
     ) -> None: ...
+
+    def pause(self) -> None: ...
+
+    def stop_print(self) -> None: ...
 
 
 class Slicer(Protocol):
@@ -246,17 +279,6 @@ class SlicePlan:
     usable: tuple[UsableSlot, ...] = ()  # slots the owner may choose instead
 
 
-class PrintRefused(Exception):
-    """A print was not prepared. ``lines``: Russian, Markdown-escaped, one per reason.
-
-    ``str()`` is for Claude: the English ``detail`` when there is one, else the lines.
-    """
-
-    def __init__(self, lines: list[str], detail: str | None = None) -> None:
-        self.lines = list(lines)
-        super().__init__(detail or "print refused: " + " / ".join(self.lines))
-
-
 @dataclass(frozen=True)
 class PrepareResult:
     """A start confirmation sent to Telegram: only the owner's press on it starts the print."""
@@ -264,6 +286,23 @@ class PrepareResult:
     confirm_id: str
     text: str
     warnings: list[str]
+
+
+@dataclass(frozen=True)
+class StopRequest:
+    """A stop confirmation sent to Telegram: only the owner's press on it stops the print."""
+
+    confirm_id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class _StopProblem:
+    """Why a stop is not asked for or not sent: ``reason`` for the outcome, English and Russian."""
+
+    reason: str
+    error: str
+    text: str
 
 
 @dataclass(frozen=True)
@@ -281,6 +320,10 @@ class _PrintTarget:
     spool: Spool | None  # mapped to the slot now
     nozzle: str  # "0.4"
     plate_type: str
+
+
+class _StartSent(Exception):
+    """``project_file`` may have left: the outcome is ``unconfirmed``, never a refusal."""
 
 
 class _StartRefused(Exception):
@@ -362,6 +405,7 @@ class Service:
         uploader: Uploader = ftps.upload,
         watch_s: float = START_WATCH_S,
         report_wait_s: float = REPORT_WAIT_S,
+        upload_timeout_s: float = UPLOAD_TIMEOUT_S,
     ) -> None:
         self._secrets = secrets
         self._settings = settings
@@ -400,6 +444,7 @@ class Service:
         self._uploader = uploader
         self._watch_s = watch_s
         self._report_wait_s = report_wait_s
+        self._upload_timeout_s = upload_timeout_s
         self._start_lock = asyncio.Lock()  # one start at a time
         self._press_tasks: set[asyncio.Task] = set()  # starts and prepares run off the press loop
         self._preparing: set[int] = set()  # job ids with a prepare from a button in flight
@@ -740,6 +785,9 @@ class Service:
         try:
             if press.button_id.startswith("start:"):
                 await self._on_start_press(press)
+                return
+            if press.button_id.startswith("stop:"):
+                await self._on_stop_press(press)
                 return
             if _print_press(press.button_id) is not None:
                 await self._on_print_press(press)
@@ -1344,7 +1392,7 @@ class Service:
                 now=self._clock().timestamp(),
             )
             self._enqueue(
-                "print_confirm", text, f"start|{confirmation.id}", buttons=start_buttons(confirmation.id)
+                "print_confirm", text, f"start|{_id_tag(confirmation.id)}", buttons=start_buttons(confirmation.id)
             )
         log.info("job %d plate %d: start confirmation sent", target.job.id, plate)
         return PrepareResult(confirmation.id, text, list(check.warnings))
@@ -1520,9 +1568,12 @@ class Service:
         except PrintRefused as exc:
             log.info("job %d plate %d: print not prepared: %s", job.id, plate, exc)
             lines = exc.lines
-        except (KeyError, ValueError) as exc:
+        except KeyError:
+            log.warning("job %d plate %d: print press for a job that is gone", job.id, plate)
+            lines = [NO_JOB_TEXT]
+        except ValueError as exc:
             log.warning("job %d plate %d: print press refused: %s", job.id, plate, exc)
-            lines = [md_literal(str(exc))]
+            lines = [NO_PLATE_TEXT.format(plate=plate)]
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1566,9 +1617,9 @@ class Service:
         self._press_tasks.add(task)
         task.add_done_callback(self._press_tasks.discard)
 
-    async def _answer_spent(self, press: Press, confirm_id: str) -> None:
+    async def _answer_spent(self, press: Press, confirm_id: str, texts: Mapping[str, str] = _SPENT_TEXTS) -> None:
         confirmation = self._store.confirmation(confirm_id)
-        text = _SPENT_TEXTS.get(confirmation.state) if confirmation is not None else None
+        text = texts.get(confirmation.state) if confirmation is not None else None
         if text is not None:
             await self._notifier.edit(press.message_id, text)
 
@@ -1586,6 +1637,11 @@ class Service:
             except _StartRefused as exc:
                 log.warning("print start refused: %s", exc.reason)
                 self._finish_start(confirm_id, f"refused:{exc.reason}", name, exc.lines)
+            except _StartSent:
+                try:
+                    self._record_unconfirmed(confirm_id, name)
+                except Exception:
+                    log.exception("recording an unconfirmed print start failed")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1602,7 +1658,7 @@ class Service:
             with self._store.transaction():
                 self._store.set_confirmation_outcome(confirm_id, outcome)
                 text = render_print_refused(name, lines, started=True)
-                self._enqueue("print_refused", text, f"start|{confirm_id}|refused")
+                self._enqueue("print_refused", text, f"start|{_id_tag(confirm_id)}|refused")
         except Exception:
             log.exception("recording a refused print start failed")
 
@@ -1654,10 +1710,16 @@ class Service:
 
         secrets, settings = self._secrets, self._settings
         assert settings.ca_file is not None  # _ftps_problem
+        upload = asyncio.to_thread(
+            self._uploader, secrets.host, secrets.serial, secrets.access_code, settings.ca_file, pinned, target.file
+        )
         try:
-            await asyncio.to_thread(
-                self._uploader, secrets.host, secrets.serial, secrets.access_code, settings.ca_file, pinned, target.file
-            )
+            # A worker thread cannot be killed: past the deadline it is left to finish or fail
+            # on its own, and nothing is sent to the printer for this press.
+            await asyncio.wait_for(upload, self._upload_timeout_s)
+        except TimeoutError:
+            log.warning("the upload did not finish in %.0f s, the print is not started", self._upload_timeout_s)
+            raise _StartRefused("upload_timeout", [UPLOAD_TIMEOUT_TEXT]) from None
         except (UploadError, ValueError) as exc:
             raise _StartRefused("upload", [f"Файл не загрузился на принтер: {md_literal(str(exc))}"]) from None
         # The upload took a while: the printer is checked once more before the one send.
@@ -1688,7 +1750,16 @@ class Service:
             self._watch = None
             log.error("project_file refused by the link: %s", exc)
             raise _StartRefused("payload", [INTERNAL_TEXT]) from None
-        return await self._watch_start(confirmation.id, target, watch)
+        except Exception:
+            # Raised after the publish may have happened: watched like a clean send.
+            log.exception("sending project_file raised, it may have reached the printer")
+        try:
+            return await self._watch_start(confirmation.id, target, watch)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("watching the print start failed")
+            raise _StartSent() from None
 
     def _preflight_or_refuse(self, target: _PrintTarget, info: PrintFileInfo, file_sha: str) -> None:
         check = preflight(
@@ -1723,26 +1794,224 @@ class Service:
         finally:
             if self._watch is watch:
                 self._watch = None
+        if not started:
+            self._record_unconfirmed(confirm_id, target.job.name)
+            return "unconfirmed"
         plate = target.plate if target.job.kind == "kit" else None
         with self._store.transaction():
-            if started:
-                self._store.set_confirmation_outcome(confirm_id, "started")
-                if not watch.announced:  # the STARTED event normally carries the stop button
-                    self._enqueue(
-                        "print_started",
-                        render_print_started(target.job.name, plate),
-                        f"start|{confirm_id}|started",
-                        buttons=stop_ask_buttons(watch.task_id),
-                    )
-                return "started"
+            self._store.set_confirmation_outcome(confirm_id, "started")
+            if not watch.announced:  # the STARTED event normally carries the stop button
+                self._enqueue(
+                    "print_started",
+                    render_print_started(target.job.name, plate),
+                    f"start|{_id_tag(confirm_id)}|started",
+                    buttons=stop_ask_buttons(watch.task_id),
+                )
+        return "started"
+
+    def _record_unconfirmed(self, confirm_id: str, name: str | None) -> None:
+        """The outcome ``unconfirmed`` and the owner's message, saying what the printer last sent."""
+        state = self._state
+        with self._store.transaction():
             self._store.set_confirmation_outcome(confirm_id, "unconfirmed")
-            state = self._state
             self._enqueue(
                 "print_unconfirmed",
-                render_start_unconfirmed(target.job.name, self._watch_s, state.gcode_state, state.subtask_name),
-                f"start|{confirm_id}|unconfirmed",
+                render_start_unconfirmed(name, self._watch_s, state.gcode_state, state.subtask_name),
+                f"start|{_id_tag(confirm_id)}|unconfirmed",
             )
-            return "unconfirmed"
+
+    # -- printing: pause and the confirmed stop (phase 3) -----------------------------
+
+    async def pause_print(self) -> dict[str, str | None]:
+        """Pause the running print, once. Only while ``RUNNING``. There is no resume.
+
+        Raises ``ControlRefused`` (English) when nothing was sent.
+        """
+        if not self.state_fresh:
+            await self._refresh_state()
+        # Synchronous from here on: no await between the checks and the send.
+        link = self._control_link()
+        state = self._state
+        if state.gcode_state != "RUNNING":
+            raise ControlRefused(
+                f"the printer is {state.gcode_state}: pause works only while RUNNING, nothing was sent"
+            )
+        try:
+            link.pause()
+        except PrinterNotConnected:
+            raise ControlRefused("the printer link is not connected, nothing was sent") from None
+        log.info("pause sent")
+        return {"task_id": state.task_id, "job_name": state.subtask_name}
+
+    async def request_stop(self) -> StopRequest:
+        """Send the stop confirmation for the current print to Telegram. Stops nothing itself.
+
+        Only the owner's press on "Да, остановить" sends ``stop``. Raises ``ControlRefused``
+        (English) when there is no print to stop, and then nothing is stored or sent.
+        """
+        if not self.state_fresh:
+            await self._refresh_state()
+        problem = self._stop_problem()
+        if problem is not None:
+            raise ControlRefused(problem.error)
+        return self._ask_stop()
+
+    def _control_link(self) -> Link:
+        link = self._link
+        if link is None or self._link_status is not LinkStatus.CONNECTED:
+            raise ControlRefused(
+                f"the printer is not connected (link {self._link_status.value}), nothing was sent"
+            )
+        if not self.state_fresh:
+            raise ControlRefused(
+                "waiting for the printer's first report since it connected, try again in a few seconds; "
+                "nothing was sent"
+            )
+        return link
+
+    def _stop_problem(self, task_id: str | None = None, name: str | None = None) -> _StopProblem | None:
+        """Why the current print cannot be stopped now, None when it can.
+
+        ``task_id`` and ``name``, when given, are the print the confirmation was asked for.
+        """
+        if self._link is None or self._link_status is not LinkStatus.CONNECTED:
+            return _StopProblem(
+                "not_connected",
+                f"the printer is not connected (link {self._link_status.value}), nothing was sent",
+                STOP_NOT_CONNECTED_TEXT,
+            )
+        if not self.state_fresh:
+            return _StopProblem(
+                "not_fresh",
+                "waiting for the printer's first report since it connected, try again in a few seconds; "
+                "nothing was sent",
+                STOP_NOT_FRESH_TEXT,
+            )
+        state = self._state
+        if state.gcode_state not in STOPPABLE_STATES:
+            return _StopProblem(
+                "print_over", f"the printer is {state.gcode_state}: there is no print to stop", STOP_OVER_TEXT
+            )
+        if (task_id is not None and (state.task_id or "") != task_id) or (
+            name is not None and (state.subtask_name or "") != name
+        ):
+            return _StopProblem("print_changed", "another print is running now", STOP_OTHER_TEXT)
+        return None
+
+    def _ask_stop(self) -> StopRequest:
+        """Store a stop confirmation bound to the current print and queue its message."""
+        state = self._state
+        task_id, name = state.task_id or "", state.subtask_name or ""
+        text = render_stop_confirmation(name)
+        with self._store.transaction():
+            confirmation = self._store.add_confirmation(
+                None,
+                "stop",
+                job_id=None,
+                plate=None,
+                gate_hash=None,
+                payload_json=json.dumps({"task_id": task_id, "subtask_name": name}),
+                now=self._clock().timestamp(),
+            )
+            self._enqueue(
+                "stop_confirm", text, f"stop|{_id_tag(confirmation.id)}", buttons=stop_buttons(confirmation.id)
+            )
+        log.info("stop confirmation sent")
+        return StopRequest(confirmation.id, text)
+
+    async def _on_stop_press(self, press: Press) -> None:
+        """``stop:ask:<task id>`` asks, ``stop:<id>:go`` sends ``stop`` at most once, ``:cancel`` cancels."""
+        parsed = _stop_press(press.button_id)
+        if parsed is None:
+            log.warning("malformed stop button ignored")
+            return
+        key, action = parsed
+        if action == "ask":
+            await self._on_stop_ask(key)
+            return
+        confirmation = self._store.confirmation(key)
+        if confirmation is None or confirmation.kind != "stop":
+            log.warning("stop press for an unknown confirmation ignored")
+            return
+        if action == "cancel":
+            if self._store.cancel_confirmation(key):
+                self._store.set_confirmation_outcome(key, "cancelled")
+                await self._notifier.edit(press.message_id, STOP_CANCELLED_TEXT)
+            else:
+                await self._answer_spent(press, key, _STOP_SPENT_TEXTS)
+            return
+        # The claim comes first: a double press, a replay after a restart or a press on an
+        # expired confirmation gets nothing past this line.
+        claimed = self._store.claim_confirmation(key, self._clock().timestamp())
+        if claimed is None:
+            await self._answer_spent(press, key, _STOP_SPENT_TEXTS)
+            return
+        outcome, text = await self._stop_claimed(claimed)
+        try:
+            self._store.set_confirmation_outcome(key, outcome)
+        except Exception:
+            log.exception("recording a stop outcome failed")
+        log.info("stop press: %s", outcome)
+        await self._notifier.edit(press.message_id, text)
+
+    async def _stop_claimed(self, confirmation: Any) -> tuple[str, str]:
+        """(outcome, the owner's answer) of a claimed stop. Sends ``stop`` at most once."""
+        try:
+            payload = json.loads(confirmation.payload_json)
+        except ValueError:
+            payload = None
+        task_id = payload.get("task_id") if isinstance(payload, dict) else None
+        name = payload.get("subtask_name") if isinstance(payload, dict) else None
+        if not isinstance(task_id, str) or not isinstance(name, str):
+            return "refused:internal", f"Остановка не отправлена: {INTERNAL_TEXT}"
+        if not self.state_fresh:
+            await self._refresh_state()
+        # Synchronous from here on: no await between the checks and the one send.
+        problem = self._stop_problem(task_id, name)
+        if problem is not None:
+            return f"refused:{problem.reason}", problem.text
+        link = self._link
+        assert link is not None  # _stop_problem
+        try:
+            link.stop_print()
+        except PrinterNotConnected:
+            return "refused:not_connected", STOP_NOT_CONNECTED_TEXT
+        except Exception:
+            # Raised after the publish may have happened: never sent again, the owner looks.
+            log.exception("sending stop raised, it may have reached the printer")
+            return "unconfirmed", STOP_UNSURE_TEXT
+        return "sent", STOP_SENT_TEXT
+
+    async def _on_stop_ask(self, task_id: str) -> None:
+        """The "Остановить…" button of a print this service started: a new stop confirmation."""
+        if not self.state_fresh:
+            await self._refresh_state()
+        problem = self._stop_problem()
+        if problem is None and (self._state.task_id or "") != task_id:
+            problem = _StopProblem("print_over", "the print of this button is over", STOP_OVER_TEXT)
+        if problem is not None:
+            log.info("stop ask press refused: %s", problem.reason)
+            self._enqueue("stop_refused", f"⏹ {problem.text}", f"stop-ask|{uuid.uuid4().hex}")
+            return
+        self._ask_stop()
+
+
+def _id_tag(confirm_id: str) -> str:
+    """A confirmation's stand-in for dedupe keys: the id itself never leaves the database."""
+    return hashlib.sha256(confirm_id.encode("ascii")).hexdigest()[:16]
+
+
+def _stop_press(button_id: str) -> tuple[str, str] | None:
+    """(task id, ``ask``) of ``stop:ask:<task id>``, (confirmation id, ``go`` or ``cancel``)
+    of ``stop:<id>:<action>``, else None."""
+    parts = button_id.split(":")
+    if len(parts) != 3 or parts[0] != "stop":
+        return None
+    if parts[1] == "ask":
+        return (parts[2], "ask") if _TASK_ID_RE.fullmatch(parts[2]) else None
+    if parts[2] not in ("go", "cancel") or not _CONFIRM_ID_RE.fullmatch(parts[1]):
+        return None
+    return parts[1], parts[2]
 
 
 def _nozzle_text(value: object) -> str:

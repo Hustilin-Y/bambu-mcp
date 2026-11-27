@@ -740,7 +740,7 @@ class Store:
         with self._tx() as conn:
             cur = conn.execute("UPDATE confirmations SET outcome = ? WHERE id = ?", (outcome, id))
             if cur.rowcount == 0:
-                raise KeyError(f"no confirmation {id}")
+                raise KeyError("no such confirmation")  # the id stays out of logs and errors
 
     def cancel_confirmation(self, id: str) -> bool:
         """Cancel a pending confirmation. False when it is not pending (or unknown)."""

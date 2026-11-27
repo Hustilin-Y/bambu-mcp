@@ -412,6 +412,7 @@ PRINT_BUTTON_TEXT = "Печатать…"
 START_BUTTON_TEXT = "Стол чистый, печатать"  # the owner confirms the bed in the press itself
 START_CANCEL_TEXT = "Отмена"
 STOP_ASK_TEXT = "Остановить…"
+STOP_GO_TEXT = "Да, остановить"
 _PLATES_PER_ROW = 4
 
 
@@ -436,6 +437,20 @@ def start_buttons(confirm_id: str) -> list[list[Button]]:
 
 def stop_ask_buttons(task_id: str) -> list[list[Button]]:
     return [[Button(f"stop:ask:{task_id}", STOP_ASK_TEXT)]]
+
+
+def stop_buttons(confirm_id: str) -> list[list[Button]]:
+    return [[Button(f"stop:{confirm_id}:go", STOP_GO_TEXT), Button(f"stop:{confirm_id}:cancel", START_CANCEL_TEXT)]]
+
+
+def render_stop_confirmation(name: str | None) -> str:
+    """The question the stop button answers. A stopped print cannot be resumed."""
+    return "\n".join(
+        [
+            f"⏹ Остановить печать «{job_name(name)}»?",
+            "Продолжить её потом будет нельзя. Кнопка действует 10 минут.",
+        ]
+    )
 
 
 def render_start_confirmation(

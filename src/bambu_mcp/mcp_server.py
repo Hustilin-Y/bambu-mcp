@@ -68,6 +68,7 @@ from bambu_mcp.printer.link import (
     PrinterNotConnected,
 )
 from bambu_mcp.printer.state import PrinterState
+from bambu_mcp.printgate import ControlRefused, PrintRefused
 from bambu_mcp.proposal import MAX_SLOT_NUMBER, NAMED_SETS, slot_number
 from bambu_mcp.store.db import Store
 from bambu_mcp.store.models import Job, Plate, PrintRow, Spool, Tariff
@@ -102,8 +103,26 @@ LOAD_SPOOL_NOTE = (
     "ams_status shows the printer's next report."
 )
 
+INSTRUCTIONS = (
+    "Bambu Lab P2S: status, camera, journal, inventory, print jobs. A print starts or stops only "
+    "on the owner's press in Telegram: prepare_print and request_stop send the confirmation."
+)
+PREPARE_NOTE = (
+    "Nothing is printing yet. The owner must press the start button under the confirmation in "
+    "Telegram (valid 10 minutes). No tool can start a print."
+)
+PAUSE_NOTE = (
+    "Sent once, not retried. There is no resume tool: the owner resumes on the printer screen "
+    "or in Bambu Studio. printer_status shows the printer's next report."
+)
+STOP_NOTE = (
+    "Nothing is stopped yet. The owner must press the stop button under the confirmation in "
+    "Telegram (valid 10 minutes)."
+)
+
 READ = ToolAnnotations(read_only_hint=True)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False)
+DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True)
 
 Camera = Callable[[], Awaitable[bytes | None]]
 
@@ -139,6 +158,12 @@ class StatusSource(Protocol):
     ) -> dict: ...
 
     def request_full_report(self) -> None: ...
+
+    async def prepare_print(self, job_id: int, plate: int = 1) -> Any: ...
+
+    async def pause_print(self) -> dict[str, str | None]: ...
+
+    async def request_stop(self) -> Any: ...
 
 
 # -- auth ------------------------------------------------------------------------
@@ -545,7 +570,7 @@ def build_mcp(
     service: StatusSource, store: Store, settings: Settings, camera: Camera
 ) -> MCPServer:
     tz = ZoneInfo(settings.timezone)
-    mcp = MCPServer(SERVER_NAME, instructions="Bambu Lab P2S monitor: status, camera, journal, inventory.")
+    mcp = MCPServer(SERVER_NAME, instructions=INSTRUCTIONS)
 
     # -- read ------------------------------------------------------------------
 
@@ -706,7 +731,7 @@ def build_mcp(
         spool = store.slot_spool(ams, slot)
         return {"ams": ams, "slot": slot, "spool": _spool(spool) if spool else None}
 
-    @mcp.tool(annotations=WRITE)
+    @mcp.tool(annotations=DESTRUCTIVE)
     async def load_spool(spool_id: int, ams: int, slot: int) -> dict[str, Any]:
         """Tell the printer which filament is in an AMS slot (material, colour, nozzle range)
         and map the spool to that slot. The only tool that writes to the printer.
@@ -884,6 +909,58 @@ def build_mcp(
         """Print jobs, newest first (limit 1..50)."""
         limit = max(1, min(limit, JOBS_MAX))
         return {"jobs": [_job_summary(j, tz) for j in store.jobs(limit)]}
+
+    # -- printing (phase 3) ------------------------------------------------------
+
+    @mcp.tool(annotations=DESTRUCTIVE)
+    async def prepare_print(job_id: int, plate: int = 1) -> dict[str, Any]:
+        """Check a sliced job against the printer and send the print confirmation to Telegram.
+
+        Wakes the PC, fetches the sliced file and runs the pre-flight (idle printer, USB stick,
+        nozzle, slot material, spool remainder, file unchanged). `plate` is the kit's plate,
+        always 1 for a part. Starts nothing: the print starts only when the owner presses the
+        button under the confirmation in Telegram, within 10 minutes. Returns the confirmation
+        text and its warnings (show them to the owner). Refusals list every blocking reason.
+        """
+        try:
+            result = await service.prepare_print(job_id, plate)
+        except PrintRefused as exc:
+            raise ToolError(str(exc)) from None
+        except KeyError:
+            raise ToolError(f"job {job_id} not found") from None
+        except ValueError as exc:
+            raise ToolError(str(exc)) from None
+        return {
+            "confirm_id": result.confirm_id,
+            "text": result.text,
+            "warnings": list(result.warnings),
+            "note": PREPARE_NOTE,
+        }
+
+    @mcp.tool(annotations=DESTRUCTIVE)
+    async def pause_print() -> dict[str, Any]:
+        """Pause the current print. Works only while the printer is RUNNING, sent once.
+
+        There is no resume tool: the owner resumes on the printer or in Bambu Studio.
+        """
+        try:
+            paused = await service.pause_print()
+        except ControlRefused as exc:
+            raise ToolError(str(exc)) from None
+        return {"sent": "pause", **paused, "note": PAUSE_NOTE}
+
+    @mcp.tool(annotations=DESTRUCTIVE)
+    async def request_stop() -> dict[str, Any]:
+        """Ask the owner in Telegram whether to stop the current print (RUNNING or PAUSE).
+
+        Stops nothing itself: the print stops only when the owner presses the stop button
+        under that message, within 10 minutes. A stopped print cannot be resumed.
+        """
+        try:
+            stop = await service.request_stop()
+        except ControlRefused as exc:
+            raise ToolError(str(exc)) from None
+        return {"confirm_id": stop.confirm_id, "text": stop.text, "note": STOP_NOTE}
 
     return mcp
 
