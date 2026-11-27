@@ -1,3 +1,4 @@
+import io
 import json
 import math
 import zipfile
@@ -330,3 +331,26 @@ def test_garbage_extrusion_is_skipped_not_fatal(tmp_path, gcode):
     res = read_output(make_gcode_3mf(tmp_path / "g.gcode.3mf", gcode), plate=1, feature_plates=(1,))
     feats = res.plates[0].features
     assert feats is not None and all(math.isfinite(v) and v >= 0 for v in feats.values())
+
+
+@pytest.mark.parametrize(
+    "gcode",
+    [
+        "M83\nG1 X1 E1e308\nG1 X2 E1e308\n",
+        "M82\nG92 E-1e308\nG1 X1 E1e308\n",
+        "M83\nG1 X1 E1e308\n",
+        "M83\n" + "G1 X1 E1e8\n" * 10,  # finite, but past any real print
+    ],
+)
+def test_huge_extrusion_gives_no_features_and_a_good_slice(tmp_path, gcode):
+    res = read_output(make_gcode_3mf(tmp_path / "h.gcode.3mf", gcode), plate=1, feature_plates=(1,))
+    assert res.plates[0].features is None
+    check_output(res, "0.4")
+
+
+def test_streamed_byte_counter_stops_the_scan(monkeypatch):
+    gcode = ("M83\n" + "G1 X1 Y1 E0.5\n" * 100).encode()
+    monkeypatch.setattr(output, "MAX_GCODE_BYTES", len(gcode) - 1)  # no file_size check on this path
+    assert output._extruded_lengths(io.BytesIO(gcode)) is None
+    monkeypatch.setattr(output, "MAX_GCODE_BYTES", len(gcode))
+    assert output._extruded_lengths(io.BytesIO(gcode))["other"] == pytest.approx(50.0)

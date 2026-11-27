@@ -15,10 +15,10 @@ SOLID = 100 + 200 + 30 + 20 + 50  # support and other never count
     ("pattern", "k"),
     [
         ("gyroid", 1.0), ("cubic", 1.0), ("adaptivecubic", 1.0),
-        ("grid", 0.9), ("rectilinear", 0.9),
+        ("grid", 0.9), ("rectilinear", 0.9), ("zig-zag", 0.9),  # Bambu serializes Rectilinear as zig-zag
         ("honeycomb", 0.8),
         ("lightning", 0.6),
-        ("triangles", 0.7), ("zig-zag", 0.7), ("", 0.7), (None, 0.7),
+        ("triangles", 0.7), ("", 0.7), (None, 0.7),
         (" Gyroid ", 1.0),  # the slicer's value, case and spaces aside
     ],
 )

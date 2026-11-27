@@ -30,6 +30,7 @@ INFILL_K = {
     "adaptivecubic": 1.0,
     "grid": 0.9,
     "rectilinear": 0.9,
+    "zig-zag": 0.9,  # Bambu Studio serializes its "Rectilinear" as zig-zag
     "honeycomb": 0.8,
     "lightning": 0.6,
 }

@@ -29,6 +29,7 @@ VERSION_KEY = "X-BBL-Client-Version"
 PROJECT_SETTINGS = "Metadata/project_settings.config"
 MAX_GCODE_BYTES = MAX_MEMBER_BYTES  # inflated bytes scanned per plate; over it the features are unknown
 MAX_GCODE_LINE = 4096  # a longer line is skipped whole
+MAX_FEATURE_MM3 = 1e9  # 1 m³ of plastic: any total above is bogus E values, the features are unknown
 
 # The keys of `features`, in mm³. Wall, surface and infill roles map one to one, the support roles to
 # "support", everything else (bridges, gap fill, brim, prime tower, start gcode) to "other".
@@ -233,7 +234,11 @@ def _feature_volumes(z: zipfile.ZipFile, plate: int, diameter: float | None) -> 
     if lengths is None:
         return None
     area = math.pi * (diameter / 2) ** 2
-    return {k: v * area for k, v in lengths.items()}
+    volumes = {k: v * area for k, v in lengths.items()}
+    total = sum(volumes.values())
+    if not math.isfinite(total) or total > MAX_FEATURE_MM3:
+        return None  # a huge E (custom gcode) would put inf in the JSON body and fail the slice
+    return volumes
 
 
 def read_output(path: Path, plate: int, feature_plates: Iterable[int] = ()) -> SliceResult:
