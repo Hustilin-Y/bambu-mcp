@@ -29,6 +29,7 @@ class PlateResult:
     minutes: float
     grams_by_filament: dict[str, float]
     png: bytes | None = None
+    filament_types: tuple[str, ...] = ()  # the material of each filament on the plate, e.g. "PETG"
 
 
 @dataclass(frozen=True)
@@ -82,7 +83,7 @@ def _version(root: ET.Element) -> str:
     return ""
 
 
-def _plates(root: ET.Element) -> list[tuple[int, float, dict[str, float]]]:
+def _plates(root: ET.Element) -> list[tuple[int, float, dict[str, float], tuple[str, ...]]]:
     out = []
     for el in root.iter("plate"):
         meta = {m.get("key"): m.get("value") for m in el.findall("metadata")}
@@ -91,10 +92,12 @@ def _plates(root: ET.Element) -> list[tuple[int, float, dict[str, float]]]:
             seconds = float(meta["prediction"])
             if not math.isfinite(seconds) or seconds < 0:
                 raise ValueError("bad prediction")
-            grams = {f.get("id", str(i + 1)): _grams(f.get("used_g", 0)) for i, f in enumerate(el.findall("filament"))}
+            filaments = el.findall("filament")
+            grams = {f.get("id", str(i + 1)): _grams(f.get("used_g", 0)) for i, f in enumerate(filaments)}
+            types = tuple(str(f.get("type", "")).strip()[:32] for f in filaments)
         except (KeyError, TypeError, ValueError, OverflowError):
             raise OutputError(f"{SLICE_INFO}: plate without index or prediction, or bad used_g") from None
-        out.append((idx, seconds / 60, grams))
+        out.append((idx, seconds / 60, grams, types))
     if not out:
         raise OutputError(f"{SLICE_INFO}: no plates")
     return out
@@ -125,9 +128,11 @@ def read_output(path: Path, plate: int) -> SliceResult:
             raise OutputError(f"{SLICE_INFO}: not valid XML ({e})") from None
         parsed = _plates(root)
         names = set(z.namelist())
-        wanted = {i for i, _, _ in parsed} | {plate}
+        wanted = {i for i, *_ in parsed} | {plate}
         missing = tuple(sorted(i for i in wanted if f"Metadata/plate_{i}.gcode" not in names))
-        plates = [PlateResult(i, mins, g, _read(z, f"Metadata/plate_{i}.png")) for i, mins, g in parsed]
+        plates = [
+            PlateResult(i, mins, g, _read(z, f"Metadata/plate_{i}.png"), types) for i, mins, g, types in parsed
+        ]
     nozzles = settings.get("nozzle_diameter")
     if not isinstance(nozzles, list) or not nozzles:
         raise OutputError(f"{PROJECT_SETTINGS}: nozzle_diameter is not a list")

@@ -487,6 +487,38 @@ async def test_load_spool_waits_for_a_fresh_report_after_a_reconnect(harness):
     assert len(link.trays) == 2
 
 
+async def test_link_drop_forgets_sdcard(harness):
+    """Pre-flight trusts sdcard only from a report since the last CONNECTED."""
+    service = await harness.start()
+    await _status(harness, LinkStatus.CONNECTED)
+    await harness.feed_report({"print": {"gcode_state": "IDLE", "sdcard": True, "task_id": "42"}})
+    assert service.state.sdcard is True and service.state.task_id == "42"
+    for status in (LinkStatus.CONNECTING, LinkStatus.DISCONNECTED, LinkStatus.AUTH_FAILED):
+        await _status(harness, LinkStatus.CONNECTED)
+        await harness.feed_report({"print": {"gcode_state": "IDLE", "sdcard": True, "task_id": "42"}})
+        await _status(harness, status)
+        assert service.state.sdcard is None, status
+        assert service.state.task_id == "42"  # kept: see the next test
+    await _status(harness, LinkStatus.CONNECTED)
+    assert service.state.sdcard is None  # CONNECTED alone says nothing about the stick
+    await harness.feed_report({"print": {"gcode_state": "IDLE", "sdcard": False}})
+    assert service.state.sdcard is False
+
+
+async def test_reconnect_report_without_task_id_does_not_announce_a_start(harness):
+    """The job identity survives a drop: a first report without task_id is not a new job."""
+    await harness.start()
+    await _status(harness, LinkStatus.CONNECTED)
+    await harness.feed("running_mid")
+    await until(lambda: harness.store.outbox_count() == 0)
+    sent = len(harness.notifier.sent)
+    await _status(harness, LinkStatus.DISCONNECTED)
+    await _status(harness, LinkStatus.CONNECTED)
+    await harness.feed_report({"print": {"gcode_state": "RUNNING", "mc_percent": 51}})
+    await until(lambda: harness.store.outbox_count() == 0)
+    assert len(harness.notifier.sent) == sent
+
+
 async def test_disconnect_does_not_announce_events(harness):
     """UNKNOWN on a drop is not a state change for the event detector (phase 1 logic)."""
     service = await harness.start()
@@ -1058,6 +1090,24 @@ async def test_slice_job_happy_path_stores_result_and_enqueues_summary(tmp_path)
     assert notifier.sent[0]["files"] == [("plate-1.png", PNG)]
     assert store.outbox_count() == 0
     assert not any((tmp_path / "outbox-files").glob("*"))  # the picture goes once it is sent
+    store.close()
+
+
+async def test_slice_job_records_the_sliced_file_sha256(tmp_path):
+    """The agent's sha256 goes into result_json: pre-flight compares the fetched file with it."""
+    sha = "ab" * 32
+    service, store, _ = job_service(tmp_path, FakeSlicer(replace(ok(), sha256=sha)))
+    add_spool(store)
+    job = await service.slice_job(add_job(store, service._settings).id)
+    assert json.loads(job.result_json)["file_sha256"] == sha
+    store.close()
+
+
+async def test_slice_job_from_an_older_agent_records_no_sha256(tmp_path):
+    service, store, _ = job_service(tmp_path, FakeSlicer(ok()))
+    add_spool(store)
+    job = await service.slice_job(add_job(store, service._settings).id)
+    assert json.loads(job.result_json)["file_sha256"] is None  # the print asks for a re-slice
     store.close()
 
 

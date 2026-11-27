@@ -1,7 +1,7 @@
 """Clients for slicing on the owner's PC: wake it through orchestra-gateway, then talk to slice-agent.
 
 slice-agent API (``slice_agent.app``): ``POST /slice`` (multipart ``file`` + ``job``),
-``GET /sliced/<file>/plate/<n>.png`` and ``GET /health``, bearer token on all but /health.
+``GET /sliced/<file>``, ``GET /sliced/<file>/plate/<n>.png`` and ``GET /health``, bearer token on all but /health.
 Outcome details are safe to show to the owner: they never carry a token or a server path
 (the agent redacts its own paths before answering).
 """
@@ -9,13 +9,17 @@ Outcome details are safe to show to the owner: they never carry a token or a ser
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import logging
 import math
+import os
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 import httpx
@@ -36,6 +40,9 @@ SLICE_TIMEOUT = httpx.Timeout(connect=10.0, read=420.0, write=120.0, pool=10.0)
 HEALTH_TIMEOUT = httpx.Timeout(3.0)
 WAKE_TIMEOUT = httpx.Timeout(10.0)
 PNG_TIMEOUT = httpx.Timeout(30.0)
+FILE_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+MAX_FILE_BYTES = 50 * 2**20
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _SLICED_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}" + re.escape(OUT_SUFFIX))
 # A path left in an agent detail: a drive letter, or two or more separated segments.
 # Placeholders such as <sliced> are not segments, so they survive.
@@ -75,6 +82,10 @@ def _json(data: bytes) -> object:
         return json.loads(data)
     except (ValueError, RecursionError):
         return None
+
+
+class FetchError(Exception):
+    """A sliced file could not be fetched. The message is English, safe to show: no token, no URL."""
 
 
 class WakeError(Exception):
@@ -183,6 +194,8 @@ class SliceRequest:
 class SliceOutcome:
     """``ok``: the file and its plates (``{"index", "minutes", "grams": {filament: g}}``).
 
+    ``sha256``: of the sliced file, None from an agent older than phase 3 (such a job is
+    sliced again before it is printed).
     ``busy``: another slice runs on the PC. ``failed``: the agent refused or the slice
     failed, ``detail`` says why. ``unreachable``: no answer (``detail`` is the error type).
     """
@@ -192,6 +205,7 @@ class SliceOutcome:
     plates: tuple[dict, ...] = ()
     slicer_version: str | None = None
     detail: str = ""
+    sha256: str | None = None
 
 
 def _cap(text: str) -> str:
@@ -290,9 +304,17 @@ class SliceClient:
         if plates is None:
             log.warning("slice-agent answered 200 with unusable plates")
             return SliceOutcome("failed", detail=UNEXPECTED)
+        sha256 = body.get("sha256")
+        if sha256 is not None and not (isinstance(sha256, str) and _SHA256_RE.fullmatch(sha256)):
+            log.warning("slice-agent answered 200 with a malformed sha256")
+            return SliceOutcome("failed", detail=UNEXPECTED)
         version = body.get("slicer_version")
         return SliceOutcome(
-            "ok", file=job.out_file, plates=plates, slicer_version=version if isinstance(version, str) else None
+            "ok",
+            file=job.out_file,
+            plates=plates,
+            slicer_version=version if isinstance(version, str) else None,
+            sha256=sha256,
         )
 
     async def fetch_png(self, name: str, plate: int) -> bytes | None:
@@ -314,3 +336,43 @@ class SliceClient:
             log.warning("slice-agent plate picture failed: %s", type(exc).__name__)
             return None
         return data if data.startswith(PNG_MAGIC) else None
+
+    async def fetch_file(self, name: str, dest: Path, max_bytes: int = MAX_FILE_BYTES) -> str:
+        """Stream the sliced file ``name`` to ``dest`` and return its sha256 (lower-case hex).
+
+        Never holds the whole body: chunks go to a temporary file next to ``dest``, renamed
+        over it once complete. ``FetchError`` past ``max_bytes`` or on any failure, and then
+        nothing is left at ``dest`` or beside it.
+        """
+        if not _SLICED_RE.fullmatch(name):
+            raise FetchError("not a sliced file name")
+        tmp = dest.with_name(f".{dest.name}.part")
+        digest = hashlib.sha256()
+        try:
+            async with self._http.stream(
+                "GET", f"{self._url}/sliced/{name}", headers=_bearer(self._token), timeout=FILE_TIMEOUT
+            ) as resp:
+                if resp.status_code != 200:
+                    raise FetchError(f"slice-agent answered HTTP {resp.status_code} for the sliced file")
+                declared = resp.headers.get("content-length", "")
+                if declared.isdigit() and int(declared) > max_bytes:
+                    raise FetchError(f"the sliced file is over {max_bytes} bytes")
+                size = 0
+                with tmp.open("wb") as f:
+                    async for chunk in resp.aiter_bytes():
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise FetchError(f"the sliced file is over {max_bytes} bytes")
+                        digest.update(chunk)
+                        f.write(chunk)
+            os.replace(tmp, dest)
+        except httpx.HTTPError as exc:
+            log.warning("slice-agent sliced file fetch failed: %s", type(exc).__name__)
+            raise FetchError(f"the sliced file could not be fetched ({type(exc).__name__})") from None
+        except OSError as exc:
+            log.warning("writing the sliced file failed: %s", type(exc).__name__)
+            raise FetchError(f"the sliced file could not be written ({type(exc).__name__})") from None
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+        return digest.hexdigest()

@@ -599,10 +599,15 @@ class Service:
     def _handle_status(self, status: LinkStatus) -> None:
         self._link_status = status
         self._state_fresh = False  # CONNECTED included: wait for the printer's next report
-        if status is not LinkStatus.CONNECTED and self._state.gcode_state != "UNKNOWN":
+        if status is not LinkStatus.CONNECTED:
             # The printer may change unseen while the link is down. The event detector
             # compares an UNKNOWN state with the last known one, so this announces nothing.
-            self._state = replace(self._state, gcode_state="UNKNOWN", raw_unknown_state=None)
+            # Pre-flight trusts the USB stick only from a report since the next CONNECTED, so
+            # it is forgotten too. The task id stays: the detector compares job identities,
+            # and a first report without it would announce the running job again.
+            forget = {"gcode_state": "UNKNOWN", "raw_unknown_state": None, "sdcard": None}
+            if any(getattr(self._state, key) != value for key, value in forget.items()):
+                self._state = replace(self._state, **forget)
         if status is LinkStatus.AUTH_FAILED and not self._auth_alerted:
             self._auth_alerted = True
             at = self._clock().astimezone(UTC)
@@ -1004,6 +1009,7 @@ class Service:
             "named_set": plan.named_set,
             "filament": plan.filament,
             "slicer_version": outcome.slicer_version,
+            "file_sha256": outcome.sha256,  # None from an older agent: the print asks for a re-slice
             "sliced_at": now.astimezone(UTC).isoformat(),
         }
         key = _job_key(job.id, "sliced")

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import zipfile
 from pathlib import Path
@@ -9,6 +10,7 @@ from bambu_mcp.names import slug
 from bambu_mcp.slicer import (
     MAX_JSON_BYTES,
     MAX_PNG_BYTES,
+    FetchError,
     GatewayWaker,
     SliceClient,
     SliceOutcome,
@@ -212,19 +214,26 @@ def request(**changes) -> SliceRequest:
 
 async def test_slice_client_against_the_agent(tmp_path):
     studio = FakeStudio()
-    app = create_app(make_cfg(tmp_path), slicer=studio, pc_agent=no_pc_agent())
+    cfg = make_cfg(tmp_path)
+    app = create_app(cfg, slicer=studio, pc_agent=no_pc_agent())
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app)) as http:
         client = SliceClient(AGENT, TOKEN, http)
         assert await client.health() is True
         outcome = await client.slice(request(), UPLOAD)
+        sliced = (cfg.sliced_dir / "lamp-arm-7-p1.gcode.3mf").read_bytes()
         assert outcome == SliceOutcome(
             "ok",
             file="lamp-arm-7-p1.gcode.3mf",
             plates=({"index": 1, "minutes": 10.0, "grams": {"1": 1.5}},),  # keyed by filament id
             slicer_version="02.08.02.61",
+            sha256=hashlib.sha256(sliced).hexdigest(),
         )
         assert await client.fetch_png(outcome.file, 1) == PNG + b"\x01"
         assert await client.fetch_png(outcome.file, 2) is None
+        dest = tmp_path / "cache" / outcome.file
+        dest.parent.mkdir()
+        assert await client.fetch_file(outcome.file, dest) == outcome.sha256
+        assert dest.read_bytes() == sliced
     call = studio.calls[0]
     assert call["out_name"] == "lamp-arm-7-p1" and call["upload"] == UPLOAD
     assert call["nozzle"] == "0.4" and call["process_set"] == "standard"
@@ -344,12 +353,24 @@ async def test_slice_failure_detail_is_capped():
         {**OK_BODY, "plates": [{"index": 1, "minutes": -1, "grams": {}}]},
         {**OK_BODY, "plates": [{"index": 1, "minutes": 1, "grams": {"PETG": "a lot"}}]},
         {**OK_BODY, "plates": [{"index": 1, "minutes": 1, "grams": []}]},
+        {**OK_BODY, "sha256": "not-a-hash"},
+        {**OK_BODY, "sha256": "A" * 64},  # the agent sends lower-case hex
+        {**OK_BODY, "sha256": 12},
     ],
 )
 async def test_slice_unexpected_ok_body_is_a_failure(body):
     outcome = await Agent(httpx.Response(200, json=body)).client().slice(request(), UPLOAD)
     assert outcome.status == "failed"
     assert outcome.detail == "slice-agent answered with an unexpected result"
+
+
+async def test_ok_body_carries_the_sha256_and_an_older_agent_none():
+    sha = "ab" * 32
+    outcome = await Agent(httpx.Response(200, json={**OK_BODY, "sha256": sha})).client().slice(request(), UPLOAD)
+    assert outcome.status == "ok" and outcome.sha256 == sha
+    # An agent from before phase 3 sends no sha256: the slice is fine, the print asks for a re-slice.
+    outcome = await Agent(httpx.Response(200, json=OK_BODY)).client().slice(request(), UPLOAD)
+    assert outcome.status == "ok" and outcome.sha256 is None
 
 
 async def test_health_false_when_unreachable_or_not_ok():
@@ -423,3 +444,69 @@ async def test_png_over_the_cap_is_none():
     exact = PNG + b"\0" * (MAX_PNG_BYTES - len(PNG))
     agent = Agent(httpx.Response(200, content=exact, headers={"content-type": "image/png"}))
     assert await agent.client().fetch_png("lamp-arm-7-p1.gcode.3mf", 1) == exact
+
+
+# -- fetch_file ----------------------------------------------------------------------
+
+
+async def test_fetch_file_streams_and_caps(tmp_path):
+    chunk = b"z" * (64 * 1024)
+    chunks_read = []
+
+    def streamed(count: int):
+        async def stream():
+            for _ in range(count):
+                chunks_read.append(1)
+                yield chunk
+        return stream()
+
+    agent = Agent(httpx.Response(200, content=streamed(4)))
+    dest = tmp_path / "lamp-arm-7-p1.gcode.3mf"
+    sha = await agent.client().fetch_file("lamp-arm-7-p1.gcode.3mf", dest)
+    assert sha == hashlib.sha256(chunk * 4).hexdigest()
+    assert dest.read_bytes() == chunk * 4
+    req = agent.requests[0]
+    assert str(req.url) == f"{AGENT}/sliced/lamp-arm-7-p1.gcode.3mf"
+    assert req.headers["authorization"] == f"Bearer {TOKEN}"
+
+    chunks_read.clear()
+    over = tmp_path / "over.gcode.3mf"
+    agent = Agent(httpx.Response(200, content=streamed(100)))
+    with pytest.raises(FetchError, match="over"):
+        await agent.client().fetch_file("lamp-arm-7-p1.gcode.3mf", over, max_bytes=3 * len(chunk))
+    assert len(chunks_read) < 100  # stopped reading at the cap, never the whole body
+    assert not over.exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == [dest.name]  # no partial file left
+
+    exact = tmp_path / "exact.gcode.3mf"
+    agent = Agent(httpx.Response(200, content=streamed(3)))
+    await agent.client().fetch_file("lamp-arm-7-p1.gcode.3mf", exact, max_bytes=3 * len(chunk))
+    assert exact.stat().st_size == 3 * len(chunk)
+
+
+async def test_fetch_file_declared_length_over_the_cap_reads_nothing(tmp_path):
+    agent = Agent(httpx.Response(200, content=b"x" * 100))
+    with pytest.raises(FetchError, match="over"):
+        await agent.client().fetch_file("lamp-arm-7-p1.gcode.3mf", tmp_path / "f.gcode.3mf", max_bytes=99)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [httpx.Response(404, json={"error": "not_found"}), httpx.Response(401), httpx.ConnectError("down"),
+     httpx.ReadTimeout("slow")],
+)
+async def test_fetch_file_failure_raises_and_leaves_nothing(tmp_path, response):
+    dest = tmp_path / "lamp-arm-7-p1.gcode.3mf"
+    with pytest.raises(FetchError) as info:
+        await Agent(response).client().fetch_file("lamp-arm-7-p1.gcode.3mf", dest)
+    assert TOKEN not in str(info.value) and AGENT not in str(info.value)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("name", ["../secret.gcode.3mf", "a/b.gcode.3mf", "lamp-arm.3mf", ""])
+async def test_fetch_file_refuses_odd_names_without_a_request(tmp_path, name):
+    agent = Agent(httpx.Response(200, content=b"x"))
+    with pytest.raises(FetchError):
+        await agent.client().fetch_file(name, tmp_path / "f.gcode.3mf")
+    assert agent.requests == []

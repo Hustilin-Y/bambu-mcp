@@ -57,6 +57,7 @@ def test_read_output_time_and_grams(tmp_path):
     assert p.minutes == pytest.approx(2315 / 60)
     assert p.grams_by_filament == {"1": pytest.approx(5.31)}
     assert p.png == PNG
+    assert p.filament_types == ("PETG",)
     check_output(res, "0.4")  # the CLI leaves printer_model_id empty: must not be rejected
 
 
