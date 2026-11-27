@@ -41,9 +41,11 @@ BAMBU_HOST=<printer IP>
 CLIENT_TOKEN_PC=<random token for Claude Code on the PC>
 CLIENT_TOKEN_ASSISTANT=<random token for the multiclaude assistant>
 # NOTIFY_TOKEN=<from `assistant service key bambu`, step 5>
+# GATEWAY_KEY=<orchestra-gateway key of bambu-service, step 7>
+# SLICE_AGENT_TOKEN=<the PC's SLICE_AGENT_TOKEN, step 7>
 ```
 
-`BAMBU_ACCESS_CODE`, `BAMBU_SERIAL` and `BAMBU_HOST` are required: without any of them the service refuses to start, and the error names the missing variable (never a value). Each `CLIENT_TOKEN_<NAME>` defines one MCP client (the name is only used in logs). Without any, the MCP server does not start. Generate a token with `openssl rand -hex 32`.
+`BAMBU_ACCESS_CODE`, `BAMBU_SERIAL` and `BAMBU_HOST` are required: without any of them the service refuses to start, and the error names the missing variable (never a value). Each `CLIENT_TOKEN_<NAME>` defines one MCP client (the name is only used in logs). Without any, the MCP server does not start. The same tokens authorise `POST /jobs` (`bambu-mcp upload`, step 7). Generate a token with `openssl rand -hex 32`. `GATEWAY_KEY` and `SLICE_AGENT_TOKEN` are optional: without them the service runs and only slicing is off (step 7).
 
 ## 3. Settings: `/srv/bambu/config.toml`
 
@@ -56,7 +58,7 @@ ca_file = "/srv/bambu/data/bambu.cert"
 notify_url = "http://127.0.0.1:8790"   # only once step 5 is done
 ```
 
-`data_dir` must be absolute: the default is relative to the app dir. Every other key (`listen`, `camera_backend`, `heatup_kwh`, `timezone`, `[power_w]`) has a default, see `config.example.toml`. Unknown keys fail the start. A `[power_w]` table must keep a `PLA` entry: it is the fallback for materials without their own.
+`data_dir` must be absolute: the default is relative to the app dir. Every other key (`listen`, `camera_backend`, `heatup_kwh`, `timezone`, `[power_w]`, and the phase 2 keys `jobs_root_allowed`, `gateway_url`, `slice_agent_url`, `service_url` described in step 7) has a default, see `config.example.toml`. Unknown keys fail the start. A `[power_w]` table must keep a `PLA` entry: it is the fallback for materials without their own.
 
 ### CA bundle
 
@@ -123,6 +125,84 @@ Token hygiene, the owner types these commands:
 
 - The token ends up in the shell history and in `ps` argv while the command runs. In bash start the line with a space (needs `HISTCONTROL=ignorespace`) or run `set +o history` first. In PowerShell run `Clear-History` afterwards and remove the line from the PSReadLine history file (`(Get-PSReadLineOption).HistorySavePath`).
 - `claude mcp add` stores the token in plaintext in `~/.claude.json`. Keep that file private.
+
+## 7. Phase 2: jobs, slicing and spools
+
+Phase 2 takes print jobs from CAD Workshop, slices them on the PC through slice-agent (deploy/slice-agent/README.md) and books the predicted grams. Every part is optional: without the slicing keys the service runs and jobs can still be created, but `slice_job` fails with "slice-agent is not configured".
+
+### Jobs in
+
+Two ways, both owner only (the `CLIENT_TOKEN_<NAME>` tokens of step 2). The service copies the manifest and its 3MF into `data_dir/jobs/<job id>/`.
+
+- MCP `create_job(manifest_path)` reads a manifest on workshop itself. Off by default. Turn it on with `jobs_root_allowed`, an absolute path (a relative one fails the start). On workshop set it to the cad-workshop folder that holds the print-ready output, so multiclaude's `create_job` works. The manifest and its 3MF must both resolve inside it, links included, and `shiba-srv` must be able to read them.
+
+  ```toml
+  jobs_root_allowed = "/<cad-workshop checkout on workshop>"
+  ```
+
+- `bambu-mcp upload` sends a manifest and the 3MF next to it from the PC (`POST /jobs`, 3MF up to 20 MB) and prints the new job id. The token comes only from the environment variable named by `--token-env` (default `BAMBU_MCP_TOKEN`), never from argv. Use the value of `CLIENT_TOKEN_PC`. In PowerShell, typed at a hidden prompt:
+
+  ```
+  [Environment]::SetEnvironmentVariable("BAMBU_MCP_TOKEN", [Net.NetworkCredential]::new("", (Read-Host -AsSecureString "token")).Password, "User")
+  ```
+
+  Then, in a new shell, from the repo root:
+
+  ```
+  uv run bambu-mcp upload <path>\<name>.print.json --url http://192.168.88.11:8765 --token-env BAMBU_MCP_TOKEN
+  ```
+
+  `--url` can come from `service_url` instead: put `service_url = "http://192.168.88.11:8765"` in a small TOML file on the PC and point the `BAMBU_CONFIG` environment variable at it. The file is read with the service's own loader, so only service keys are allowed in it.
+
+### Slicing: workshop side
+
+`config.toml`:
+
+```toml
+gateway_url = "http://192.168.88.11:<gateway port>"   # [server] host and port of gateway.toml
+slice_agent_url = "http://<PC address>:11436"
+```
+
+`.env`: `SLICE_AGENT_TOKEN` (the same value as the PC's user variable, deploy/slice-agent/README.md, "Tokens") and `GATEWAY_KEY`. Without `slice_agent_url` and `SLICE_AGENT_TOKEN` nothing is sliced. Without `gateway_url` and `GATEWAY_KEY` the PC is not woken: slicing works only while it is awake. The log says which at start.
+
+The gateway key. orchestra-gateway keeps people's and programs' keys as SHA-256 hashes in `/srv/orchestra/keys.toml` (not in `gateway.toml`), made with its `new-key` command (check the gateway's README if this changed):
+
+```
+G="/srv/orchestra/app/gateway/.venv/bin/orchestra-gateway --config /srv/orchestra/gateway.toml"
+$G new-key bambu-service --aliases none --out /srv/orchestra/keys/bambu-service.key
+sudo systemctl restart orchestra-gateway
+printf 'GATEWAY_KEY=%s\n' "$(cat /srv/orchestra/keys/bambu-service.key)" >> /srv/bambu/.env
+rm /srv/orchestra/keys/bambu-service.key
+sudo systemctl restart bambu-service
+```
+
+`--aliases none` names no real alias: the key can call `/wake` and `/status` but routes no model requests. `printf` is a shell builtin, so the key never shows in `ps`.
+
+How a slice runs: the service sends `POST /wake` to the gateway with `GATEWAY_KEY`, polls slice-agent's `/health` for up to 120 s, then posts the job. One slice at a time: on 409 `busy` it waits 30 s and tries once more. The agent's CLI timeout is 300 s.
+
+- The PC needs only the `standard` process set: the service always asks for it, and a named set from the conversation travels as overrides of the whitelisted settings.
+- The filament preset sent is the `filament_preset` of the spool in the chosen AMS slot. It must be one of the agent's `filaments`, or the slice is refused.
+- The sliced summary goes to Telegram with the first plate's picture (fetched from the agent). A summary longer than a photo caption (1024 characters) is sent as a separate message right after the picture. The picture waits in `data_dir/outbox-files/` until its message is sent or dropped.
+- The owner prints the sliced file from Bambu Studio on the PC, under the agent's name for it.
+
+### Booking a sliced print
+
+A print whose file name matches a sliced job (`<name>-<job id>-p1` or `-kit`, as Studio reports it) books that job's predicted grams to the spool chosen at slicing, **without asking** the spool question. A failed or cancelled one keeps the printed share of the grams when the printer reported a percentage, and otherwise refunds the booking and asks the usual phase 1 question. A print under any other name is handled as in phase 1.
+
+### Spools and `load_spool`
+
+Spool records have three new fields for `load_spool`: `tray_info_idx`, `nozzle_temp_min` and `nozzle_temp_max`. Copy them from the `slice-agent flatten` output on the PC (one line per filament preset) with `add_spool` or `update_spool`. `update_spool` can set or change them but **cannot clear** them.
+
+`load_spool(spool_id, ams, slot)` sets the AMS slot's material, colour and nozzle range on the printer and maps the spool to the slot. It is the only printer write: the link now sends exactly one kind of write, `ams_filament_setting`, besides the phase 1 `get_version` and `pushall` requests. It refuses, sending nothing, unless all of these hold:
+
+- the printer is connected and has sent a fresh report since it (re)connected,
+- the printer is idle (`IDLE`, `FINISH` or `FAILED`),
+- `ams` and `slot` are 0..3 and that AMS unit is in the last report,
+- the spool is active and has `material` (an AMS type), `color_hex` (`#RRGGBB`), `tray_info_idx`, `nozzle_temp_min` and `nozzle_temp_max`.
+
+It sends once and does not retry: check the slot on the printer screen. Nothing checks that the spool's material belongs to the `tray_info_idx` filament family, so a wrong id sets the wrong filament profile on the printer.
+
+Checked live on 2026-11-24 (plan Task 10, Step 6): `ams_id` is the AMS unit and `tray_id` the slot within it (slot 2 of AMS 0 is `tray_id` 1), the printer takes the type, colour and nozzle range, and the next report shows them while the other slots stay as they were. `PLA-S` is not checked yet.
 
 ## Checks after deploy
 

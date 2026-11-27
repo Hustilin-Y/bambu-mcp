@@ -10,10 +10,18 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from bambu_mcp.store.models import OutboxRow, Plate, PrintRow, Spool, Tariff
+from bambu_mcp.store.models import (
+    JOB_STATUSES,
+    Job,
+    OutboxRow,
+    Plate,
+    PrintRow,
+    Spool,
+    Tariff,
+)
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 7
 # schema.sql is the version-1 schema; each later version is one migration script.
 _MIGRATIONS = {
     2: "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
@@ -31,6 +39,31 @@ _MIGRATIONS = {
     "    attempts INTEGER NOT NULL DEFAULT 0,\n"
     "    next_attempt_at REAL NOT NULL\n"
     ");",
+    # Print jobs from CAD Workshop manifests. Their files live in data_dir/jobs/<id>/.
+    4: "CREATE TABLE jobs (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    name TEXT NOT NULL,\n"
+    "    kind TEXT NOT NULL CHECK (kind IN ('part', 'kit')),\n"
+    "    manifest_json TEXT NOT NULL,\n"
+    "    file_sha256 TEXT NOT NULL,\n"
+    "    created_at TEXT NOT NULL,\n"
+    "    status TEXT NOT NULL DEFAULT 'new'"
+    " CHECK (status IN ('new', 'slicing', 'sliced', 'slice_failed')),\n"
+    "    settings_json TEXT,\n"
+    "    result_json TEXT,\n"
+    "    sliced_file TEXT,\n"
+    "    error TEXT\n"
+    ");\n"
+    "CREATE INDEX jobs_name ON jobs (name);",
+    # The sliced job a print was matched to by its file name, and the plate printed.
+    5: "ALTER TABLE prints ADD COLUMN job_id INTEGER REFERENCES jobs(id);\n"
+    "ALTER TABLE prints ADD COLUMN plate INTEGER;",
+    # What load_spool sends to the AMS: the preset's filament_id and nozzle range.
+    6: "ALTER TABLE spools ADD COLUMN tray_info_idx TEXT;\n"
+    "ALTER TABLE spools ADD COLUMN nozzle_temp_min INTEGER;\n"
+    "ALTER TABLE spools ADD COLUMN nozzle_temp_max INTEGER;",
+    # The AMS slot the owner chose for a job (1..16 as the owner counts), NULL: by material.
+    7: "ALTER TABLE jobs ADD COLUMN slot INTEGER CHECK (slot BETWEEN 1 AND 16);",
 }
 _SEEN_TTL_S = 30 * 24 * 3600
 _DEFAULT_TARIFF = (date(2024, 6, 1), 4.32, None)
@@ -46,9 +79,15 @@ _SPOOL_FIELDS = frozenset(
         "net_g",
         "remaining_g",
         "active",
+        "tray_info_idx",
+        "nozzle_temp_min",
+        "nozzle_temp_max",
     }
 )
-_PRINT_FIELDS = frozenset({"spool_id", "grams", "kwh", "cost_filament_uah", "cost_power_uah", "fit"})
+_PRINT_FIELDS = frozenset(
+    {"spool_id", "grams", "kwh", "cost_filament_uah", "cost_power_uah", "fit", "source", "job_id", "plate"}
+)
+_JOB_FIELDS = frozenset({"status", "settings_json", "result_json", "sliced_file", "error", "slot"})
 
 
 def _norm(identity: tuple) -> tuple[str, str, str]:
@@ -68,6 +107,9 @@ def _spool(row: sqlite3.Row) -> Spool:
         net_g=row["net_g"],
         remaining_g=row["remaining_g"],
         active=bool(row["active"]),
+        tray_info_idx=row["tray_info_idx"],
+        nozzle_temp_min=row["nozzle_temp_min"],
+        nozzle_temp_max=row["nozzle_temp_max"],
     )
 
 
@@ -89,6 +131,25 @@ def _print(row: sqlite3.Row) -> PrintRow:
         fit=row["fit"],
         deducted_spool_id=row["deducted_spool_id"],
         deducted_g=row["deducted_g"],
+        job_id=row["job_id"],
+        plate=row["plate"],
+    )
+
+
+def _job(row: sqlite3.Row) -> Job:
+    return Job(
+        id=row["id"],
+        name=row["name"],
+        kind=row["kind"],
+        manifest_json=row["manifest_json"],
+        file_sha256=row["file_sha256"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        status=row["status"],
+        settings_json=row["settings_json"],
+        result_json=row["result_json"],
+        sliced_file=row["sliced_file"],
+        error=row["error"],
+        slot=row["slot"],
     )
 
 
@@ -217,12 +278,29 @@ class Store:
         filament_preset: str | None,
         price_uah: float,
         net_g: float,
+        *,
+        tray_info_idx: str | None = None,
+        nozzle_temp_min: int | None = None,
+        nozzle_temp_max: int | None = None,
     ) -> int:
         with self._tx() as conn:
             cur = conn.execute(
                 "INSERT INTO spools (brand, material, color_name, color_hex, filament_preset,"
-                " price_uah, net_g, remaining_g) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (brand, material, color_name, color_hex, filament_preset, price_uah, net_g, net_g),
+                " price_uah, net_g, remaining_g, tray_info_idx, nozzle_temp_min, nozzle_temp_max)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    brand,
+                    material,
+                    color_name,
+                    color_hex,
+                    filament_preset,
+                    price_uah,
+                    net_g,
+                    net_g,
+                    tray_info_idx,
+                    nozzle_temp_min,
+                    nozzle_temp_max,
+                ),
             )
             return int(cur.lastrowid)
 
@@ -495,5 +573,71 @@ class Store:
         with self._tx() as conn:
             conn.execute("DELETE FROM outbox WHERE id = ?", (id,))
 
+    def outbox_dedupes(self) -> set[str]:
+        """Dedupe keys of every waiting message."""
+        return {r["dedupe"] for r in self._conn().execute("SELECT dedupe FROM outbox")}
+
     def outbox_count(self) -> int:
         return int(self._conn().execute("SELECT COUNT(*) FROM outbox").fetchone()[0])
+
+    # -- jobs ------------------------------------------------------------
+
+    def add_job(
+        self, name: str, kind: str, manifest_json: str, file_sha256: str, created_at: datetime
+    ) -> int:
+        """A new job in status ``new``. Its files are handled by ``bambu_mcp.jobs``."""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO jobs (name, kind, manifest_json, file_sha256, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (name, kind, manifest_json, file_sha256, created_at.isoformat()),
+            )
+            return int(cur.lastrowid)
+
+    def job(self, id: int) -> Job | None:
+        row = self._conn().execute("SELECT * FROM jobs WHERE id = ?", (id,)).fetchone()
+        return _job(row) if row else None
+
+    def jobs(self, limit: int) -> list[Job]:
+        """Newest first."""
+        rows = self._conn().execute("SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,))
+        return [_job(r) for r in rows]
+
+    def jobs_with_status(self, status: str) -> list[Job]:
+        """Oldest first."""
+        rows = self._conn().execute("SELECT * FROM jobs WHERE status = ? ORDER BY id", (status,))
+        return [_job(r) for r in rows]
+
+    @staticmethod
+    def _job_assignments(fields: dict[str, Any]) -> str:
+        unknown = set(fields) - _JOB_FIELDS
+        if unknown:
+            raise ValueError(f"unknown job fields: {sorted(unknown)}")
+        if "status" in fields and fields["status"] not in JOB_STATUSES:
+            raise ValueError(f"job status must be one of {', '.join(JOB_STATUSES)}")
+        return ", ".join(f"{name} = ?" for name in fields)
+
+    def update_job(self, id: int, **fields: Any) -> None:
+        assignments = self._job_assignments(fields)
+        if not fields:
+            return
+        with self._tx() as conn:
+            cur = conn.execute(f"UPDATE jobs SET {assignments} WHERE id = ?", (*fields.values(), id))
+            if cur.rowcount == 0:
+                raise KeyError(f"no job {id}")
+
+    def transition_job(self, id: int, from_statuses: tuple[str, ...], **fields: Any) -> bool:
+        """Update the job only while its status is one of ``from_statuses``, in one statement.
+
+        False when the job is in another status (or does not exist): nothing changed.
+        """
+        if not fields or not from_statuses:
+            raise ValueError("transition_job needs fields and from_statuses")
+        assignments = self._job_assignments(fields)
+        marks = ", ".join("?" for _ in from_statuses)
+        with self._tx() as conn:
+            cur = conn.execute(
+                f"UPDATE jobs SET {assignments} WHERE id = ? AND status IN ({marks})",
+                (*fields.values(), id, *from_statuses),
+            )
+            return cur.rowcount == 1

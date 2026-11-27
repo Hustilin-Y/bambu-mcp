@@ -5,6 +5,11 @@ Every request needs ``Authorization: Bearer <token>`` matching one of the
 before the MCP app sees it and records the client name (never the token) for
 logs. No tool accepts or returns the access code, serial, host or any token.
 
+``POST /jobs`` (same middleware) takes a CAD Workshop manifest and its 3MF as
+multipart parts ``manifest`` and ``file`` and creates a job; see ``bambu_mcp.jobs``.
+The job tools propose and slice jobs through ``Service`` (the same code path as the
+Telegram buttons) and return file names only, never server paths.
+
 All tools are ``async`` on purpose: the SDK runs sync tools in worker threads,
 and the store keeps one SQLite connection per thread.
 """
@@ -15,10 +20,13 @@ import asyncio
 import contextlib
 import functools
 import hmac
+import json
 import logging
+import re
 import socket
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import date
+from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -27,25 +35,72 @@ from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import ToolAnnotations
+from python_multipart.multipart import parse_options_header
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from bambu_mcp import camera as camera_module
 from bambu_mcp.config import Secrets, Settings
+from bambu_mcp.jobs import (
+    MAX_FILE_BYTES,
+    JobBusy,
+    JobError,
+    JobTooLarge,
+    JobUpload,
+    SliceStart,
+    create_job_from_bytes,
+    create_job_from_path,
+    incoming_dir,
+)
 from bambu_mcp.journal import FIT_VALUES, rebook_grams
+from bambu_mcp.manifest import INFILL_PATTERNS, MAX_MANIFEST_BYTES, ManifestError, parse_manifest
 from bambu_mcp.printer.hms import hms_code, severity
-from bambu_mcp.printer.link import LinkStatus
+from bambu_mcp.printer.link import (
+    AMS_SLOTS,
+    AMS_UNITS,
+    NOZZLE_TEMP_RANGE,
+    TRAY_INFO_IDX_RE,
+    TRAY_TYPES,
+    LinkStatus,
+    PrinterNotConnected,
+)
 from bambu_mcp.printer.state import PrinterState
+from bambu_mcp.proposal import MAX_SLOT_NUMBER, NAMED_SETS, slot_number
 from bambu_mcp.store.db import Store
-from bambu_mcp.store.models import Plate, PrintRow, Spool, Tariff
+from bambu_mcp.store.models import Job, Plate, PrintRow, Spool, Tariff
+from slice_agent.runner import (
+    BRIM_TYPES,
+    DENSITY_RANGE,
+    LAYER_HEIGHTS,
+    OVERRIDE_KEYS,
+    PLATE_TYPES,
+    SUPPORT_TYPES,
+    WALL_GENERATORS,
+    WALL_LOOPS_RANGE,
+    Overrides,
+)
 
 log = logging.getLogger(__name__)
 
 MCP_PATH = "/mcp"
+JOBS_PATH = "/jobs"
+_BODY_SLACK = 64 * 1024  # multipart boundaries and part headers
 SERVER_NAME = "bambu-mcp"
 GRACEFUL_SHUTDOWN_S = 5
 HISTORY_MAX = 200
+JOBS_MAX = 50
+SET_KEY = "set"  # slice_job settings: the named set to start from
+PATH_INTAKE_OFF = "path intake is off: upload with `bambu-mcp upload`"
+# gcode_state values (phase 1 names) in which the AMS may be reconfigured.
+LOADABLE_STATES = ("IDLE", "FINISH", "FAILED")
+_SPOOL_HEX_RE = re.compile(r"#[0-9A-Fa-f]{6}", re.ASCII)  # a spool's color_hex, exactly
+LOAD_SPOOL_NOTE = (
+    "Sent once, not retried. Check the AMS slot on the printer screen; "
+    "ams_status shows the printer's next report."
+)
 
 READ = ToolAnnotations(read_only_hint=True)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False)
@@ -61,6 +116,29 @@ class StatusSource(Protocol):
 
     @property
     def link_status(self) -> LinkStatus: ...
+
+    @property
+    def state_fresh(self) -> bool: ...
+
+    async def propose(self, job_id: int, slot: int | None = None) -> str: ...
+
+    def start_slice(
+        self, job_id: int, explicit: Mapping | None = None, *, named_set: str = ..., slot: int | None = None
+    ) -> SliceStart: ...
+
+    def set_tray(
+        self,
+        *,
+        ams: int,
+        slot: int,
+        tray_info_idx: str,
+        tray_type: str,
+        color_rgba: str,
+        nozzle_temp_min: int,
+        nozzle_temp_max: int,
+    ) -> dict: ...
+
+    def request_full_report(self) -> None: ...
 
 
 # -- auth ------------------------------------------------------------------------
@@ -131,6 +209,9 @@ def _spool(s: Spool) -> dict[str, Any]:
         "remaining_g": round(s.remaining_g, 1),
         "price_per_kg_uah": _money(s.price_per_kg_uah),
         "active": s.active,
+        "tray_info_idx": s.tray_info_idx,
+        "nozzle_temp_min": s.nozzle_temp_min,
+        "nozzle_temp_max": s.nozzle_temp_max,
     }
 
 
@@ -189,11 +270,258 @@ def _tool_errors() -> Iterator[None]:
         raise ToolError(str(exc)) from exc
 
 
+# -- jobs ----------------------------------------------------------------------------
+
+def _allowed_values(key: str, nozzle: str) -> str:
+    """What ``Overrides.parse`` accepts for ``key`` (one of ``OVERRIDE_KEYS``), for error messages."""
+    heights = ", ".join(f"{h:g}" for h in LAYER_HEIGHTS.get(nozzle, ()))
+    return {
+        "sparse_infill_density": "an integer {}..{} (percent)".format(*DENSITY_RANGE),
+        "sparse_infill_pattern": ", ".join(INFILL_PATTERNS),
+        "wall_loops": "an integer {}..{}".format(*WALL_LOOPS_RANGE),
+        "wall_generator": ", ".join(WALL_GENERATORS),
+        "enable_support": "true or false",
+        "support_type": ", ".join(SUPPORT_TYPES),
+        "brim_type": ", ".join(BRIM_TYPES),
+        "curr_bed_type": ", ".join(PLATE_TYPES),
+        "layer_height": heights or f"nothing for nozzle {nozzle}",
+    }[key]
+
+
+def explicit_settings(
+    settings: Mapping[str, Any] | None, nozzle: str
+) -> tuple[dict[str, object], str | None]:
+    """(explicit overrides, named set) from a ``slice_job`` request (ruling R6).
+
+    A named set (``{"set": "strong"}``) is expanded into explicit values and the other
+    keys go on top, so both outrank the part's last settings and its hints. Raises
+    ``ToolError`` naming the key and what it accepts.
+    """
+    raw = dict(settings or {})
+    named = raw.pop(SET_KEY, None)
+    if named is not None and (not isinstance(named, str) or named not in NAMED_SETS):
+        raise ToolError(f"{SET_KEY}: unknown named set {named!r}, allowed: {', '.join(NAMED_SETS)}")
+    explicit: dict[str, object] = {**(NAMED_SETS[named] if named else {}), **raw}
+    for key, value in explicit.items():
+        if key not in OVERRIDE_KEYS:
+            raise ToolError(f"{key}: unknown setting, allowed: {', '.join((SET_KEY, *OVERRIDE_KEYS))}")
+        try:
+            Overrides.parse({key: value}, nozzle)
+        except ValueError:
+            origin = "" if key in raw else f" (from set {named!r})"
+            raise ToolError(
+                f"{key}: {value!r}{origin} is not allowed for nozzle {nozzle}, "
+                f"allowed: {_allowed_values(key, nozzle)}"
+            ) from None
+    return explicit, named
+
+
+def _job_nozzle(job: Job) -> str:
+    try:
+        return f"{parse_manifest(json.loads(job.manifest_json)).nozzle_mm:g}"
+    except (ValueError, RecursionError, ManifestError):
+        raise ToolError(f"job {job.id} has an unreadable manifest") from None
+
+
+def _stored_nozzle(job: Job) -> str | None:
+    """The manifest's nozzle for a status report: None rather than an error when unreadable."""
+    try:
+        return _job_nozzle(job)
+    except ToolError:
+        return None
+
+
+def _loads(text: str | None) -> dict | None:
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _job_summary(job: Job, tz: ZoneInfo) -> dict[str, Any]:
+    return {
+        "job_id": job.id,
+        "name": job.name,
+        "kind": job.kind,
+        "status": job.status,
+        "created_at": job.created_at.astimezone(tz).isoformat(),
+        "sliced_file": job.sliced_file,
+    }
+
+
+def _spool_name(store: Store, spool_id: object) -> str | None:
+    if not isinstance(spool_id, int):
+        return None
+    spool = next((s for s in store.spools(active_only=False) if s.id == spool_id), None)
+    if spool is None:
+        return None
+    return " ".join(part for part in (spool.brand, spool.material, spool.color_name) if part)
+
+
+def _job_slot(store: Store, result: dict) -> dict[str, Any] | None:
+    slot = result.get("slot")
+    if not isinstance(slot, dict) or not all(isinstance(slot.get(k), int) for k in ("ams", "slot")):
+        return None
+    return {
+        "ams": slot["ams"],
+        "slot": slot["slot"],
+        "number": slot_number(slot["ams"], slot["slot"]),
+        "material": result.get("material") or slot.get("tray_type"),
+        "color": slot.get("color"),
+        "spool": _spool_name(store, slot.get("spool_id")),
+    }
+
+
+def _job_plates(result: dict) -> list[dict[str, Any]]:
+    costs = {c.get("index"): c for c in result.get("costs") or () if isinstance(c, dict)}
+    plates = []
+    for plate in result.get("plates") or ():
+        if not isinstance(plate, dict):
+            continue
+        cost = costs.get(plate.get("index"), {})
+        grams = plate.get("grams")
+        plates.append(
+            {
+                "index": plate.get("index"),
+                "minutes": plate.get("minutes"),
+                "grams": round(sum(grams.values()), 2) if isinstance(grams, dict) else None,
+                "cost_filament_uah": _money(cost.get("filament_uah")),
+                "cost_power_uah": _money(cost.get("power_uah")),
+                "cost_total_uah": _money(cost.get("total_uah")),
+            }
+        )
+    return plates
+
+
+def _job_status(store: Store, job: Job, tz: ZoneInfo) -> dict[str, Any]:
+    """The job for a client: file and spool names only, never a server path."""
+    result = _loads(job.result_json) or {}
+    return {
+        **_job_summary(job, tz),
+        "settings": _loads(job.settings_json),
+        "named_set": result.get("named_set"),
+        "slot": _job_slot(store, result),
+        "chosen_slot": job.slot,
+        "plate_type": result.get("plate_type"),
+        "nozzle": result.get("nozzle") or _stored_nozzle(job),
+        "plates": _job_plates(result),
+        "warning": _slot_warning(result),
+        "error": job.error,
+    }
+
+
+def _slot_warning(result: Mapping) -> str | None:
+    """The material mismatch the job was sliced with (``SlotChoice.warning``), if any."""
+    slot = result.get("slot")
+    warning = slot.get("warning") if isinstance(slot, dict) else None
+    return warning if isinstance(warning, str) and warning else None
+
+
+def _check_slot_number(slot: int | None) -> None:
+    """The owner's slot number range; whether it can be printed from is the service's check."""
+    if slot is not None and not 1 <= slot <= MAX_SLOT_NUMBER:
+        raise ToolError(f"slot must be 1..{MAX_SLOT_NUMBER}, got {slot}")
+
+
 def _spool_by_id(store: Store, spool_id: int) -> Spool:
     spool = next((s for s in store.spools(active_only=False) if s.id == spool_id), None)
     if spool is None:
         raise ToolError(f"no spool {spool_id}")
     return spool
+
+
+# -- load_spool ----------------------------------------------------------------------
+
+
+def _check_tray_metadata(
+    tray_info_idx: str | None, nozzle_temp_min: int | None, nozzle_temp_max: int | None
+) -> None:
+    """The spool's load_spool fields as they will be stored (None = not set)."""
+    if tray_info_idx is not None and not TRAY_INFO_IDX_RE.fullmatch(tray_info_idx):
+        raise ToolError(
+            "tray_info_idx must be the preset's filament_id: 3..8 upper-case letters or digits, e.g. GFA00"
+        )
+    low, high = NOZZLE_TEMP_RANGE
+    for name, temp in (("nozzle_temp_min", nozzle_temp_min), ("nozzle_temp_max", nozzle_temp_max)):
+        if temp is not None and not low <= temp <= high:
+            raise ToolError(f"{name} must be {low}..{high} °C")
+    if nozzle_temp_min is not None and nozzle_temp_max is not None and nozzle_temp_min > nozzle_temp_max:
+        raise ToolError(f"nozzle_temp_min {nozzle_temp_min} is above nozzle_temp_max {nozzle_temp_max}")
+
+
+def _check_color_hex(color_hex: str | None) -> None:
+    if color_hex is not None and not _SPOOL_HEX_RE.fullmatch(color_hex):
+        raise ToolError(f"color_hex must be #RRGGBB (6 hex digits), got {color_hex!r}")
+
+
+def _tray_color(color_hex: str) -> str | None:
+    """A spool's ``#RRGGBB`` as the AMS wants it: ``RRGGBBFF`` upper-case (always opaque)."""
+    return f"{color_hex[1:].upper()}FF" if _SPOOL_HEX_RE.fullmatch(color_hex) else None
+
+
+def _tray_fields(spool: Spool) -> dict[str, Any]:
+    """``set_tray`` keyword arguments from a spool, or ``ToolError`` naming what is missing."""
+    if not spool.active:
+        raise ToolError(f"spool {spool.id} is inactive (retired): reactivate it with update_spool first")
+    missing = [
+        name
+        for name, value in (
+            ("material", spool.material),
+            ("color_hex", spool.color_hex),
+            ("tray_info_idx", spool.tray_info_idx),
+            ("nozzle_temp_min", spool.nozzle_temp_min),
+            ("nozzle_temp_max", spool.nozzle_temp_max),
+        )
+        if value is None or (isinstance(value, str) and not value.strip())
+    ]
+    if missing:
+        raise ToolError(
+            f"spool {spool.id} lacks {', '.join(missing)}: set them with update_spool "
+            "(tray_info_idx and the nozzle range are printed by `slice-agent flatten`)"
+        )
+    tray_type = spool.material.strip().upper()
+    if tray_type not in TRAY_TYPES:
+        raise ToolError(
+            f"spool {spool.id} material {spool.material!r} is not an AMS type: {', '.join(TRAY_TYPES)}"
+        )
+    color = _tray_color(spool.color_hex)
+    if color is None:  # a row written before the spool tools checked colours
+        raise ToolError(
+            f"spool {spool.id} color_hex {spool.color_hex!r} is not #RRGGBB: fix it with update_spool"
+        )
+    return {
+        "tray_info_idx": spool.tray_info_idx,
+        "tray_type": tray_type,
+        "color_rgba": color,
+        "nozzle_temp_min": spool.nozzle_temp_min,
+        "nozzle_temp_max": spool.nozzle_temp_max,
+    }
+
+
+def _check_printer_ready(service: StatusSource, ams: int, slot: int) -> None:
+    if ams not in AMS_UNITS or slot not in AMS_SLOTS:
+        raise ToolError("ams and slot must each be 0..3")
+    link = service.link_status
+    if link is not LinkStatus.CONNECTED:
+        raise ToolError(f"the printer is not connected (link {link.value}), nothing was sent")
+    if not service.state_fresh:
+        raise ToolError(
+            "waiting for the printer's first report since it connected, try again in a few seconds; "
+            "nothing was sent"
+        )
+    state = service.state
+    if state.gcode_state not in LOADABLE_STATES:
+        raise ToolError(
+            f"the printer is {state.gcode_state}: load_spool works only when it is "
+            f"{', '.join(LOADABLE_STATES)}, nothing was sent"
+        )
+    units = sorted({t.ams for t in state.trays})
+    if ams not in units:
+        found = ", ".join(map(str, units)) or "none"
+        raise ToolError(f"no AMS unit {ams} in the printer's last report (units: {found}), nothing was sent")
 
 
 # -- app ---------------------------------------------------------------------------
@@ -282,12 +610,30 @@ def build_mcp(
         price_uah: float,
         net_g: float,
         filament_preset: str | None = None,
+        tray_info_idx: str | None = None,
+        nozzle_temp_min: int | None = None,
+        nozzle_temp_max: int | None = None,
     ) -> dict[str, Any]:
-        """Add a full spool (remaining = net_g). Price in UAH for the whole spool."""
+        """Add a full spool (remaining = net_g). Price in UAH for the whole spool.
+
+        tray_info_idx (the preset's filament_id) and nozzle_temp_min/max (°C) are what
+        load_spool sends to the AMS; `slice-agent flatten` prints them per filament preset.
+        """
         if net_g <= 0 or price_uah < 0:
             raise ToolError("net_g must be positive and price_uah non-negative")
+        _check_color_hex(color_hex)
+        _check_tray_metadata(tray_info_idx, nozzle_temp_min, nozzle_temp_max)
         spool_id = store.add_spool(
-            brand, material, color_name, color_hex, filament_preset, price_uah, net_g
+            brand,
+            material,
+            color_name,
+            color_hex,
+            filament_preset,
+            price_uah,
+            net_g,
+            tray_info_idx=tray_info_idx,
+            nozzle_temp_min=nozzle_temp_min,
+            nozzle_temp_max=nozzle_temp_max,
         )
         return _spool(_spool_by_id(store, spool_id))
 
@@ -302,8 +648,14 @@ def build_mcp(
         price_uah: float | None = None,
         net_g: float | None = None,
         active: bool | None = None,
+        tray_info_idx: str | None = None,
+        nozzle_temp_min: int | None = None,
+        nozzle_temp_max: int | None = None,
     ) -> dict[str, Any]:
-        """Change spool fields; omitted fields stay as they are. active=false retires a spool."""
+        """Change spool fields; omitted fields stay as they are. active=false retires a spool.
+
+        tray_info_idx and nozzle_temp_min/max: see add_spool (needed by load_spool).
+        """
         fields = {
             k: v
             for k, v in {
@@ -315,12 +667,21 @@ def build_mcp(
                 "price_uah": price_uah,
                 "net_g": net_g,
                 "active": active,
+                "tray_info_idx": tray_info_idx,
+                "nozzle_temp_min": nozzle_temp_min,
+                "nozzle_temp_max": nozzle_temp_max,
             }.items()
             if v is not None
         }
         if net_g is not None and net_g <= 0:
             raise ToolError("net_g must be positive")
-        _spool_by_id(store, spool_id)
+        current = _spool_by_id(store, spool_id)
+        _check_color_hex(color_hex)
+        _check_tray_metadata(  # the values as they will be stored, the other bound included
+            fields.get("tray_info_idx", current.tray_info_idx),
+            fields.get("nozzle_temp_min", current.nozzle_temp_min),
+            fields.get("nozzle_temp_max", current.nozzle_temp_max),
+        )
         with _tool_errors():
             store.update_spool(spool_id, **fields)
         return _spool(_spool_by_id(store, spool_id))
@@ -344,6 +705,38 @@ def build_mcp(
         store.map_slot(ams, slot, spool_id)
         spool = store.slot_spool(ams, slot)
         return {"ams": ams, "slot": slot, "spool": _spool(spool) if spool else None}
+
+    @mcp.tool(annotations=WRITE)
+    async def load_spool(spool_id: int, ams: int, slot: int) -> dict[str, Any]:
+        """Tell the printer which filament is in an AMS slot (material, colour, nozzle range)
+        and map the spool to that slot. The only tool that writes to the printer.
+
+        Needs an idle printer (IDLE, FINISH or FAILED), ams and slot 0..3 of a reported
+        AMS unit, and a spool with material, color_hex, tray_info_idx and nozzle_temp_min/max.
+        Sent once: check the printer screen afterwards.
+        """
+        spool = _spool_by_id(store, spool_id)
+        fields = _tray_fields(spool)
+        # Synchronous from here on: no await between the checks and the send.
+        _check_printer_ready(service, ams, slot)
+        try:
+            sent = service.set_tray(ams=ams, slot=slot, **fields)["print"]
+        except PrinterNotConnected as exc:
+            raise ToolError(str(exc)) from None
+        except ValueError as exc:
+            raise ToolError(f"refused before sending: {exc}") from None
+        store.map_slot(ams, slot, spool_id)
+        try:
+            service.request_full_report()
+        except PrinterNotConnected:
+            log.warning("load_spool sent, but the follow-up full report could not be requested")
+        return {
+            "sent": {k: v for k, v in sent.items() if k != "sequence_id"},
+            "ams": ams,
+            "slot": slot,
+            "spool": _spool(_spool_by_id(store, spool_id)),
+            "note": LOAD_SPOOL_NOTE,
+        }
 
     @mcp.tool(annotations=WRITE)
     async def add_plate(name: str, bed_type: str) -> dict[str, Any]:
@@ -397,6 +790,101 @@ def build_mcp(
         assert updated is not None
         return _print(updated, tz)
 
+    # -- jobs ------------------------------------------------------------------
+
+    def job_or_error(job_id: int) -> Job:
+        job = store.job(job_id)
+        if job is None:
+            raise ToolError(f"job {job_id} not found")
+        return job
+
+    @mcp.tool(annotations=WRITE)
+    async def create_job(manifest_path: str) -> dict[str, Any]:
+        """Create a print job from a CAD Workshop manifest, by its absolute path on the service machine.
+
+        Works only when the service allows a jobs root; otherwise upload with `bambu-mcp upload`.
+        """
+        root = settings.jobs_root_allowed
+        if root is None:
+            raise ToolError(PATH_INTAKE_OFF)
+        path = Path(manifest_path)
+        if not path.is_absolute():
+            raise ToolError("manifest_path must be an absolute path")
+        # Synchronous on the event loop on purpose (no await, no thread): intakes never interleave.
+        try:
+            job = create_job_from_path(store, settings, path, root)
+        except JobError as exc:
+            raise ToolError(str(exc)) from None
+        return {"job_id": job.id, "name": job.name, "kind": job.kind, "status": job.status}
+
+    @mcp.tool(annotations=WRITE)
+    async def propose_job(job_id: int, slot: int | None = None) -> dict[str, Any]:
+        """Send the job's proposal (settings, AMS slot, plate) to Telegram with slice, change and
+        slot buttons.
+
+        `slot` (1..16, AMS 1 is 1..4, AMS 2 is 5..8) is the owner's choice of AMS slot: pass it
+        only when the owner names one. It is stored with the job and used by later slices.
+        Without it the stored slot is used, else the slot whose material matches the part.
+        Returns the same text. Nothing is sliced or printed.
+        """
+        job_or_error(job_id)
+        _check_slot_number(slot)
+        try:
+            text = await service.propose(job_id, slot)
+        except JobBusy:
+            raise ToolError(f"job {job_id} is being sliced already") from None
+        except KeyError:
+            raise ToolError(f"job {job_id} not found") from None
+        except ValueError as exc:
+            raise ToolError(str(exc)) from None
+        return {"job_id": job_id, "text": text}
+
+    @mcp.tool(annotations=WRITE)
+    async def slice_job(
+        job_id: int, settings: dict[str, Any] | None = None, slot: int | None = None
+    ) -> dict[str, Any]:
+        """Start slicing a job on the owner's PC (woken if needed). Returns at once, never prints.
+
+        `settings`: {"set": "standard" | "strong" | "draft"} and/or overrides: sparse_infill_density
+        (0..100), sparse_infill_pattern, wall_loops (1..10), wall_generator, enable_support,
+        support_type, brim_type, curr_bed_type, layer_height. They win over the part's last
+        settings and its hints. `slot` (1..16) is the owner's choice of AMS slot: pass it only
+        when the owner names one. It is stored with the job. Without it the job's stored slot
+        is used, else the slot whose material matches the part. Follow it with job_status; the
+        summary also goes to Telegram. `warning` is the AMS slot warning (a material mismatch,
+        Russian) or null: tell the owner.
+        """
+        job = job_or_error(job_id)
+        explicit, named = explicit_settings(settings, _job_nozzle(job))
+        _check_slot_number(slot)
+        options: dict[str, Any] = {"named_set": named} if named else {}
+        if slot is not None:
+            options["slot"] = slot
+        try:
+            # The Telegram button's path: claimed now, sliced in a background task, so a
+            # cancelled tool call never interrupts the slice.
+            started = service.start_slice(job_id, explicit, **options)
+        except JobBusy:
+            raise ToolError(f"job {job_id} is being sliced already") from None
+        except KeyError:
+            raise ToolError(f"job {job_id} not found") from None
+        except ValueError as exc:
+            raise ToolError(str(exc)) from None
+        return {"job_id": job_id, "status": "slicing", "warning": started.warning}
+
+    @mcp.tool(annotations=READ)
+    async def job_status(job_id: int) -> dict[str, Any]:
+        """A job: status, settings, AMS slot it was sliced with, the owner's chosen slot (1..16 or
+        null: by material), plate type, nozzle, per-plate minutes, grams and cost (UAH), the
+        sliced file name, the slot warning (material mismatch) and the last error."""
+        return _job_status(store, job_or_error(job_id), tz)
+
+    @mcp.tool(annotations=READ)
+    async def jobs(limit: int = 10) -> dict[str, Any]:
+        """Print jobs, newest first (limit 1..50)."""
+        limit = max(1, min(limit, JOBS_MAX))
+        return {"jobs": [_job_summary(j, tz) for j in store.jobs(limit)]}
+
     return mcp
 
 
@@ -407,8 +895,9 @@ def build_app(
     settings: Settings,
     *,
     camera: Camera | None = None,
+    max_job_file_bytes: int = MAX_FILE_BYTES,
 ) -> Starlette:
-    """The MCP Streamable HTTP app at ``/mcp`` behind the bearer-token middleware."""
+    """The MCP Streamable HTTP app at ``/mcp`` and ``POST /jobs``, behind the bearer-token middleware."""
     if camera is None:
         # Fail fast when another snapshot is running instead of queueing behind it.
         camera = functools.partial(camera_module.snapshot, secrets, settings, wait=False)
@@ -419,8 +908,68 @@ def build_app(
         json_response=True,
         transport_security=_allowed(settings.listen),
     )
+    app.router.routes.append(
+        Route(JOBS_PATH, _jobs_endpoint(store, settings, max_job_file_bytes), methods=["POST"])
+    )
     app.add_middleware(BearerTokenMiddleware, tokens=secrets.client_tokens)
     return app
+
+
+# -- job upload ----------------------------------------------------------------------
+
+
+def _jobs_endpoint(
+    store: Store, settings: Settings, max_file: int
+) -> Callable[[Request], Awaitable[Response]]:
+    """``POST /jobs``: multipart ``manifest`` + ``file`` -> 201 ``{"job_id", ...}``.
+
+    The body is streamed: the declared length and a running total are checked
+    against the caps, and the 3MF goes to a temp file, never fully into memory
+    before the caps hold.
+    """
+    limit = max_file + MAX_MANIFEST_BYTES + _BODY_SLACK
+
+    def refuse(exc: JobError) -> JSONResponse:
+        too_large = isinstance(exc, JobTooLarge)
+        log.info("job upload refused: %s", exc)
+        return JSONResponse(
+            {"error": "too_large" if too_large else "bad_request", "detail": str(exc)},
+            status_code=413 if too_large else 422,
+        )
+
+    async def endpoint(request: Request) -> Response:
+        upload: JobUpload | None = None
+        try:
+            kind, options = parse_options_header(request.headers.get("content-type", ""))
+            boundary = options.get(b"boundary")
+            if kind != b"multipart/form-data" or not boundary:
+                raise JobError("expected multipart/form-data")
+            declared = request.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > limit:
+                raise JobTooLarge("request is too large")
+            upload = JobUpload(boundary, incoming_dir(settings), max_file, MAX_MANIFEST_BYTES)
+            total = 0
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > limit:
+                    raise JobTooLarge("request is too large")
+                upload.write(chunk)
+            manifest_bytes, path = upload.finish()
+            job = create_job_from_bytes(store, settings, manifest_bytes, path.read_bytes())
+        except JobError as exc:
+            return refuse(exc)
+        except Exception:
+            log.exception("job upload failed unexpectedly")
+            return JSONResponse({"error": "internal", "detail": "internal error"}, status_code=500)
+        finally:
+            if upload is not None:
+                upload.discard()
+        return JSONResponse(
+            {"job_id": job.id, "name": job.name, "kind": job.kind, "status": job.status},
+            status_code=201,
+        )
+
+    return endpoint
 
 
 # -- serving -----------------------------------------------------------------------

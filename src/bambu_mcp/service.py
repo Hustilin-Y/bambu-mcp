@@ -3,7 +3,8 @@
 MQTT link (paho thread) -> PrinterState -> events -> journal + outbox (one SQLite transaction),
 then a sender task delivers the outbox in order (with camera snapshots), retrying through
 outages and restarts. Plus the post-print questions, the button presses and the quarterly
-tariff reminder.
+tariff reminder. Phase 2: print jobs are proposed and sliced on the owner's PC (wake it,
+slice, send the summary with the plate picture).
 """
 
 from __future__ import annotations
@@ -12,37 +13,74 @@ import asyncio
 import contextlib
 import functools
 import hashlib
+import json
 import logging
 import os
+import shutil
 import signal
-from collections.abc import Awaitable, Callable, Coroutine
-from dataclasses import replace
+import uuid
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from bambu_mcp import camera as camera_module
+from bambu_mcp import jobs as jobs_module
 from bambu_mcp import mcp_server
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.cost import tariff_check_due
 from bambu_mcp.events import CANCEL_ERROR, Event, EventDetector, EventKind, event_identity
+from bambu_mcp.jobs import JobBusy, SliceStart
 from bambu_mcp.journal import NO_SPOOL, TERMINAL_KINDS, Journal, Slot
 from bambu_mcp.logthrottle import Throttle
+from bambu_mcp.manifest import Manifest, ManifestError, parse_manifest, verify_file
 from bambu_mcp.messages import (
     fit_question,
+    job_name,
+    md_literal,
     post_print_buttons,
     render_event,
+    render_proposal,
+    render_sliced,
+    slot_buttons,
     spool_buttons,
     spool_question,
 )
+from bambu_mcp.names import slug
 from bambu_mcp.notify import Button, LogNotifier, Notifier, Press, SendError, ServiceNotifyClient
 from bambu_mcp.printer.hms import HmsTexts
-from bambu_mcp.printer.link import LinkStatus, PrinterLink
+from bambu_mcp.printer.link import LinkStatus, PrinterLink, PrinterNotConnected
 from bambu_mcp.printer.state import PrinterState, apply
+from bambu_mcp.proposal import (
+    SlotChoice,
+    SlotUnusable,
+    UsableSlot,
+    estimate_cost,
+    job_hints,
+    job_material,
+    last_settings,
+    pick_slot,
+    resolve_settings,
+    slot_number,
+    slot_position,
+    usable_slots,
+)
 from bambu_mcp.redact import install_redaction
+from bambu_mcp.slicer import (
+    WAKE_BUDGET_S,
+    GatewayWaker,
+    SliceClient,
+    SliceOutcome,
+    SliceRequest,
+    WakeError,
+)
 from bambu_mcp.store.db import Store
-from bambu_mcp.store.models import OutboxRow, Tariff
+from bambu_mcp.store.models import Job, OutboxRow, Spool, Tariff
+from slice_agent.runner import PLATE_TYPES
 
 log = logging.getLogger(__name__)
 
@@ -65,9 +103,29 @@ OUTBOX_BACKOFF_START_S = 30.0
 OUTBOX_BACKOFF_MAX_S = 30 * 60.0
 OUTBOX_GIVE_UP_S = 24 * 3600.0
 PRESS_RESTART_S = 5.0
-# tray_now: 0..15 = AMS unit * 4 + slot, 254 = external spool, 255 = nothing loaded.
-_SLOTS_PER_AMS = 4
+# tray_now: 0..15 = the owner's slot number - 1, 254 = external spool, 255 = nothing loaded.
 _MAX_AMS_TRAY = 15
+# Jobs (phase 2).
+DEFAULT_NAMED_SET = "standard"
+# The agent always slices on its standard process set: a named set travels as overrides.
+PROCESS_SET = "standard"
+DEFAULT_PLATE_TYPE = "Textured PEI Plate"
+JOB_HISTORY = 200  # newest jobs searched for the part's last settings and colour
+BUSY_RETRY_S = 30.0
+CLAIMABLE = ("new", "sliced", "slice_failed")
+SLICE_BUTTON_TEXT = "✂️ Нарезать"
+CHANGE_BUTTON_TEXT = "⚙️ Изменить"
+CHANGE_TEXT = "Скажи ассистенту, что поменять: слот, стенки, заполнение, поддержки, пластину"
+SLOT_UNUSABLE_TEXT = "Слот {n} пустой или без катушки с пресетом, выбери другой"
+SLICED_KIND = "job_sliced"
+SLICED_TEXT_KIND = "job_sliced_text"  # the summary sent after its picture when too long for a caption
+CAPTION_MAX = 1024  # Telegram photo caption limit, in UTF-16 code units
+_WAKE_TEXTS = {
+    "refused": "шлюз отклонил запрос пробуждения ПК",
+    "unreachable": "шлюз не ответил на запрос пробуждения ПК",
+    "not_configured": "ПК выключен, а шлюз для пробуждения не настроен",
+}
+ATTACHMENTS_DIR = "outbox-files"  # data_dir/<this>/<sha256 of the dedupe key>/<file>
 
 Camera = Callable[[], Awaitable[bytes | None]]
 Clock = Callable[[], datetime]
@@ -78,6 +136,61 @@ class Link(Protocol):
     def start(self) -> None: ...
 
     def stop(self) -> None: ...
+
+    def request_full_report(self) -> None: ...
+
+    def set_tray(
+        self,
+        ams: int,
+        slot: int,
+        tray_info_idx: str,
+        tray_type: str,
+        color_rgba: str,
+        nozzle_temp_min: int,
+        nozzle_temp_max: int,
+    ) -> dict: ...
+
+
+class Slicer(Protocol):
+    """``slicer.SliceClient``."""
+
+    async def health(self) -> bool: ...
+
+    async def slice(self, job: SliceRequest, file_bytes: bytes) -> SliceOutcome: ...
+
+    async def fetch_png(self, name: str, plate: int) -> bytes | None: ...
+
+
+class Waker(Protocol):
+    """``slicer.GatewayWaker``."""
+
+    async def wake_and_wait(self, budget_s: float = WAKE_BUDGET_S) -> bool: ...
+
+
+class _SliceFailed(Exception):
+    """``error`` (English) goes into the job row, ``text`` (Russian, Markdown-safe) to the owner."""
+
+    def __init__(self, error: str, text: str) -> None:
+        super().__init__(error)
+        self.error = error
+        self.text = text
+
+
+@dataclass(frozen=True)
+class SlicePlan:
+    """Everything a slice of one job is made with, resolved from the job and the printer state."""
+
+    manifest: Manifest
+    settings: dict[str, object]
+    choice: SlotChoice
+    spool: Spool | None
+    material: str  # canonical: as in settings.power_w when listed there
+    color: str | None  # the slot's colour, preferred for the part next time
+    plate_type: str
+    nozzle: str
+    named_set: str  # its values are in ``settings``, the agent always gets PROCESS_SET
+    filament: str | None  # the spool's Bambu Studio filament preset
+    usable: tuple[UsableSlot, ...] = ()  # slots the owner may choose instead
 
 
 LinkFactory = Callable[[Callable[[dict], None], Callable[[LinkStatus], None]], Link]
@@ -113,7 +226,7 @@ def _tray_slot(report: dict) -> Slot | None:
         return None
     if not 0 <= tray <= _MAX_AMS_TRAY:
         return None
-    return divmod(tray, _SLOTS_PER_AMS)
+    return slot_position(tray + 1)
 
 
 def _rows_json(rows: list[list[Button]] | None) -> list[list[dict[str, str]]] | None:
@@ -136,6 +249,8 @@ class Service:
         *,
         clock: Clock = _utc_now,
         sleep: Sleep = asyncio.sleep,
+        slicer: Slicer | None = None,
+        waker: Waker | None = None,
     ) -> None:
         self._secrets = secrets
         self._settings = settings
@@ -155,6 +270,8 @@ class Service:
 
         self._state = PrinterState.empty()
         self._link_status = LinkStatus.DISCONNECTED
+        self._link: Link | None = None  # while run() is running
+        self._state_fresh = False  # a report with gcode_state arrived since the last CONNECTED
         self._slot: Slot | None = None  # AMS slot of the current or last print
         self._job_seen: tuple[tuple, datetime] | None = None  # job identity, first seen at
         self._first_report = True  # the first state after start is checked against the journal
@@ -165,6 +282,9 @@ class Service:
         self._inbox: asyncio.Queue[tuple[str, Any]] | None = None
         self._outbox_wake: asyncio.Event | None = None
         self._stop_requested: asyncio.Event | None = None
+        self._slicer = slicer
+        self._waker = waker
+        self._slice_tasks: set[asyncio.Task] = set()
 
     # -- public ----------------------------------------------------------------
 
@@ -176,12 +296,55 @@ class Service:
     def link_status(self) -> LinkStatus:
         return self._link_status
 
+    @property
+    def state_fresh(self) -> bool:
+        """True once a report with ``gcode_state`` arrived since the link last (re)connected."""
+        return self._state_fresh and self._link_status is LinkStatus.CONNECTED
+
+    def _running_link(self) -> Link:
+        if self._link is None:
+            raise PrinterNotConnected("printer link is not running, nothing was sent")
+        return self._link
+
+    def set_tray(
+        self,
+        *,
+        ams: int,
+        slot: int,
+        tray_info_idx: str,
+        tray_type: str,
+        color_rgba: str,
+        nozzle_temp_min: int,
+        nozzle_temp_max: int,
+    ) -> dict:
+        """The one printer write (``load_spool``): see ``PrinterLink.set_tray``. Returns the payload."""
+        return self._running_link().set_tray(
+            ams=ams,
+            slot=slot,
+            tray_info_idx=tray_info_idx,
+            tray_type=tray_type,
+            color_rgba=color_rgba,
+            nozzle_temp_min=nozzle_temp_min,
+            nozzle_temp_max=nozzle_temp_max,
+        )
+
+    def request_full_report(self) -> None:
+        self._running_link().request_full_report()
+
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._inbox = asyncio.Queue()
         self._outbox_wake = asyncio.Event()
         self._outbox_wake.set()  # messages left from the last run go out first
         self._stop_requested = asyncio.Event()
+        try:
+            self._fail_interrupted_jobs()
+        except Exception:
+            log.exception("checking for interrupted slices failed")
+        try:
+            self._sweep_attachments()
+        except Exception:
+            log.exception("removing unused message attachments failed")
         link = self._link_factory(self._on_report_threadsafe, self._on_status_threadsafe)
         tasks = [
             asyncio.create_task(self._consume_inbox(), name="bambu-inbox"),
@@ -190,10 +353,13 @@ class Service:
             asyncio.create_task(self._tariff_loop(), name="bambu-tariff"),
         ]
         link.start()
+        self._link = link
         try:
             await self._stop_requested.wait()
         finally:
+            self._link = None
             await asyncio.to_thread(link.stop)  # joins paho's network thread
+            tasks += self._slice_tasks  # a cancelled slice marks its job failed
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -241,6 +407,8 @@ class Service:
         if row.snapshot:
             image = await self._snapshot_for(row.id)
             files = [(SNAPSHOT_NAME, image)] if image else None
+        if row.kind == SLICED_KIND:
+            files = [*(files or []), *self._attachments(row.dedupe)] or None
         try:
             await self._notifier.send(
                 row.text, buttons=_rows_buttons(row.buttons), files=files, dedupe=row.dedupe
@@ -361,6 +529,39 @@ class Service:
     def _drop(self, row: OutboxRow) -> None:
         self._store.outbox_delete(row.id)
         self._head_image = None
+        if row.kind == SLICED_KIND:
+            shutil.rmtree(self._attachments_dir(row.dedupe), ignore_errors=True)
+
+    def _attachments_dir(self, dedupe: str) -> Path:
+        name = hashlib.sha256(dedupe.encode("utf-8")).hexdigest()
+        return Path(self._settings.data_dir) / ATTACHMENTS_DIR / name
+
+    def _sweep_attachments(self) -> None:
+        """Remove attachment folders no outbox message refers to (a crash before the commit)."""
+        root = Path(self._settings.data_dir) / ATTACHMENTS_DIR
+        if not root.is_dir():
+            return
+        used = {self._attachments_dir(d).name for d in self._store.outbox_dedupes()}
+        for entry in root.iterdir():
+            if entry.name in used and entry.is_dir() and not entry.is_symlink():
+                continue
+            log.info("removing an unused message attachment %s", entry.name)
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                with contextlib.suppress(OSError):
+                    entry.unlink()
+
+    def _attachments(self, dedupe: str) -> list[tuple[str, bytes]]:
+        """Files stored for an outbox message (a plate picture), kept until it is dropped."""
+        folder = self._attachments_dir(dedupe)
+        try:
+            if not folder.is_dir():
+                return []
+            return [(p.name, p.read_bytes()) for p in sorted(folder.iterdir()) if p.is_file()]
+        except OSError:
+            log.exception("reading a message attachment failed, sending without it")
+            return []
 
     def _delivery_failed(self, row: OutboxRow, exc: SendError) -> float:
         now = self._clock().timestamp()
@@ -397,6 +598,11 @@ class Service:
 
     def _handle_status(self, status: LinkStatus) -> None:
         self._link_status = status
+        self._state_fresh = False  # CONNECTED included: wait for the printer's next report
+        if status is not LinkStatus.CONNECTED and self._state.gcode_state != "UNKNOWN":
+            # The printer may change unseen while the link is down. The event detector
+            # compares an UNKNOWN state with the last known one, so this announces nothing.
+            self._state = replace(self._state, gcode_state="UNKNOWN", raw_unknown_state=None)
         if status is LinkStatus.AUTH_FAILED and not self._auth_alerted:
             self._auth_alerted = True
             at = self._clock().astimezone(UTC)
@@ -404,7 +610,13 @@ class Service:
 
     async def _handle_press(self, press: Press) -> None:
         try:
-            text = self._journal.on_press(press)
+            if _slot_press(press.button_id) is not None:
+                await self._on_slot_press(press)
+                return
+            if press.button_id.startswith("job:"):
+                text = self._on_job_press(press)
+            else:
+                text = self._journal.on_press(press)
             if text is not None:
                 await self._notifier.edit(press.message_id, text)
         except Exception:
@@ -417,6 +629,9 @@ class Service:
             return
         at = self._clock()
         self._state = new
+        body = report.get("print")
+        if isinstance(body, dict) and "gcode_state" in body:
+            self._state_fresh = True
         if new.gcode_state != "UNKNOWN":
             identity = event_identity(new)
             if self._job_seen is None or self._job_seen[0] != identity:
@@ -524,6 +739,480 @@ class Service:
         rows = [[Button(f"spool:{print_id}:{NO_SPOOL}", NO_SPOOL_TEXT)], *rows[:-1]]
         self._enqueue("spool", spool_question(name), f"{event.dedupe_key}|spool", buttons=rows)
 
+    # -- jobs: proposal and slicing ----------------------------------------------
+
+    async def propose(self, job_id: int, slot: int | None = None) -> str:
+        """Queue the job's proposal with the slice, change and slot buttons. Returns its text.
+
+        ``slot`` (1..16) is the owner's AMS slot: stored with the job, it replaces the one
+        stored before. Raises ``KeyError`` for an unknown job, ``SlotUnusable`` for a slot
+        that cannot be printed from, ``ValueError`` when the settings do not resolve.
+        """
+        job = self._job(job_id)
+        if slot is not None and job.status == "slicing":
+            raise JobBusy(job.id)  # the slot of a running slice never changes under it
+        plan = self._plan(job, None, DEFAULT_NAMED_SET, slot)
+        text, buttons = _proposal(job, plan)
+        with self._store.transaction():
+            if slot is not None:
+                self._store.update_job(job.id, slot=slot)
+            self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
+        return text
+
+    async def slice_job(
+        self,
+        job_id: int,
+        explicit: Mapping | None = None,
+        *,
+        named_set: str = DEFAULT_NAMED_SET,
+        slot: int | None = None,
+    ) -> Job:
+        """Wake the PC, slice the job, store the result and queue the summary (or the failure).
+
+        ``explicit`` is what the owner asked for (ruling R6). ``slot`` is the owner's AMS
+        slot, stored with the job (None: the stored one, else the material match). Raises
+        ``KeyError`` (unknown job), ``ValueError`` (settings outside the whitelist, or
+        ``SlotUnusable``) or ``JobBusy`` before anything changes. Every later failure ends
+        the job ``slice_failed`` and tells the owner.
+        """
+        job, plan = self._claim(job_id, explicit, named_set, slot)
+        await self._slice_claimed(job, plan)
+        return self._job(job.id)
+
+    def start_slice(
+        self,
+        job_id: int,
+        explicit: Mapping | None = None,
+        *,
+        named_set: str = DEFAULT_NAMED_SET,
+        slot: int | None = None,
+    ) -> SliceStart:
+        """``slice_job`` in the background: the job is claimed before this returns.
+
+        The slot warning is returned at once, so a caller that skipped the proposal sees it.
+        """
+        job, plan = self._claim(job_id, explicit, named_set, slot)
+        task = asyncio.create_task(self._slice_claimed(job, plan), name=f"bambu-slice-{job.id}")
+        self._slice_tasks.add(task)
+        task.add_done_callback(self._slice_tasks.discard)
+        return SliceStart(job, plan.choice.warning)
+
+    def _job(self, job_id: int) -> Job:
+        job = self._store.job(job_id)
+        if job is None:
+            raise KeyError(f"no job {job_id}")
+        return job
+
+    def _claim(
+        self, job_id: int, explicit: Mapping | None, named_set: str, slot: int | None = None
+    ) -> tuple[Job, SlicePlan]:
+        job = self._job(job_id)
+        plan = self._plan(job, explicit, named_set, slot)
+        chosen = {"slot": slot} if slot is not None else {}
+        claimed = self._store.transition_job(
+            job.id,
+            CLAIMABLE,
+            status="slicing",
+            settings_json=json.dumps(plan.settings),
+            result_json=None,
+            sliced_file=None,
+            error=None,
+            **chosen,
+        )
+        if not claimed:
+            raise JobBusy(f"job {job.id} is being sliced already")
+        return job, plan
+
+    def _plan(
+        self, job: Job, explicit: Mapping | None, named_set: str, slot: int | None = None
+    ) -> SlicePlan:
+        """``slot`` (1..16) wins over the job's stored slot, which wins over the material match."""
+        manifest = parse_manifest(json.loads(job.manifest_json))  # checked at intake
+        nozzle = f"{manifest.nozzle_mm:g}"
+        history = self._store.jobs(JOB_HISTORY)
+        settings = resolve_settings(
+            explicit or {},
+            last_settings(history, job.name),
+            job_hints(manifest),
+            named_set,
+            checks=manifest.checks,
+            nozzle=nozzle,
+        )
+        wanted, _reason = job_material(manifest)
+        trays = self._state.trays
+        spools: dict[tuple[int, int], Spool] = {}
+        for tray in trays:
+            spool = self._store.slot_spool(tray.ams, tray.slot)
+            if spool is not None:
+                spools[(tray.ams, tray.slot)] = spool
+        number = slot if slot is not None else job.slot
+        forced = slot_position(number) if number is not None else None
+        choice = pick_slot(trays, spools, wanted, _last_color(history, job.name), forced=forced)
+        where = (choice.ams, choice.slot)
+        spool = spools.get(where) if choice.ams is not None else None
+        tray = next((t for t in trays if (t.ams, t.slot) == where), None)
+        color = choice.color_name or ((tray.color_rgba or "")[:6] if tray else "") or None
+        return SlicePlan(
+            manifest=manifest,
+            settings=settings,
+            choice=choice,
+            spool=spool,
+            material=self._canonical(spool.material if spool else (choice.tray_type or wanted)),
+            color=color,
+            plate_type=str(settings.get("curr_bed_type") or self._default_plate_type()),
+            nozzle=nozzle,
+            named_set=named_set,
+            filament=(spool.filament_preset or None) if spool else None,
+            usable=tuple(usable_slots(trays, spools)),
+        )
+
+    def _canonical(self, material: str) -> str:
+        """The material as the power table spells it (``print_kwh`` is case-sensitive)."""
+        for key in self._settings.power_w:
+            if key.casefold() == material.casefold():
+                return key
+        return material
+
+    def _default_plate_type(self) -> str:
+        for plate in self._store.plates():
+            if plate.is_default:
+                if plate.bed_type in PLATE_TYPES:
+                    return plate.bed_type
+                log.warning("default plate %d has an unknown bed type, using %s", plate.id, DEFAULT_PLATE_TYPE)
+        return DEFAULT_PLATE_TYPE
+
+    async def _slice_claimed(self, job: Job, plan: SlicePlan) -> None:
+        try:
+            await self._slice(job, plan)
+        except _SliceFailed as exc:
+            log.warning("job %d not sliced: %s", job.id, exc.error)
+            self._fail_job(job, exc.error, exc.text)
+        except asyncio.CancelledError:
+            self._fail_job(job, "interrupted by a service stop", "прервано остановкой сервиса")
+            raise
+        except Exception:
+            log.exception("slicing job %d failed", job.id)
+            self._fail_job(job, "internal error in the service", "внутренняя ошибка сервиса")
+
+    async def _slice(self, job: Job, plan: SlicePlan) -> None:
+        slicer = self._slicer
+        if slicer is None:
+            raise _SliceFailed(
+                "slice-agent is not configured",
+                f"слайсер не настроен, нужны {md_literal('slice_agent_url')} и {md_literal('SLICE_AGENT_TOKEN')}",
+            )
+        data = await asyncio.to_thread(self._stored_file, job)
+        problem = _preset_problem(plan)
+        if problem is not None:
+            raise _SliceFailed(*problem)
+        try:
+            awake = await (self._waker.wake_and_wait(WAKE_BUDGET_S) if self._waker else slicer.health())
+        except WakeError as exc:
+            raise _SliceFailed(str(exc), _WAKE_TEXTS.get(exc.kind, "ПК не удалось разбудить")) from None
+        if not awake:
+            raise _SliceFailed(
+                "the PC did not wake within 2 minutes", "ПК не проснулся за 2 минуты, нарезка не запускалась"
+            )
+        request = SliceRequest(
+            job_id=job.id,
+            name=slug(job.name),
+            kit=plan.manifest.kind == "kit",
+            plates=tuple(p.index for p in plan.manifest.plates) if plan.manifest.kind == "kit" else (1,),
+            nozzle=plan.nozzle,
+            process_set=PROCESS_SET,
+            filament=plan.filament,
+            plate_type=plan.plate_type,
+            overrides=plan.settings,
+        )
+        log.info("job %d: slicing as %s", job.id, request.out_file)
+        outcome = await slicer.slice(request, data)
+        if outcome.status == "busy":
+            log.info("job %d: slice-agent busy, one retry in %.0f s", job.id, BUSY_RETRY_S)
+            await self._sleep(BUSY_RETRY_S)
+            outcome = await slicer.slice(request, data)
+        if outcome.status == "busy":
+            raise _SliceFailed(
+                "slice-agent is busy with another slice", "слайсер на ПК занят другой нарезкой, попробуй позже"
+            )
+        if outcome.status == "unreachable":
+            raise _SliceFailed(f"slice-agent did not answer ({outcome.detail})", "слайсер на ПК не ответил")
+        if outcome.status != "ok" or not outcome.file:
+            detail = outcome.detail or "slice failed"
+            raise _SliceFailed(detail, md_literal(detail))
+        await self._finish(job, plan, outcome)
+
+    def _stored_file(self, job: Job) -> bytes:
+        """The job's 3MF, checked again: the intake does not fsync before the rename."""
+        try:
+            manifest = jobs_module.load_job_manifest(self._settings, job)
+            data = (jobs_module.job_dir(self._settings, job.id) / manifest.file).read_bytes()
+            if manifest.file_sha256 != job.file_sha256:
+                raise ManifestError("the stored manifest changed")
+            verify_file(manifest, data)
+        except (OSError, ManifestError):
+            log.warning("job %d: stored file does not match its manifest", job.id)
+            raise _SliceFailed(
+                "stored file is damaged, upload again", "файл задания повреждён, загрузи его заново"
+            ) from None
+        return data
+
+    async def _finish(self, job: Job, plan: SlicePlan, outcome: SliceOutcome) -> None:
+        assert self._slicer is not None and outcome.file
+        now = self._clock()
+        tariff = self._store.tariff_on(now.astimezone(self._tz).date())
+        plates = [dict(p) for p in outcome.plates]
+        costs = [
+            estimate_cost(
+                p["minutes"], sum(p["grams"].values()), plan.spool, plan.material, tariff, self._settings, now
+            )
+            for p in plates
+        ]
+        first = min(p["index"] for p in plates)
+        try:
+            png = await self._slicer.fetch_png(outcome.file, first)
+        except Exception:
+            log.exception("job %d: plate picture failed, sending the text alone", job.id)
+            png = None
+        text = render_sliced(
+            job, plates, costs, settings=plan.settings, slot_choice=plan.choice, plate_type=plan.plate_type
+        )
+        choice = plan.choice
+        result = {
+            "plates": plates,
+            "costs": [
+                {
+                    "index": p["index"],
+                    "filament_uah": c.filament_uah,
+                    "power_uah": c.power_uah,
+                    "kwh": c.kwh,
+                    "total_uah": c.total_uah,
+                }
+                for p, c in zip(plates, costs, strict=True)
+            ],
+            "slot": {
+                "ams": choice.ams,
+                "slot": choice.slot,
+                "spool_id": choice.spool_id,
+                "tray_type": choice.tray_type,
+                "color": plan.color,
+                "warning": choice.warning,
+            },
+            "material": plan.material,
+            "plate_type": plan.plate_type,
+            "nozzle": plan.nozzle,
+            "process_set": PROCESS_SET,
+            "named_set": plan.named_set,
+            "filament": plan.filament,
+            "slicer_version": outcome.slicer_version,
+            "sliced_at": now.astimezone(UTC).isoformat(),
+        }
+        key = _job_key(job.id, "sliced")
+        # A photo caption holds 1024 characters: a longer summary follows its picture.
+        split = png is not None and _caption_len(text) > CAPTION_MAX
+        picture_key = _job_key(job.id, "picture") if split else key
+        folder = self._attachments_dir(notify_dedupe(picture_key)) if png else None
+        try:
+            if folder is not None and png is not None:
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / f"plate-{first}.png").write_bytes(png)
+            with self._store.transaction():
+                done = self._store.transition_job(
+                    job.id,
+                    ("slicing",),
+                    status="sliced",
+                    settings_json=json.dumps(plan.settings),
+                    result_json=json.dumps(result, ensure_ascii=False),
+                    sliced_file=outcome.file,
+                    error=None,
+                )
+                if not done:
+                    raise RuntimeError(f"job {job.id} left the slicing status")
+                if split:
+                    caption = f"{job_name(job.name)}: пластина {first}"
+                    self._enqueue(SLICED_KIND, caption, picture_key)
+                    self._enqueue(SLICED_TEXT_KIND, text, key)
+                else:
+                    self._enqueue(SLICED_KIND, text, key)
+        except BaseException:
+            if folder is not None:
+                shutil.rmtree(folder, ignore_errors=True)
+            raise
+        log.info("job %d sliced: %s", job.id, outcome.file)
+
+    def _fail_job(self, job: Job, error: str, text: str) -> None:
+        """``slicing`` -> ``slice_failed`` with ``error``, and tell the owner ``text``."""
+        try:
+            with self._store.transaction():
+                if self._store.transition_job(job.id, ("slicing",), status="slice_failed", error=error):
+                    self._enqueue(
+                        "job_failed",
+                        f"❌ Нарезка «{job_name(job.name)}» не удалась: {text}",
+                        _job_key(job.id, "failed"),
+                    )
+        except Exception:
+            log.exception("marking job %d failed did not work", job.id)
+
+    def _fail_interrupted_jobs(self) -> None:
+        """Jobs left ``slicing`` by a stop that could not mark them: no slice runs for them now."""
+        for job in self._store.jobs_with_status("slicing"):
+            self._fail_job(job, "interrupted by a service restart", "прервано перезапуском сервиса")
+
+    async def _on_slot_press(self, press: Press) -> None:
+        """``job:<id>:slot:<n>``: store the slot and edit the proposal in place with it chosen.
+
+        A slot that cannot be printed from is answered with a new message and nothing
+        changes. While the job is slicing the press is answered like the slice button.
+        """
+        parsed = _slot_press(press.button_id)
+        assert parsed is not None
+        job_id, number = parsed
+        job = self._store.job(job_id)
+        if job is None:
+            log.warning("slot press for unknown job %d ignored", job_id)
+            return
+        name = job_name(job.name)
+        if job.status == "slicing":
+            await self._notifier.edit(press.message_id, f"Уже режу «{name}»")
+            return
+        try:
+            plan = self._plan(job, None, DEFAULT_NAMED_SET, number)
+        except SlotUnusable:
+            self._enqueue("job_slot", SLOT_UNUSABLE_TEXT.format(n=number), _job_key(job.id, "slot"))
+            return
+        except ValueError as exc:
+            log.warning("job %d: slot press refused: %s", job.id, exc)
+            text = f"Не получилось выбрать слот для «{name}»: {md_literal(str(exc))}"
+            self._enqueue("job_slot", text, _job_key(job.id, "slot"))
+            return
+        # A slice claimed in the meantime keeps its own plan: the slot is not changed under it.
+        if not self._store.transition_job(job.id, CLAIMABLE, slot=number):
+            await self._notifier.edit(press.message_id, f"Уже режу «{name}»")
+            return
+        text, buttons = _proposal(self._job(job.id), plan)
+        if not await self._notifier.edit(press.message_id, text, buttons):
+            log.warning("job %d: editing the proposal failed, sending it again", job.id)
+            self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
+
+    def _on_job_press(self, press: Press) -> str | None:
+        """``job:<id>:slice`` starts the slice once, ``job:<id>:change`` asks for the changes."""
+        _kind, _sep, rest = press.button_id.partition(":")
+        raw_id, sep, action = rest.partition(":")
+        if not sep or action not in ("slice", "change"):
+            return None
+        try:
+            job_id = int(raw_id)
+        except ValueError:
+            return None
+        job = self._store.job(job_id)
+        if job is None:
+            log.warning("job press for unknown job %d ignored", job_id)
+            return None
+        if action == "change":
+            return CHANGE_TEXT
+        name = job_name(job.name)
+        if job.status == "slicing":
+            return f"Уже режу «{name}»"
+        try:
+            self.start_slice(job.id)
+        except JobBusy:
+            return f"Уже режу «{name}»"
+        except ValueError as exc:
+            log.warning("job %d: slice press refused: %s", job.id, exc)
+            return f"Не получилось начать нарезку «{name}»: {md_literal(str(exc))}"
+        except Exception:
+            log.exception("job %d: slice press failed", job.id)
+            return f"Не получилось начать нарезку «{name}»: внутренняя ошибка сервиса"
+        return f"✂️ Режу «{name}», пришлю результат"
+
+
+def _slot_press(button_id: str) -> tuple[int, int] | None:
+    """(job id, slot number) of a ``job:<id>:slot:<n>`` button, None for any other button."""
+    parts = button_id.split(":")
+    if len(parts) != 4 or parts[0] != "job" or parts[2] != "slot":
+        return None
+    if not all(p.isascii() and p.isdigit() for p in (parts[1], parts[3])):
+        return None
+    job_id, number = int(parts[1]), int(parts[3])
+    try:
+        slot_position(number)
+    except ValueError:
+        return None
+    return job_id, number
+
+
+def _proposal(job: Job, plan: SlicePlan) -> tuple[str, list[list[Button]]]:
+    """The proposal's text and buttons: slice and change, then the slot rows."""
+    text = render_proposal(job, plan.settings, plan.choice, plan.plate_type, None)
+    warning = _preset_warning(plan)
+    if warning:
+        text = f"{text}\n{warning}"
+    choice = plan.choice
+    chosen = None
+    if choice.ams is not None and choice.slot is not None:
+        chosen = slot_number(choice.ams, choice.slot)
+    buttons = [
+        [
+            Button(f"job:{job.id}:slice", SLICE_BUTTON_TEXT),
+            Button(f"job:{job.id}:change", CHANGE_BUTTON_TEXT),
+        ],
+        *slot_buttons(job.id, plan.usable, chosen),
+    ]
+    return text, buttons
+
+
+def _job_key(job_id: int, what: str) -> str:
+    """A fresh dedupe key: every proposal, summary and failure is its own message."""
+    return f"job|{job_id}|{what}|{uuid.uuid4().hex}"
+
+
+def _last_color(history: list[Job], name: str) -> str | None:
+    """The slot colour of the newest sliced job of the part (``history`` newest first)."""
+    for job in history:
+        if job.name != name or job.status != "sliced" or not job.result_json:
+            continue
+        try:
+            color = json.loads(job.result_json).get("slot", {}).get("color")
+        except (ValueError, RecursionError, AttributeError):
+            continue
+        if isinstance(color, str) and color:
+            return color
+    return None
+
+
+def _preset_problem(plan: SlicePlan) -> tuple[str, str] | None:
+    """(English error, Russian reason) when there is no filament preset to slice with."""
+    if plan.filament is not None:
+        return None
+    choice = plan.choice
+    if choice.ams is None or choice.slot is None:
+        return "no loaded slot with a filament preset", "нет заправленного слота с пресетом филамента"
+    n = slot_number(choice.ams, choice.slot)
+    spool = plan.spool
+    if spool is None:
+        return (
+            f"slot {n} has no spool mapped, so there is no filament preset",
+            f"слот {n} не привязан к катушке, нет пресета филамента",
+        )
+    label = md_literal(f"{spool.brand} {spool.material} {spool.color_name}")
+    return (
+        f"spool {spool.id} in slot {n} has no filament preset",
+        f"у катушки {spool.id} ({label}) в слоте {n} не указан пресет филамента",
+    )
+
+
+def _preset_warning(plan: SlicePlan) -> str | None:
+    """The proposal's line for a slice that would stop before it starts."""
+    problem = _preset_problem(plan)
+    if problem is None:
+        return None
+    reason = problem[1]
+    return f"⚠️ {reason[0].upper()}{reason[1:]}: нарезка не начнётся"
+
+
+def _caption_len(text: str) -> int:
+    """Length as Telegram counts it (UTF-16 code units), before Markdown escapes are removed."""
+    return len(text.encode("utf-16-le")) // 2
+
 
 # -- entry point ---------------------------------------------------------------
 
@@ -533,6 +1222,19 @@ def build_notifier(secrets: Secrets, settings: Settings) -> Notifier:
         return ServiceNotifyClient(settings.notify_url, secrets.notify_token)
     log.warning("notify_url or NOTIFY_TOKEN not set, notifications go to the log only")
     return LogNotifier()
+
+
+def build_slicer(
+    secrets: Secrets, settings: Settings, http: httpx.AsyncClient
+) -> tuple[SliceClient | None, GatewayWaker | None]:
+    """slice-agent client and the PC waker. Without a gateway the PC must be awake already."""
+    if not settings.slice_agent_url or not secrets.slice_agent_token:
+        log.warning("slice_agent_url or SLICE_AGENT_TOKEN not set, jobs cannot be sliced")
+        return None, None
+    client = SliceClient(settings.slice_agent_url, secrets.slice_agent_token, http)
+    if not settings.gateway_url or not secrets.gateway_key:
+        log.warning("gateway_url or GATEWAY_KEY not set, the PC is not woken for slicing")
+    return client, GatewayWaker(settings.gateway_url, secrets.gateway_key, http, ready=client.health)
 
 
 def extra_coroutines(
@@ -546,6 +1248,8 @@ async def _amain(secrets: Secrets, settings: Settings) -> None:
     store = Store(Path(settings.data_dir) / DB_NAME)
     store.migrate()
     notifier = build_notifier(secrets, settings)
+    http = httpx.AsyncClient(trust_env=False)  # LAN only: no proxies from the environment
+    slicer, waker = build_slicer(secrets, settings, http)
     service = Service(
         secrets,
         settings,
@@ -553,6 +1257,8 @@ async def _amain(secrets: Secrets, settings: Settings) -> None:
         notifier,
         lambda on_report, on_status: PrinterLink(secrets, settings, on_report, on_status),
         functools.partial(camera_module.snapshot, secrets, settings),
+        slicer=slicer,
+        waker=waker,
     )
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -567,6 +1273,7 @@ async def _amain(secrets: Secrets, settings: Settings) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
         if isinstance(notifier, ServiceNotifyClient):
             await notifier.aclose()
+        await http.aclose()
         store.close()
 
 

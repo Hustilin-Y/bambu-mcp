@@ -73,6 +73,8 @@ dependencies = [
     { name = "mcp" },
     { name = "paho-mqtt" },
     { name = "pillow" },
+    { name = "python-multipart" },
+    { name = "starlette" },
     { name = "tzdata" },
     { name = "uvicorn" },
 ]
@@ -90,6 +92,8 @@ requires-dist = [
     { name = "mcp" },
     { name = "paho-mqtt", specifier = ">=2" },
     { name = "pillow", specifier = ">=13.0.0" },
+    { name = "python-multipart", specifier = ">=0.0.34" },
+    { name = "starlette", specifier = ">=1.10.0" },
     { name = "tzdata", specifier = ">=2026.6" },
     { name = "uvicorn" },
 ]

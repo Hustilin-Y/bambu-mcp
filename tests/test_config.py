@@ -44,6 +44,20 @@ def test_secrets_optional_fields(tmp_path):
     s = Secrets.load(env)
     assert s.notify_token is None
     assert s.client_tokens == {}
+    assert s.gateway_key is None
+    assert s.slice_agent_token is None
+
+
+def test_secrets_phase2_tokens(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text(
+        "BAMBU_ACCESS_CODE=1\nBAMBU_SERIAL=S\nBAMBU_HOST=h\n"
+        "GATEWAY_KEY=gw-key-1\nSLICE_AGENT_TOKEN=slice-tok-2\n"
+    )
+    s = Secrets.load(env)
+    assert s.gateway_key == "gw-key-1"
+    assert s.slice_agent_token == "slice-tok-2"
+    assert "gw-key-1" not in repr(s) and "slice-tok-2" not in repr(s)
 
 
 def test_settings_defaults(tmp_path):
@@ -60,6 +74,34 @@ def test_settings_defaults(tmp_path):
     assert s.camera_backend == "pyav"
     assert s.data_dir == Path("data")
     assert ("127.0.0.1", 8765) in s.listen
+    assert s.jobs_root_allowed is None
+    assert s.gateway_url is None
+    assert s.slice_agent_url is None
+    assert s.service_url is None
+
+
+def test_settings_phase2_keys(tmp_path):
+    toml = tmp_path / "config.toml"
+    root = (tmp_path / "cad" / "out").as_posix()  # absolute on every OS
+    toml.write_text(
+        f'jobs_root_allowed = "{root}"\n'
+        'gateway_url = "http://127.0.0.1:8800"\n'
+        'slice_agent_url = "http://192.0.2.10:11436"\n'
+        'service_url = "http://192.168.88.11:8765"\n'
+    )
+    s = Settings.load(toml)
+    assert s.jobs_root_allowed == Path(root)
+    assert s.gateway_url == "http://127.0.0.1:8800"
+    assert s.slice_agent_url == "http://192.0.2.10:11436"
+    assert s.service_url == "http://192.168.88.11:8765"
+
+
+@pytest.mark.parametrize("value", ["cad/out", "./out", "out"])
+def test_settings_jobs_root_must_be_absolute(tmp_path, value):
+    toml = tmp_path / "config.toml"
+    toml.write_text(f'jobs_root_allowed = "{value}"\n')
+    with pytest.raises(ValueError, match="jobs_root_allowed must be an absolute path"):
+        Settings.load(toml)
 
 
 def test_settings_overrides(tmp_path):
@@ -81,7 +123,16 @@ def test_settings_overrides(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "line", ['tls_mode = "none"', 'camera_backend = "ffmpeg"', "bogus_key = 1"]
+    "line",
+    [
+        'tls_mode = "none"',
+        'camera_backend = "ffmpeg"',
+        "bogus_key = 1",
+        'gateway_url = "ftp://x"',
+        "slice_agent_url = 5",
+        'service_url = ""',
+        "jobs_root_allowed = 3",
+    ],
 )
 def test_settings_rejects_bad_values(tmp_path, line):
     toml = tmp_path / "config.toml"

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from typing import Any
 
 KNOWN_STATES = frozenset(
     {"FAILED", "FINISH", "IDLE", "INIT", "OFFLINE", "PAUSE", "PREPARE", "RUNNING", "SLICING"}
 )
+_PLATE_KEYS = ("plate_idx", "plate_id", "gcode_file")
+_IDENTITY_KEYS = ("subtask_name", "task_id", "gcode_start_time")
+_PLATE_GCODE = re.compile(r"plate_([1-9][0-9]{0,3})\.gcode", re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -40,6 +44,7 @@ class PrinterState:
     nozzle_diameter: float | None
     trays: tuple[Tray, ...]
     raw_unknown_state: str | None
+    plate: int | None = None  # plate of the print's file: plate_idx, plate_id or gcode_file
 
     @classmethod
     def empty(cls) -> PrinterState:
@@ -124,6 +129,17 @@ def _parse_nozzle(p: dict) -> float | None:
     return _float(p.get("nozzle_diameter"))
 
 
+def _parse_plate(p: dict) -> int | None:
+    """``plate_idx``, else ``plate_id``, else the number in ``gcode_file`` (``plate_2.gcode``)."""
+    for key in ("plate_idx", "plate_id"):
+        plate = _int(p.get(key))
+        if plate is not None and plate >= 1:
+            return plate
+    gcode = p.get("gcode_file")
+    match = _PLATE_GCODE.search(gcode) if isinstance(gcode, str) else None
+    return int(match.group(1)) if match else None
+
+
 def apply(state: PrinterState, report: dict) -> PrinterState:
     """Merge a report into the state. Fields absent from the report are kept."""
     if not isinstance(report, dict):
@@ -151,6 +167,10 @@ def apply(state: PrinterState, report: dict) -> PrinterState:
     ):
         if key in p:
             changes[field] = conv(p[key])
+    if any(key in p for key in _PLATE_KEYS):
+        changes["plate"] = _parse_plate(p)
+    elif any(key in changes and changes[key] != getattr(state, key) for key in _IDENTITY_KEYS):
+        changes["plate"] = None  # another job without its plate: never keep the last one's
     if "print_error" in p:
         changes["print_error"] = _int(p["print_error"]) or 0
     hms = _parse_hms(p.get("hms"))

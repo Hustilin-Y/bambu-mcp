@@ -34,6 +34,8 @@ class Secrets:
     host: str
     notify_token: str | None = None
     client_tokens: dict[str, str] = field(default_factory=dict)
+    gateway_key: str | None = None  # orchestra-gateway key, to wake the PC
+    slice_agent_token: str | None = None  # bearer for slice-agent on the PC
 
     def __repr__(self) -> str:  # never leak values through repr or tracebacks
         return "Secrets(***)"
@@ -49,6 +51,8 @@ class Secrets:
             serial=env["BAMBU_SERIAL"],
             host=env["BAMBU_HOST"],
             notify_token=env.get("NOTIFY_TOKEN") or None,
+            gateway_key=env.get("GATEWAY_KEY") or None,
+            slice_agent_token=env.get("SLICE_AGENT_TOKEN") or None,
             client_tokens={
                 k[len(_CLIENT_PREFIX):].lower(): v
                 for k, v in env.items()
@@ -73,6 +77,10 @@ class Settings:
     power_w: dict[str, float] = field(default_factory=lambda: {"PLA": 200.0})
     heatup_kwh: float = 0.05
     timezone: str = "Europe/Kyiv"
+    jobs_root_allowed: Path | None = None  # None: create_job from a path is off
+    gateway_url: str | None = None
+    slice_agent_url: str | None = None
+    service_url: str | None = None  # default --url of `bambu-mcp upload`
 
     @classmethod
     def load(cls, toml_path: Path) -> Settings:
@@ -107,6 +115,13 @@ class Settings:
         if "PLA" not in power_w:
             raise ValueError("power_w must have a PLA entry (the fallback for other materials)")
 
+        urls = {key: _url(raw, key) for key in ("gateway_url", "slice_agent_url", "service_url")}
+        jobs_root = raw.get("jobs_root_allowed")
+        if jobs_root is not None and (not isinstance(jobs_root, str) or not jobs_root):
+            raise ValueError("jobs_root_allowed must be a non-empty path string")
+        if jobs_root is not None and not Path(jobs_root).is_absolute():
+            raise ValueError("jobs_root_allowed must be an absolute path")
+
         ca_file = raw.get("ca_file")
         return cls(
             data_dir=Path(raw.get("data_dir", defaults.data_dir)),
@@ -119,4 +134,15 @@ class Settings:
             power_w=power_w,
             heatup_kwh=float(raw.get("heatup_kwh", defaults.heatup_kwh)),
             timezone=raw.get("timezone", defaults.timezone),
+            jobs_root_allowed=Path(jobs_root) if jobs_root else None,
+            **urls,
         )
+
+
+def _url(raw: dict[str, Any], key: str) -> str | None:
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.startswith(("http://", "https://")):
+        raise ValueError(f"{key} must be an http:// or https:// URL")
+    return value

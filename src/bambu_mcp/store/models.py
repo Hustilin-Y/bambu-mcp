@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 
+JOB_STATUSES = ("new", "slicing", "sliced", "slice_failed")
+
 
 @dataclass(frozen=True)
 class Spool:
@@ -16,6 +18,10 @@ class Spool:
     net_g: float
     remaining_g: float
     active: bool
+    # For load_spool, copied once by the owner from `slice-agent flatten` output.
+    tray_info_idx: str | None = None  # Bambu filament_id of the preset, e.g. "GFA00"
+    nozzle_temp_min: int | None = None  # nozzle_temperature_range_low
+    nozzle_temp_max: int | None = None  # nozzle_temperature_range_high
 
     @property
     def price_per_kg_uah(self) -> float:
@@ -54,6 +60,8 @@ class PrintRow:
     fit: str | None
     deducted_spool_id: int | None = None  # spool the recorded grams were removed from
     deducted_g: float | None = None  # grams actually removed (after the floor at 0)
+    job_id: int | None = None  # the sliced job the print's file name matched
+    plate: int | None = None  # its plate, None when the printer did not say
 
 
 @dataclass(frozen=True)
@@ -67,3 +75,19 @@ class OutboxRow:
     created_at: float  # epoch seconds
     attempts: int
     next_attempt_at: float
+
+
+@dataclass(frozen=True)
+class Job:
+    id: int
+    name: str  # the manifest name, unchanged
+    kind: str  # "part" or "kit"
+    manifest_json: str  # the manifest exactly as received
+    file_sha256: str
+    created_at: datetime
+    status: str  # one of JOB_STATUSES
+    settings_json: str | None
+    result_json: str | None
+    sliced_file: str | None  # a file name, never a path
+    error: str | None
+    slot: int | None = None  # the owner's AMS slot choice (1..16), None: chosen by material

@@ -84,7 +84,7 @@ async def test_edit_patch():
         seen["json"] = json.loads(request.content)
         return httpx.Response(200, json={"message_id": "9"})
 
-    await make(handler).edit("9", text="done", buttons=[])
+    assert await make(handler).edit("9", text="done", buttons=[]) is True
     assert seen["req"].method == "PATCH"
     assert seen["req"].url.path == "/v1/messages/9"
     assert seen["json"] == {"text": "done", "buttons": []}
@@ -157,7 +157,7 @@ async def test_edit_retries_on_503_then_gives_up(caplog):
         attempts.append(1)
         return httpx.Response(503, json={"error": "telegram_unreachable"})
 
-    assert await make(handler).edit("1", text="x") is None
+    assert await make(handler).edit("1", text="x") is False
     assert len(attempts) == 3
     assert TOKEN not in caplog.text
 
