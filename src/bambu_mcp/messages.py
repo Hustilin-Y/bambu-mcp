@@ -264,6 +264,62 @@ def eval_buttons(job_id: int) -> list[list[Button]]:
     return [[Button(f"job:{job_id}:eval", EVAL_BUTTON_TEXT)]]
 
 
+VARIANT_BUTTON_TEXT = "Вариант {n}"
+_VARIANTS_PER_ROW = 3
+EVALUATING_TEXT = "🔍 Подбираю варианты…"
+VARIANTS_TITLE = "Варианты:"
+# Settings a table line names only when they differ from the run's baseline.
+_SHORT_EXTRA_KEYS = (
+    "layer_height", "wall_generator", "top_shell_layers", "bottom_shell_layers", "outer_wall_speed",
+    "seam_position", "ironing_type",
+)
+
+
+def variant_buttons(job_id: int, variants: Sequence[Mapping], chosen: int | None) -> list[list[Button]]:
+    """«Вариант N» for each variant that sliced (``job:<id>:variant:<n>``), the chosen one marked."""
+    buttons = [
+        Button(
+            f"job:{job_id}:variant:{v['n']}",
+            f"{CHOSEN_MARK if v['n'] == chosen else ''}{VARIANT_BUTTON_TEXT.format(n=v['n'])}",
+        )
+        for v in variants
+        if v.get("status") == "ok"
+    ]
+    return [buttons[i : i + _VARIANTS_PER_ROW] for i in range(0, len(buttons), _VARIANTS_PER_ROW)]
+
+
+def _short_settings(settings: Mapping, baseline: Mapping) -> str:
+    """'4 стенки 40% gyroid', plus the settings this variant changes against the baseline."""
+    keys = ["wall_loops", "sparse_infill_density", "sparse_infill_pattern"]
+    keys += [k for k in _SHORT_EXTRA_KEYS if settings.get(k) != baseline.get(k) and k in settings]
+    if "top_shell_layers" in keys or "bottom_shell_layers" in keys:
+        keys += [k for k in ("top_shell_layers", "bottom_shell_layers") if k in settings and k not in keys]
+    return " ".join(_setting_parts({k: settings[k] for k in keys if k in settings}))
+
+
+def render_variants(variants: Sequence[Mapping], chosen: int | None, symbol: str) -> list[str]:
+    """The evaluation table, at most 6 lines after its title:
+    '1 ✓ 4 стенки 40% gyroid · 52 мин · 8 г · 14.45 <symbol> · прочность 1.8×'."""
+    if not variants:
+        return []
+    baseline = variants[0].get("settings") or {}
+    lines = [VARIANTS_TITLE]
+    for v in variants[:6]:
+        n, short = v["n"], _short_settings(v.get("settings") or {}, baseline)
+        if v.get("status") != "ok":
+            lines.append(f"{n} ✗ {short} · не нарезан")
+            continue
+        mark = CHOSEN_MARK if n == chosen else ""
+        cost = v.get("cost")
+        money = money_text(cost, symbol) if isinstance(cost, int | float) else f"? {md_literal(symbol)}"
+        ratio = v.get("strength_ratio")
+        strength = f"{ratio:.1f}×" if isinstance(ratio, int | float) else "?"
+        lines.append(
+            f"{n} {mark}{short} · {round(v['minutes'])} мин · {v['grams']:.0f} г · {money} · прочность {strength}"
+        )
+    return lines
+
+
 _GOAL_SOURCES = {"owner": "выбрал ты", "fallback": "по умолчанию"}
 
 

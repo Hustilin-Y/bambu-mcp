@@ -49,6 +49,7 @@ from bambu_mcp.cost import tariff_reminder_enabled
 from bambu_mcp.evaluation import job_goal, parse_goal
 from bambu_mcp.jobs import (
     MAX_FILE_BYTES,
+    EvaluationFailed,
     JobBusy,
     JobError,
     JobTooLarge,
@@ -147,6 +148,10 @@ class StatusSource(Protocol):
     def state_fresh(self) -> bool: ...
 
     async def propose(self, job_id: int, slot: int | None = None, goal: object = None) -> str: ...
+
+    async def evaluate(self, job_id: int, goal: object = None) -> str: ...
+
+    async def choose_variant(self, job_id: int, n: int) -> str: ...
 
     def start_slice(
         self,
@@ -494,6 +499,19 @@ def _job_status(store: Store, job: Job, tz: ZoneInfo) -> dict[str, Any]:
         "plates": _job_plates(result),
         "warning": _slot_warning(result),
         "error": job.error,
+    }
+
+
+def _job_variants(job: Job | None) -> dict[str, Any]:
+    """The job's last evaluation: the chosen variant and each variant's numbers, no files."""
+    data = _loads(job.variants_json) if job is not None else None
+    entries = data.get("variants") if data is not None else None
+    if not isinstance(entries, list):
+        return {"chosen": None, "variants": []}
+    keys = ("n", "status", "settings", "minutes", "grams", "cost", "currency", "strength_ratio", "error")
+    return {
+        "chosen": data.get("chosen"),
+        "variants": [{k: v.get(k) for k in keys} for v in entries if isinstance(v, dict)],
     }
 
 
@@ -1046,6 +1064,48 @@ def build_mcp(
         except ValueError as exc:
             raise ToolError(str(exc)) from None
         return {"job_id": job_id, "status": "slicing", "warning": started.warning}
+
+    @mcp.tool(annotations=WRITE)
+    async def evaluate_job(job_id: int, goal: str | list[str] | None = None) -> dict[str, Any]:
+        """Find the best settings for a part's goal: wake the PC and slice up to 6 variants, one
+        after another (the job's current settings first, then the goal's candidates). Takes
+        minutes. Never prints.
+
+        `goal` (as in propose_job, only when the owner names one) is stored with the job first.
+        The best variant for the goal becomes the job's settings, and the proposal with the
+        table ("<n> [✓] <settings> · <min> мин · <g> г · <cost> · прочность <x>×", strength
+        against the first variant, "?" when the agent did not measure it) goes to Telegram
+        with «Вариант N» buttons. Returns the same text, `chosen` (the ✓ variant) and
+        `variants`. Kits are refused. Follow with choose_variant or slice_job.
+        """
+        job_or_error(job_id)
+        _check_goal(goal)
+        try:
+            text = await service.evaluate(job_id, goal)
+        except JobBusy:
+            raise ToolError(f"job {job_id} is being sliced or evaluated already") from None
+        except KeyError:
+            raise ToolError(f"job {job_id} not found") from None
+        except (ValueError, EvaluationFailed) as exc:
+            raise ToolError(str(exc)) from None
+        return {"job_id": job_id, "text": text, **_job_variants(store.job(job_id))}
+
+    @mcp.tool(annotations=WRITE)
+    async def choose_variant(job_id: int, n: int) -> dict[str, Any]:
+        """Choose variant `n` (1..6) of the job's last evaluate_job run as its settings, as the
+        «Вариант N» button does. The owner's words in slice_job settings still win over it. A
+        following slice_job reuses the variant's file when it is still the one on the PC.
+        Returns the proposal text, also sent to Telegram."""
+        job_or_error(job_id)
+        try:
+            text = await service.choose_variant(job_id, n)
+        except JobBusy:
+            raise ToolError(f"job {job_id} is being sliced or evaluated already") from None
+        except KeyError:
+            raise ToolError(f"job {job_id} not found") from None
+        except ValueError as exc:
+            raise ToolError(str(exc)) from None
+        return {"job_id": job_id, "text": text}
 
     @mcp.tool(annotations=READ)
     async def job_status(job_id: int) -> dict[str, Any]:

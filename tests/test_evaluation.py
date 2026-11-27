@@ -148,3 +148,74 @@ def test_fallback_is_balanced():
     for bad in ("{", json.dumps({"primary": "ultra"}), json.dumps(["speed"])):
         job, manifest = _goal_job({}, bad)
         assert job_goal(job, manifest) == ("balanced", None, "fallback", None)
+
+
+# -- the evaluation run: candidates and score (Task 6) ---------------------------------
+
+from bambu_mcp.evaluation import MAX_VARIANTS, VariantMetrics, candidates, score  # noqa: E402
+
+HINTED = {
+    "wall_loops": 4, "sparse_infill_density": 25, "sparse_infill_pattern": "gyroid", "enable_support": False,
+}
+
+
+def test_candidates_baseline_first_at_most_six_all_valid():
+    base = {**HINTED, **GOALS["strength"].base}
+    out = candidates("strength", {}, base, {}, "0.4")
+    assert out[0] == base
+    assert 2 <= len(out) <= MAX_VARIANTS == 6
+    assert len({json.dumps(c, sort_keys=True) for c in out}) == len(out)  # no duplicates
+    for c in out:
+        Overrides.parse(c, "0.4")
+        assert c["enable_support"] is False  # the hint the grid does not touch stays
+    assert {c["wall_loops"] for c in out} >= {3, 4, 5, 6}
+
+
+def test_explicit_keys_fixed_in_every_variant():
+    explicit = {"wall_loops": 2, "sparse_infill_pattern": "honeycomb"}
+    base = {**HINTED, **explicit}
+    for key in GOALS:
+        for c in candidates(key, explicit, base, {}, "0.4"):
+            assert c["wall_loops"] == 2 and c["sparse_infill_pattern"] == "honeycomb", key
+
+
+def test_candidates_keep_the_goal_rules_and_the_checks():
+    fit = candidates("fit", {}, dict(HINTED), {}, "0.4")
+    assert fit[0] == HINTED  # the baseline is the reference, whatever its rules
+    for c in fit[1:]:
+        assert limits_ok(GOALS["fit"], c, {}) == []
+    base = {**HINTED, "enable_support": True}
+    for c in candidates("cheap", {}, base, {"supports_suggested": True}, "0.4"):
+        assert c["enable_support"] is True
+
+
+def _m(minutes, grams=10.0, cost=10.0, strength=1000.0, **settings) -> VariantMetrics:
+    return VariantMetrics(settings=settings, minutes=minutes, grams=grams, cost=cost, strength=strength)
+
+
+def test_winner_by_goal_score_and_limits():
+    # speed: the fastest whose strength is at least 0.6 x the baseline's.
+    runs = [_m(100), _m(50, strength=500), _m(60, strength=700), _m(80, strength=900)]
+    assert score(runs, ("speed", None)) == [2, 3, 0]
+    # strength: the strongest within 2.5 x the baseline's time.
+    runs = [_m(100), _m(300, strength=3000), _m(200, strength=1800), _m(150, strength=1800)]
+    assert score(runs, ("strength", None))[:2] == [3, 2]
+    # light: grams. cheap: total cost.
+    assert score([_m(100, grams=10), _m(100, grams=7), _m(100, grams=8)], ("light", None))[0] == 1
+    assert score([_m(100, cost=10), _m(100, cost=12), _m(100, cost=9)], ("cheap", None))[0] == 2
+    # A failed variant is never ranked.
+    failed = VariantMetrics(settings={}, minutes=None, grams=None, cost=None, strength=None, ok=False)
+    assert score([_m(100), failed], ("speed", None)) == [0]
+
+
+def test_secondary_goal_breaks_ties():
+    runs = [_m(100, cost=10), _m(80, cost=10), _m(120, cost=10)]
+    assert score(runs, ("cheap", None))[0] == 0  # a tie: the earlier one
+    assert score(runs, ("cheap", "speed")) == [1, 0, 2]
+
+
+def test_score_without_strength_uses_the_other_metrics():
+    runs = [_m(100, strength=None), _m(50, strength=None), _m(70, strength=None)]
+    # The strength limit cannot be checked: no variant is dropped for it.
+    assert score(runs, ("speed", None)) == [1, 2, 0]
+    assert sorted(score(runs, ("balanced", None))) == [0, 1, 2]

@@ -1907,6 +1907,332 @@ async def test_button_count_within_24(tmp_path):
     store.close()
 
 
+# -- the evaluation run: «Подобрать» (evaluation Task 6) -------------------------------
+
+STRENGTH_HINTS = {
+    "infill_pattern": "gyroid", "infill_pct": 25, "material": "PETG", "walls": 4, "goal": "strength",
+}
+EVAL_FEATURE_KEYS = (
+    "outer_wall", "inner_wall", "top_surface", "bottom_surface", "sparse_infill", "internal_solid_infill",
+    "support", "other",
+)
+
+
+class EvalSlicer:
+    """slice-agent fake for evaluation runs: the result follows the overrides.
+
+    minutes = 40 + 10 x walls + infill %, grams = 4 + walls + infill / 10, and the features give
+    S = 100 x walls + 50 + k x 10 x infill %. Each answer has its own sha256.
+    """
+
+    def __init__(self, *, fail=None, features=True, gate: asyncio.Event | None = None) -> None:
+        self.fail = fail or (lambda overrides: None)
+        self.features, self.gate = features, gate
+        self.requests: list = []
+        self.shas: list[str | None] = []
+        self.active = self.max_active = 0
+
+    async def health(self) -> bool:
+        return True
+
+    async def slice(self, job, file_bytes):
+        self.requests.append(job)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            await asyncio.sleep(0)
+            o = dict(job.overrides)
+            reason = self.fail(o)
+            if reason:
+                self.shas.append(None)
+                return SliceOutcome("failed", detail=reason)
+            walls, infill = o.get("wall_loops", 3), o.get("sparse_infill_density", 15)
+            minutes = float(40 + 10 * walls + infill)
+            plate = {"index": 1, "minutes": minutes, "grams": {"PETG": 4 + walls + infill / 10}}
+            if self.features:
+                volumes = dict.fromkeys(EVAL_FEATURE_KEYS, 0.0)
+                volumes.update(
+                    outer_wall=100.0, inner_wall=100.0 * (walls - 1), top_surface=20.0, bottom_surface=20.0,
+                    internal_solid_infill=10.0, sparse_infill=10.0 * infill,
+                )
+                plate["features"] = volumes
+            sha = f"{len(self.requests):064x}"
+            self.shas.append(sha)
+            return SliceOutcome("ok", file=job.out_file, plates=(plate,), slicer_version="02.08.02.61", sha256=sha)
+        finally:
+            self.active -= 1
+
+    async def fetch_png(self, name, plate):
+        return None
+
+
+def table(text: str) -> list[str]:
+    lines = text.split("\n")
+    return lines[lines.index("Варианты:") + 1:]
+
+
+def variant_ids(rows) -> list[tuple[str, str]]:
+    return [(b.id, b.text) for row in rows or [] for b in row if ":variant:" in b.id]
+
+
+async def eval_harness(harness, slicer):
+    harness.slicer, harness.waker = slicer, FakeWaker()
+    harness.settings = job_settings(harness.settings.data_dir)
+    service = await harness.start()
+    service._state = replace(PrinterState.empty(), trays=TRAYS)
+    add_spool(harness.store)
+    job = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
+    return service, job
+
+
+async def test_evaluation_slices_baseline_then_variants_sequentially(tmp_path):
+    slicer, waker = EvalSlicer(), FakeWaker()
+    service, store, notifier = job_service(tmp_path, slicer, waker)
+    add_spool(store)
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+
+    text = await service.evaluate(job.id)
+
+    assert waker.budgets == [120]  # woken once for the whole run
+    assert slicer.max_active == 1  # one slice at a time
+    sent = [dict(r.overrides) for r in slicer.requests]
+    assert {k: sent[0][k] for k in STRENGTH_BASE} == STRENGTH_BASE  # the baseline first
+    assert [(s["wall_loops"], s["sparse_infill_density"]) for s in sent] == [
+        (4, 40), (3, 25), (4, 30), (5, 50), (6, 60)
+    ]
+    assert all(r.name == "lamp-arm" and r.job_id == job.id for r in slicer.requests)
+    rows = table(text)
+    assert len(rows) == 5
+    assert rows[0].startswith("1 4 стенки 40% gyroid · 120 мин · 12 г · ")
+    assert rows[0].endswith(" · прочность 1.0×")
+    # The strongest within 2.5 x the baseline's time wins, and is shown as the proposal.
+    assert rows[4].startswith("5 ✓ 6 стенок 60% gyroid · 160 мин · 16 г · ")
+    assert rows[4].endswith(" грн · прочность 1.5×")  # 1250 / 850
+    assert text.startswith("lamp-arm, пластина 1: ") and "6 стенок, 60% gyroid" in text.split("\n")[0]
+    stored = store.job(job.id)
+    assert stored.status == "new"  # the run gives the job back as it was
+    assert json.loads(stored.variant_json)["wall_loops"] == 6
+    variants = json.loads(stored.variants_json)
+    assert [v["n"] for v in variants["variants"]] == [1, 2, 3, 4, 5] and variants["chosen"] == 5
+    await drain(service)
+    assert notifier.sent[-1]["text"] == text
+    assert variant_ids(notifier.sent[-1]["buttons"]) == [
+        (f"job:{job.id}:variant:{n}", f"{'✓ ' if n == 5 else ''}Вариант {n}") for n in range(1, 6)
+    ]
+    store.close()
+
+
+async def test_failed_variant_skipped_failed_baseline_restores(harness):
+    slicer = EvalSlicer(fail=lambda o: "boom" if o["wall_loops"] == 5 else None)
+    service, job = await eval_harness(harness, slicer)
+
+    text = await service.evaluate(job.id)
+    rows = table(text)
+    assert rows[3] == "4 ✗ 5 стенок 50% adaptivecubic · не нарезан"
+    assert len(slicer.requests) == 5  # the run went on after the failure
+    await until(lambda: harness.store.outbox_count() == 0)
+    assert f"job:{job.id}:variant:4" not in [i for i, _ in variant_ids(harness.notifier.sent[-1]["buttons"])]
+
+    # A failed baseline fails the run: the proposal goes back to its text, nothing is stored.
+    other = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
+    slicer.fail = lambda o: "агент: no preset" if o["sparse_infill_density"] == 40 else None
+    before = await service.propose(other.id)
+    await until(lambda: harness.store.outbox_count() == 0)
+    count = len(slicer.requests)
+    await harness.notifier.press_queue.put(Press(1, "m9", f"job:{other.id}:eval", T0))
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert harness.notifier.edits[0][1].endswith("🔍 Подбираю варианты…")
+    assert harness.notifier.edits[1] == ("m9", before)
+    assert len(slicer.requests) == count + 1  # nothing after the baseline
+    stored = harness.store.job(other.id)
+    assert stored.status == "new" and stored.variants_json is None and stored.variant_json is None
+    await until(lambda: harness.store.outbox_count() == 0)
+    assert harness.notifier.sent[-1]["text"] == "❌ Подбор вариантов для «lamp-arm» не удался: агент: no preset"
+
+
+async def test_all_variants_fail_baseline_only(tmp_path):
+    slicer = EvalSlicer(fail=lambda o: None if o["sparse_infill_density"] == 40 else "boom")
+    service, store, notifier = job_service(tmp_path, slicer)
+    add_spool(store)
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    rows = table(await service.evaluate(job.id))
+    assert rows[0].startswith("1 ✓ 4 стенки 40% gyroid · 120 мин")
+    assert all(r.endswith("не нарезан") for r in rows[1:])
+    await drain(service)
+    assert variant_ids(notifier.sent[-1]["buttons"]) == [(f"job:{job.id}:variant:1", "✓ Вариант 1")]
+    store.close()
+
+
+async def test_no_features_strength_unknown(tmp_path):
+    service, store, _ = job_service(tmp_path, EvalSlicer(features=False))
+    add_spool(store)
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    rows = table(await service.evaluate(job.id))
+    assert len(rows) == 5 and all(r.endswith(" · прочность ?") for r in rows)
+    store.close()
+
+
+async def test_evaluation_is_for_parts_only(tmp_path):
+    slicer = EvalSlicer()
+    service, store, _ = job_service(tmp_path, slicer)
+    add_spool(store)
+    kit = add_job(store, service._settings, kind="kit")
+    with pytest.raises(ValueError, match="parts only"):
+        await service.evaluate(kit.id)
+    assert slicer.requests == [] and store.job(kit.id).status == "new"
+    store.close()
+
+
+async def test_second_press_and_goal_press_during_run_refused(harness):
+    gate = asyncio.Event()
+    service, job = await eval_harness(harness, EvalSlicer(gate=gate))
+    queue = harness.notifier.press_queue
+
+    await queue.put(Press(1, "m4", f"job:{job.id}:eval", T0))
+    await until(lambda: harness.notifier.edits and harness.slicer.requests)
+    assert harness.notifier.edits[0][0] == "m4"
+    assert harness.notifier.edits[0][1].endswith("\n🔍 Подбираю варианты…")
+    busy = "Уже подбираю варианты для «lamp-arm»"
+    presses = (f"job:{job.id}:eval", f"job:{job.id}:goal:speed", f"job:{job.id}:slice",
+               f"job:{job.id}:slot:1", f"job:{job.id}:variant:1")
+    for seq, button in enumerate(presses, 2):
+        await queue.put(Press(seq, "m4", button, T0))
+        await until(lambda seq=seq: len(harness.notifier.edits) == seq)
+        assert harness.notifier.edits[-1] == ("m4", busy), button
+    with pytest.raises(JobBusy):
+        await service.evaluate(job.id)
+    assert harness.store.job(job.id).goal_json is None
+    assert len(harness.slicer.requests) == 1
+
+    gate.set()
+    await until(lambda: len(harness.notifier.edits) == 7)
+    message_id, text = harness.notifier.edits[-1]
+    assert message_id == "m4" and "Варианты:" in text
+    assert len(variant_ids(harness.notifier.edit_buttons[-1])) == 5
+    assert harness.store.job(job.id).status == "new"
+    assert len(harness.slicer.requests) == 5
+
+
+async def test_choose_variant_then_slice_reuses_file(harness):
+    slicer = EvalSlicer()
+    service, job = await eval_harness(harness, slicer)
+    await service.evaluate(job.id)
+    queue = harness.notifier.press_queue
+
+    # «Вариант 4» (5 walls): stored as the variant layer and marked, the proposal edited in place.
+    await queue.put(Press(1, "m5", f"job:{job.id}:variant:4", T0))
+    await until(lambda: harness.notifier.edits)
+    message_id, text = harness.notifier.edits[0]
+    assert message_id == "m5" and "5 стенок, 50% adaptivecubic" in text.split("\n")[0]
+    assert table(text)[3].startswith("4 ✓ ")
+    assert "✓ Вариант 4" in [t for _, t in variant_ids(harness.notifier.edit_buttons[0])]
+    stored = harness.store.job(job.id)
+    assert json.loads(stored.variant_json)["wall_loops"] == 5 and stored.goal_json is None
+    assert json.loads(stored.variants_json)["chosen"] == 4
+
+    # Back to «Вариант 5», the last one sliced: its file is still the agent's, «Резать» reuses it.
+    await queue.put(Press(2, "m5", f"job:{job.id}:variant:5", T0))
+    await until(lambda: len(harness.notifier.edits) == 2)
+    woken = len(harness.waker.budgets)
+    await queue.put(Press(3, "m5", f"job:{job.id}:slice", T0))
+    await until(lambda: harness.store.job(job.id).status == "sliced")
+    assert len(slicer.requests) == 5 and len(harness.waker.budgets) == woken  # no slice, no wake
+    done = harness.store.job(job.id)
+    result = json.loads(done.result_json)
+    assert result["file_sha256"] == slicer.shas[4]
+    assert result["plates"][0]["minutes"] == 160.0
+    assert json.loads(done.settings_json)["wall_loops"] == 6
+    assert done.sliced_file == f"lamp-arm-{job.id}-p1.gcode.3mf"
+    await until(lambda: harness.store.outbox_count() == 0)
+    assert harness.notifier.sent[-1]["text"].startswith("lamp-arm, пластина 1:")
+
+    # «Вариант 4» was overwritten on the PC by later variants: «Резать» slices it again.
+    await queue.put(Press(4, "m5", f"job:{job.id}:variant:4", T0))
+    await until(lambda: len(harness.notifier.edits) == 4)
+    await queue.put(Press(5, "m5", f"job:{job.id}:slice", T0))
+    await until(lambda: len(slicer.requests) == 6)
+    await until(lambda: harness.store.job(job.id).status == "sliced")
+    assert dict(slicer.requests[5].overrides)["wall_loops"] == 5
+    assert json.loads(harness.store.job(job.id).result_json)["file_sha256"] == slicer.shas[5]
+
+
+async def test_chosen_variant_is_inherited_by_the_next_job_with_the_same_goal(harness):
+    # Ruling R4: the same primary goal inherits the last job's settings over the base point.
+    service, job = await eval_harness(harness, EvalSlicer())
+    await service.evaluate(job.id)
+    await service.choose_variant(job.id, 4)  # 5 walls, 50 % adaptivecubic
+    await service.slice_job(job.id)
+    assert json.loads(harness.store.job(job.id).settings_json)["wall_loops"] == 5
+
+    again = add_job(harness.store, harness.settings, hints=STRENGTH_HINTS)
+    text = await service.propose(again.id)
+    assert "5 стенок, 50% adaptivecubic" in text and "цель: прочно (от ассистента)" in text
+    # Another goal: its base point wins over the last job, as before.
+    speed = add_job(harness.store, harness.settings, hints={**STRENGTH_HINTS, "goal": "speed"})
+    assert "2 стенки, 10% grid" in await service.propose(speed.id)
+
+
+async def test_choose_variant_refusals(tmp_path):
+    slicer = EvalSlicer(fail=lambda o: "boom" if o["wall_loops"] == 5 else None)
+    service, store, _ = job_service(tmp_path, slicer)
+    add_spool(store)
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    with pytest.raises(ValueError, match="no evaluation"):
+        await service.choose_variant(job.id, 1)
+    await service.evaluate(job.id)
+    for n in (0, 6, 4):  # out of range, and the failed one
+        with pytest.raises(ValueError, match="variant"):
+            await service.choose_variant(job.id, n)
+    assert json.loads(store.job(job.id).variants_json)["chosen"] == 5
+    store.close()
+
+
+async def test_goal_change_drops_the_evaluation(tmp_path):
+    service, store, _ = job_service(tmp_path, EvalSlicer())
+    add_spool(store)
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    await service.evaluate(job.id)
+    text = await service.propose(job.id, goal="speed")
+    assert "Варианты:" not in text
+    stored = store.job(job.id)
+    assert stored.variants_json is None and stored.variant_json is None
+    store.close()
+
+
+async def test_button_count_within_24_after_an_evaluation(tmp_path):
+    service, store, notifier = job_service(tmp_path, EvalSlicer())
+    trays = []
+    for number in range(1, 17):
+        ams, slot = divmod(number - 1, 4)
+        trays.append(Tray(ams, slot, "PETG", "FFFFFFFF", None))
+        spool = store.add_spool("Elegoo", "PETG", f"цвет{number}", "#FFFFFF", PRESET, 550.0, 1000.0)
+        store.map_slot(ams, slot, spool)
+    service._state = replace(PrinterState.empty(), trays=tuple(trays))
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    await service.propose(job.id, slot=16)
+    await service.evaluate(job.id)
+    await drain(service)
+    ids = notifier.button_ids(-1)
+    assert len(ids) <= 24, len(ids)
+    assert not any(":goal:" in i for i in ids)  # the variant row replaces the goal rows (spec 5.8)
+    assert sum(":variant:" in i for i in ids) == 5
+    assert f"job:{job.id}:slot:16" in ids and f"job:{job.id}:eval" in ids
+    store.close()
+    # With one AMS everything fits: the goal rows stay.
+    (tmp_path / "one").mkdir()
+    small, small_store, small_notifier = job_service(tmp_path / "one", EvalSlicer())
+    add_spool(small_store)
+    other = add_job(small_store, small._settings, hints=STRENGTH_HINTS)
+    await small.evaluate(other.id)
+    await drain(small)
+    ids = small_notifier.button_ids(-1)
+    assert sum(":goal:" in i for i in ids) == 8 and sum(":variant:" in i for i in ids) == 5
+    assert len(ids) <= 24
+    small_store.close()
+
+
 # -- phase 3: prepare, confirm and start a print -------------------------------------------
 
 MD5_1 = "DD49CB18BFA49DB2DCDC78948AEFBA81"  # Bambu Studio writes it in upper case

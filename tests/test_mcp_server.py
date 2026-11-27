@@ -62,6 +62,8 @@ TOOL_NAMES = {
     "create_job",
     "propose_job",
     "slice_job",
+    "evaluate_job",
+    "choose_variant",
     "job_status",
     "jobs",
     "load_spool",
@@ -1278,3 +1280,39 @@ def test_set_country_without_a_timezone_says_so(h):
     result = h.call("set_country", code="US")
     assert result["country"] == "US" and result["timezone"] == h.settings.timezone
     assert result["note"] == "no default timezone for US: set timezone in config.toml"
+
+
+# -- the evaluation run (Task 6) -------------------------------------------------------
+
+
+def test_evaluate_job_tool_returns_table(jh):
+    hints = {"walls": 4, "infill_pct": 25, "infill_pattern": "gyroid", "material": "PETG"}
+    job_id = jh.add_job(hints={**hints, "goal": "strength"})
+    result = jh.call("evaluate_job", job_id=job_id)
+    assert result["job_id"] == job_id
+    lines = result["text"].split("\n")
+    rows = lines[lines.index("Варианты:") + 1:]
+    assert len(rows) == 5 and rows[0].startswith("1 ") and all("прочность ?" in r for r in rows)
+    assert result["chosen"] in range(1, 6)
+    assert [v["n"] for v in result["variants"]] == [1, 2, 3, 4, 5]
+    assert all(v["status"] == "ok" and v["minutes"] == 100.0 for v in result["variants"])
+    assert len(jh.slicer.requests) == 5 and jh.waker.calls == 1
+    assert jh.store.job(job_id).status == "new"
+
+    chosen = jh.call("choose_variant", job_id=job_id, n=2)
+    assert chosen["job_id"] == job_id and "3 стенки, 25% gyroid" in chosen["text"].split("\n")[0]
+    assert json.loads(jh.store.job(job_id).variants_json)["chosen"] == 2
+    assert "out of range" in jh.error("choose_variant", job_id=job_id, n=9)
+    assert jh.error("choose_variant", job_id=999, n=1) == "job 999 not found"
+
+    # A goal in the call is the owner's: stored, and the run uses it.
+    again = jh.call("evaluate_job", job_id=job_id, goal="speed")
+    assert "цель: быстро (выбрал ты)" in again["text"]
+    assert "goal" in jh.error("evaluate_job", job_id=job_id, goal="ultra")
+    raw = json.loads((MANIFESTS / "kit.print.json").read_text(encoding="utf-8"))
+    raw["file_sha256"] = hashlib.sha256(THREE_MF).hexdigest()
+    kit = create_job_from_bytes(jh.store, jh.settings, json.dumps(raw).encode("utf-8"), THREE_MF).id
+    assert "parts only" in jh.error("evaluate_job", job_id=kit)
+    tools = {t["name"]: t for t in jh.rpc("tools/list")["tools"]}
+    assert set(tools["evaluate_job"]["inputSchema"]["properties"]) == {"job_id", "goal"}
+    assert set(tools["choose_variant"]["inputSchema"]["properties"]) == {"job_id", "n"}

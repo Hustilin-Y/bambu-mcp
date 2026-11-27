@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from bambu_mcp.manifest import GOAL_KEYS, Manifest, is_goal
 from bambu_mcp.proposal import job_hints
 from bambu_mcp.store.models import Job
+from slice_agent.runner import Overrides
 
 # The keys of a plate's `features` from the slice-agent (slice_agent.output.FEATURES).
 FEATURE_KEYS = (
@@ -333,3 +334,149 @@ def job_goal(job: Job, manifest: Manifest) -> tuple[str, str | None, str, str | 
         reason = hints.get("goal_reason")
         return primary, secondary, "assistant", reason if isinstance(reason, str) and reason else None
     return DEFAULT_GOAL, None, "fallback", None
+
+
+# -- the evaluation run: candidates and score ----------------------------------------
+
+MAX_VARIANTS = 6  # slices per run, the baseline included
+
+
+def _fixed_by(explicit: Mapping, keys: list[str]) -> bool:
+    return all(k in explicit for k in keys)
+
+
+def candidates(
+    goal: str, explicit: Mapping, base: Mapping, checks: Mapping | None, nozzle: str
+) -> list[dict[str, object]]:
+    """The settings an evaluation run slices: ``base`` first (the baseline), then the goal's grid.
+
+    ``base`` is the job's resolved settings without a chosen variant. Each grid point goes over
+    it and ``explicit`` (the owner's words, ruling R2) over the point, so explicit keys are the
+    same in every variant. A point that breaks the goal's rules or the manifest's checks (unless
+    explicit keys are what breaks them), that fails the whitelist for ``nozzle``, or that
+    repeats an earlier one is dropped. At most ``MAX_VARIANTS``.
+    """
+    target = GOALS[goal]
+    baseline = {**base, **explicit}
+    out = [baseline]
+    seen = {json.dumps(baseline, sort_keys=True)}
+    for point in target.grid:
+        settings = {**baseline, **point, **explicit}
+        try:
+            settings = dict(Overrides.parse(settings, nozzle).values)
+        except ValueError:
+            continue
+        broken = broken_rules(target, settings)
+        if broken and not _fixed_by(explicit, broken):
+            continue
+        if (checks or {}).get("supports_suggested") and not settings.get("enable_support"):
+            if "enable_support" not in explicit:
+                continue
+        key = json.dumps(settings, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(settings)
+        if len(out) == MAX_VARIANTS:
+            break
+    return out
+
+
+@dataclass(frozen=True)
+class VariantMetrics:
+    """One sliced variant of a run: ``ok`` False when it failed to slice (never ranked).
+
+    ``cost`` is the predicted total (None: unknown), ``strength`` the raw ``strength_proxy``.
+    """
+
+    settings: Mapping
+    minutes: float | None
+    grams: float | None
+    cost: float | None
+    strength: float | None
+    ok: bool = True
+
+
+# Rounding before comparing, so close results tie and the secondary goal decides.
+_ROUND = {"time": 0, "cost": 2, "grams": 1, "strength": 2, "layer": 2, "risk": 2, "shell": 0}
+_DEFAULT_LAYER = 0.2  # the P2S 0.4 mm process when the settings leave it to the preset
+
+
+def _setting(settings: Mapping, key: str, default: float) -> float:
+    value = _number(settings.get(key))
+    return default if value is None else value
+
+
+def _metric(name: str, v: VariantMetrics, base: VariantMetrics, known: set[str]) -> float:
+    """A metric where lower is better. Unknown metrics count 0 for every variant."""
+    s = v.settings
+    if name == "time":
+        return v.minutes or 0.0
+    if name == "cost":
+        return v.cost if "cost" in known else 0.0  # type: ignore[return-value]
+    if name == "grams":
+        return v.grams or 0.0
+    if name == "strength":
+        return -(v.strength / base.strength) if "strength" in known else 0.0  # type: ignore[operator]
+    if name == "layer":
+        return _setting(s, "layer_height", _DEFAULT_LAYER)
+    if name == "risk":
+        # Dimensional risk: a fast outer wall, a thick layer and few walls, equal weights.
+        speed = _setting(s, "outer_wall_speed", 200.0)
+        walls = max(_setting(s, "wall_loops", 2.0), 1.0)
+        return speed / 60 + _setting(s, "layer_height", _DEFAULT_LAYER) / 0.2 + 3 / walls
+    if name == "shell":
+        walls = _setting(s, "wall_loops", 2.0)
+        shells = min(_setting(s, "top_shell_layers", 3.0), _setting(s, "bottom_shell_layers", 3.0))
+        return -(walls + shells)
+    raise KeyError(name)
+
+
+def _goal_key(goal: Goal, v: VariantMetrics, base: VariantMetrics, known: set[str]) -> tuple[float, ...]:
+    if goal.key == "balanced":
+        # Equal weights: time, cost and strength, each relative to the baseline.
+        total = (v.minutes or 0.0) / (base.minutes or 1.0)
+        if "cost" in known and base.cost:
+            total += v.cost / base.cost  # type: ignore[operator]
+        if "strength" in known:
+            total -= v.strength / base.strength  # type: ignore[operator]
+        return (round(total, 2),)
+    return tuple(round(_metric(m, v, base, known), _ROUND[m]) for m in goal.score)
+
+
+def _within_limits(goal: Goal, v: VariantMetrics, base: VariantMetrics, known: set[str]) -> bool:
+    lim = goal.limits
+    if lim.max_time is not None and base.minutes and (v.minutes or 0.0) > lim.max_time * base.minutes:
+        return False
+    if lim.min_strength is not None and "strength" in known:
+        return v.strength >= lim.min_strength * base.strength  # type: ignore[operator]
+    return True
+
+
+def score(variants: Sequence[VariantMetrics], goal: tuple[str, str | None]) -> list[int]:
+    """Indexes of the variants that pass the primary goal's limits, best first.
+
+    ``variants[0]`` is the baseline the ratio limits compare with. The primary goal's score
+    ranks, the secondary's breaks ties, then the slicing order. Strength counts only when
+    every sliced variant has it (else it is "?": the strength limits are not checked), the
+    same for the cost. A failed variant is never ranked. Empty when the baseline failed.
+    """
+    if not variants or not variants[0].ok:
+        return []
+    base = variants[0]
+    ok = [i for i, v in enumerate(variants) if v.ok]
+    known = set()
+    if all(variants[i].strength is not None for i in ok) and base.strength:
+        known.add("strength")
+    if all(variants[i].cost is not None for i in ok):
+        known.add("cost")
+    primary = GOALS[goal[0]]
+    secondary = GOALS[goal[1]] if goal[1] is not None else None
+    eligible = [i for i in ok if _within_limits(primary, variants[i], base, known)]
+
+    def rank(i: int) -> tuple:
+        v = variants[i]
+        tie = _goal_key(secondary, v, base, known) if secondary is not None else ()
+        return (*_goal_key(primary, v, base, known), *tie, i)
+
+    return sorted(eligible, key=rank)

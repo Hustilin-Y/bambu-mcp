@@ -55,7 +55,11 @@ class JobTooLarge(JobError):
 
 
 class JobBusy(Exception):
-    """The job is being sliced already."""
+    """The job is being sliced (or evaluated) already."""
+
+
+class EvaluationFailed(Exception):
+    """An evaluation run failed at its baseline. The message is English, safe to show."""
 
 
 @dataclass(frozen=True)
