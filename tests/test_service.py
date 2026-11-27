@@ -868,6 +868,8 @@ async def test_running_to_idle_is_reported_as_failed(harness):
     assert len(failed) == 1 and "cube" in failed[0]["text"]
     row = harness.store.print_by_identity(("cube", "1795385329", None))
     assert row.outcome == "failed" and row.actual_min is not None
+    # A failed print has no part to fit: no fit question (the spool question may still come).
+    assert not any(b.startswith("fit:") for i in range(len(harness.notifier.sent)) for b in harness.notifier.button_ids(i))
 
 
 async def test_normal_finish_then_restart_sends_nothing_more(harness):

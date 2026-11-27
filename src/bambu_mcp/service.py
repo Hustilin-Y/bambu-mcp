@@ -951,12 +951,13 @@ class Service:
 
     def _ask_post_print(self, event: Event, print_id: int) -> None:
         name = event.state.subtask_name
-        self._enqueue(
-            "fit",
-            fit_question(name),
-            f"{event.dedupe_key}|fit",
-            buttons=post_print_buttons(print_id),
-        )
+        if event.kind is EventKind.FINISHED:  # a failed or stopped print has no part to fit
+            self._enqueue(
+                "fit",
+                fit_question(name),
+                f"{event.dedupe_key}|fit",
+                buttons=post_print_buttons(print_id),
+            )
         row = self._store.print_by_id(print_id)
         spools = self._store.spools()
         if row is None or row.spool_id is not None or not spools:

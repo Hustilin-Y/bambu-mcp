@@ -951,7 +951,7 @@ def build_mcp(
 
     @mcp.tool(annotations=DESTRUCTIVE)
     async def request_stop() -> dict[str, Any]:
-        """Ask the owner in Telegram whether to stop the current print (RUNNING or PAUSE).
+        """Ask the owner in Telegram whether to stop the current print (PREPARE, RUNNING or PAUSE).
 
         Stops nothing itself: the print stops only when the owner presses the stop button
         under that message, within 10 minutes. A stopped print cannot be resumed.
