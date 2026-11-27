@@ -69,7 +69,13 @@ from bambu_mcp.notify import Button, LogNotifier, Notifier, Press, SendError, Se
 from bambu_mcp.printer import ftps
 from bambu_mcp.printer.ftps import UploadError
 from bambu_mcp.printer.hms import HmsTexts
-from bambu_mcp.printer.link import GCODE_3MF_SUFFIX, LinkStatus, PrinterLink, PrinterNotConnected
+from bambu_mcp.printer.link import (
+    GCODE_3MF_SUFFIX,
+    TASK_ID_RE,
+    LinkStatus,
+    PrinterLink,
+    PrinterNotConnected,
+)
 from bambu_mcp.printer.state import PrinterState, apply
 from bambu_mcp.printgate import (
     ControlRefused,
@@ -158,9 +164,8 @@ PRINT_CACHE_KEEP = 3  # sliced files kept, newest first
 START_WATCH_S = 30.0  # after project_file: our task_id must show up PREPARE or RUNNING
 REPORT_WAIT_S = 5.0  # a fresh pushall before the checks
 START_REPORTED = frozenset({"PREPARE", "RUNNING"})
-STOPPABLE_STATES = frozenset({"RUNNING", "PAUSE"})
+STOPPABLE_STATES = frozenset({"PREPARE", "RUNNING", "PAUSE"})  # PREPARE: heating and levelling
 UPLOAD_TIMEOUT_S = 300.0  # the whole FTPS upload: ftps.upload has only per-socket timeouts
-_TASK_ID_RE = re.compile(r"[0-9]{1,20}", re.ASCII)
 _CONFIRM_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
 _HASH_CHUNK = 1 << 16
 UPLOADING_TEXT = "⏳ Загружаю на принтер…"
@@ -177,6 +182,10 @@ FILE_GONE_TEXT = "Нарезанного файла уже нет на серв�
 FILE_CHANGED_TEXT = "Нарезанный файл изменился после подтверждения, подготовь печать заново"
 NOT_CONNECTED_TEXT = "Принтер не на связи, команда не отправлена"
 INTERNAL_TEXT = "внутренняя ошибка сервиса"
+INTERRUPTED_TEXT = (
+    "⚠️ Запуск печати «{name}» прервался из-за перезапуска сервиса. Не знаю, начал ли принтер печатать. "
+    "Посмотри на экран принтера. Команда повторно не отправляется."
+)
 UPLOAD_TIMEOUT_TEXT = "Файл не загрузился на принтер: загрузка на принтер не уложилась в 5 минут"
 NO_JOB_TEXT = "Задание не найдено"
 NO_PLATE_TEXT = "В задании нет пластины {plate}"
@@ -512,6 +521,10 @@ class Service:
             self._sweep_attachments()
         except Exception:
             log.exception("removing unused message attachments failed")
+        try:
+            self._close_interrupted_starts()
+        except Exception:
+            log.exception("checking for interrupted print starts failed")
         link = self._link_factory(self._on_report_threadsafe, self._on_status_threadsafe)
         tasks = [
             asyncio.create_task(self._consume_inbox(), name="bambu-inbox"),
@@ -719,6 +732,24 @@ class Service:
             else:
                 with contextlib.suppress(OSError):
                     entry.unlink()
+
+    def _close_interrupted_starts(self) -> None:
+        """Start presses a restart cut off: claimed, never decided. Never sent again.
+
+        The confirmation became ``unconfirmed`` and the owner is asked to look at the printer:
+        the ``project_file`` may or may not have left before the restart.
+        """
+        for confirmation in self._store.undecided_confirmations("start"):
+            job = self._store.job(confirmation.job_id) if confirmation.job_id is not None else None
+            name = job_name(job.name if job is not None else None)
+            with self._store.transaction():
+                self._store.set_confirmation_outcome(confirmation.id, "unconfirmed")
+                self._enqueue(
+                    "print_interrupted",
+                    INTERRUPTED_TEXT.format(name=name),
+                    f"start|{_id_tag(confirmation.id)}|interrupted",
+                )
+            log.warning("a print start was interrupted by a restart, the owner is asked to check the printer")
 
     def _attachments(self, dedupe: str) -> list[tuple[str, bytes]]:
         """Files stored for an outbox message (a plate picture), kept until it is dropped."""
@@ -1349,7 +1380,7 @@ class Service:
             cache.mkdir(parents=True, exist_ok=True)
             file_sha = await slicer.fetch_file(target.file, path)
         except FetchError as exc:
-            raise PrintRefused([f"Не удалось забрать нарезанный файл с ПК: {md_literal(str(exc))}"], str(exc)) from None
+            raise PrintRefused([f"Не удалось забрать нарезанный файл с ПК: {exc.text}"], str(exc)) from None
         except OSError as exc:
             log.warning("print cache not writable: %s", type(exc).__name__)
             raise PrintRefused(["Не удалось сохранить нарезанный файл на сервере"], "the print cache is not writable") from None
@@ -1720,8 +1751,12 @@ class Service:
         except TimeoutError:
             log.warning("the upload did not finish in %.0f s, the print is not started", self._upload_timeout_s)
             raise _StartRefused("upload_timeout", [UPLOAD_TIMEOUT_TEXT]) from None
-        except (UploadError, ValueError) as exc:
-            raise _StartRefused("upload", [f"Файл не загрузился на принтер: {md_literal(str(exc))}"]) from None
+        except UploadError as exc:
+            log.warning("the upload failed: %s", exc)
+            raise _StartRefused("upload", [f"Файл не загрузился на принтер: {exc.text}"]) from None
+        except ValueError as exc:  # an unsafe remote name: the slice result is odd
+            log.warning("the upload was refused: %s", exc)
+            raise _StartRefused("upload", ["Файл не загрузился на принтер: недопустимое имя файла"]) from None
         # The upload took a while: the printer is checked once more before the one send.
         self._preflight_or_refuse(target, info, file_sha)
         link = self._link
@@ -2008,7 +2043,7 @@ def _stop_press(button_id: str) -> tuple[str, str] | None:
     if len(parts) != 3 or parts[0] != "stop":
         return None
     if parts[1] == "ask":
-        return (parts[2], "ask") if _TASK_ID_RE.fullmatch(parts[2]) else None
+        return (parts[2], "ask") if TASK_ID_RE.fullmatch(parts[2]) else None
     if parts[2] not in ("go", "cancel") or not _CONFIRM_ID_RE.fullmatch(parts[1]):
         return None
     return parts[1], parts[2]

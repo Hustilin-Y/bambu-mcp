@@ -528,6 +528,7 @@ async def test_fetch_file_failure_raises_and_leaves_nothing(tmp_path, response):
         await Agent(response).client().fetch_file("lamp-arm-7-p1.gcode.3mf", dest)
     assert TOKEN not in str(info.value) and AGENT not in str(info.value)
     assert list(tmp_path.iterdir()) == []
+    assert "ПК" in info.value.text and not any("a" <= c <= "z" for c in info.value.text)
 
 
 @pytest.mark.parametrize("name", ["../secret.gcode.3mf", "a/b.gcode.3mf", "lamp-arm.3mf", ""])

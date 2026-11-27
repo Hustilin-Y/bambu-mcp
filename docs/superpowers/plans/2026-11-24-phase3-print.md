@@ -23,7 +23,7 @@
 - `project_file` payload exactly as verified in phase 0, with: `url "ftp:///<file>"`, `file <file>`, `param "Metadata/plate_<n>.gcode"`, `md5` from `Metadata/plate_<n>.gcode.md5` inside the file, `subtask_name` = the file stem (the job's `out_name`, so phase 2 Task 9 matching works), unique numeric `task_id`, `subtask_id "0"`, `project_id "0"`, `profile_id "0"`, `timelapse false`, `bed_type "auto"`, `bed_leveling true`, `bed_levelling true`, `auto_bed_leveling 2`, `flow_cali false`, `vibration_cali false`, `layer_inspect true`, `use_ams true`, `ams_mapping [ams*4+slot]`, `ams_mapping2 [{"ams_id": ams, "slot_id": slot}]`.
 - FTPS: implicit TLS on 990, the same CA file and peer CN == serial check as MQTT, TLS session reuse on data sockets, upload to the USB root, `SIZE` must equal the local size before `project_file` is sent. Nothing is deleted from the stick.
 - Watch window after the send: 30 s. `started` = a report with our `task_id` (or `subtask_name`) and `gcode_state` in `PREPARE`/`RUNNING`. Otherwise `unconfirmed`, told to the owner with what was last seen, and the confirmation stays used.
-- Pause: tool `pause_print`, allowed only while `RUNNING`. Stop: tool `request_stop` and the "Остановить…" button only send a Telegram message with a "Да, остановить" button. The press sends `stop`. No resume anywhere.
+- Pause: tool `pause_print`, allowed only while `RUNNING`. Stop: tool `request_stop` and the "Остановить…" button only send a Telegram message with a "Да, остановить" button. The press sends `stop`, only while the same print is `PREPARE` (heating, levelling), `RUNNING` or `PAUSE`. No resume anywhere.
 - Russian Telegram texts, no em dash, no semicolon, escaped with the existing helpers. English code, docs, errors to Claude. No server paths or secrets in any text.
 - Tests never touch the real printer, FTP server, PC or Telegram. Fakes only.
 - Memory: the sliced file is streamed to `data_dir/print-cache/` and from there to FTPS, never held whole in RAM. The cache keeps the last 3 files.
@@ -148,5 +148,11 @@ Not a subagent task. With the owner present, bed clear and USB stick in:
 2. From Telegram: the "Печатать…" button on a fresh `example-bracket` slice, then press confirm. Expect `started`, journal match, grams booked.
 3. From Claude Code: `prepare_print`, press in Telegram, then `pause_print`. Resume on the printer screen. Then `request_stop` and confirm. Expect stopped and the printed share booked.
 4. The expiry path: prepare, wait 10 min, press. Expect a refusal.
-5. The PC side: restart the slice-agent task after the Task 3 change (the owner does it, or runs `install.ps1` again).
-6. Record the results in `docs/phase3-notes.md`.
+5. Stop during `PREPARE`: start a print, press "Остановить…" and "Да, остановить" while it heats or levels. Expect the printer to take `stop` there.
+6. Protocol facts the fakes cannot show, read from the service log and the printer reports:
+   - the P2S reports the `task_id` we sent (otherwise every start ends `unconfirmed`),
+   - the `project_file` answer is a `SUCCESS` ack with `sequence_id "0"`, and the lower-case md5 is accepted,
+   - the `pause` and `stop` payload shapes are accepted,
+   - FTPS: TLS session reuse on the data socket works, and the `STOR` path form lands at the USB root.
+7. The PC side: restart the slice-agent task after the Task 3 change (the owner does it, or runs `install.ps1` again).
+8. Record the results in `docs/phase3-notes.md`.

@@ -38,7 +38,7 @@ from bambu_mcp.service import (
     build_notifier,
     notify_dedupe,
 )
-from bambu_mcp.slicer import SliceOutcome, WakeError
+from bambu_mcp.slicer import FetchError, SliceOutcome, WakeError
 from bambu_mcp.store.db import Store
 
 FIXTURES = Path(__file__).parent / "fixtures" / "p2s"
@@ -2072,12 +2072,16 @@ async def test_unconfirmed_tells_owner_and_never_resends(harness):
 async def test_press_answers_when_the_upload_or_the_send_fails(harness):
     service, job, _printer = await print_harness(harness)
     link = harness.links[-1]
-    harness.uploader.error = UploadError("printer cannot store the file (553): no USB storage in the printer?")
+    harness.uploader.error = UploadError(
+        "printer cannot store the file (553): no USB storage in the printer?",
+        "принтер не может сохранить файл, вставлена ли флешка?",
+    )
     cid = (await service.prepare_print(job.id)).confirm_id
     await press(harness, f"start:{cid}:go")
     assert await pressed_to_the_end(harness, cid) == "refused:upload"
     assert link.projects == []
-    assert "не загрузился" in harness.notifier.sent[-1]["text"]
+    refusal = harness.notifier.sent[-1]["text"]
+    assert "не загрузился" in refusal and "флешка" in refusal and "USB storage" not in refusal
 
     harness.uploader.error = None
     link.refuse = True
@@ -2373,7 +2377,7 @@ async def test_stop_cancel_and_malformed_stop_buttons(harness):
     await until(lambda: harness.store.outbox_count() == 0)
     sent = len(harness.notifier.sent)
     for button in (f"stop:{cid}:resume", f"stop:{cid.upper()}:go", f"stop:{cid}", "stop:ask:", "stop:ask:7x7",
-                   f"stop:{cid}:go:1", "stop:ask:777:go"):
+                   f"stop:{cid}:go:1", "stop:ask:777:go", "stop:ask:" + "1" * 20):
         await press(harness, button)
     await press(harness, f"stop:{cid}:cancel", "m8")
     await until(lambda: harness.notifier.edits)
@@ -2519,3 +2523,72 @@ async def test_confirmation_id_stays_out_of_logs_and_dedupe(harness, caplog):
     with pytest.raises(KeyError) as info:
         harness.store.set_confirmation_outcome("ab" * 16, "started")
     assert "ab" * 16 not in str(info.value)
+
+
+# -- final review fixes ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("entry", ["request_stop", "button"])
+async def test_stop_during_prepare(harness, entry):
+    """Heating and levelling: the owner may notice a wrong plate there, so the stop works."""
+    service, _job, printer = await print_harness(harness)
+    await running(harness, printer, task_id="777", state="PREPARE")
+    if entry == "request_stop":
+        cid = (await service.request_stop()).confirm_id
+    else:
+        sent = len(harness.notifier.sent)
+        await press(harness, "stop:ask:777", "m3")
+        await until(lambda: len(harness.notifier.sent) == sent + 1)
+        cid = harness.notifier.sent[-1]["buttons"][0][0].id.split(":")[1]
+    assert harness.store.confirmation(cid).kind == "stop"
+    assert "stop" not in harness.events
+
+    await press(harness, f"stop:{cid}:go", "m7")
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits[-1] == ("m7", "⏹ Команда остановки отправлена")
+    await press(harness, f"stop:{cid}:go", "m7")
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert harness.events.count("stop") == 1
+
+
+async def test_start_interrupted_by_a_restart_is_unconfirmed(harness):
+    service, job, _printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    waiting = (await service.prepare_print(job.id)).confirm_id
+    await until(lambda: harness.store.outbox_count() == 0)
+    # The press claimed it, then the service stopped before the start was decided.
+    assert harness.store.claim_confirmation(cid, harness.clock().timestamp()) is not None
+    await harness.stop()
+    sent = len(harness.notifier.sent)
+
+    await harness.start()
+    await until(lambda: harness.store.confirmation(cid).outcome is not None)
+    await until(lambda: harness.store.outbox_count() == 0)
+
+    assert harness.store.confirmation(cid).outcome == "unconfirmed"
+    (message,) = harness.notifier.sent[sent:]
+    text = message["text"]
+    assert "перезапуск" in text and "Не знаю" in text and "экран" in text and "lamp-arm" in text
+    assert "—" not in text and ";" not in text
+    assert cid not in message["dedupe"]
+    conf = harness.store.confirmation(waiting)
+    assert (conf.state, conf.outcome) == ("pending", None)
+    assert sum(len(link.projects) for link in harness.links) == 0 and harness.uploader.calls == []
+
+    await harness.stop()  # told once
+    await harness.start()
+    await harness.service.settle()
+    await until(lambda: harness.store.outbox_count() == 0)
+    assert len(harness.notifier.sent) == sent + 1
+
+
+async def test_fetch_refusal_is_russian_for_the_owner_english_for_claude(harness):
+    service, job, _printer = await print_harness(harness)
+    harness.slicer.error = FetchError(
+        "slice-agent answered HTTP 404 for the sliced file", "ПК не отдал нарезанный файл (HTTP 404)"
+    )
+    with pytest.raises(PrintRefused) as info:
+        await service.prepare_print(job.id)
+    assert "HTTP 404" in str(info.value) and "slice-agent" in str(info.value)
+    (line,) = info.value.lines
+    assert "ПК не отдал" in line and "slice-agent" not in line

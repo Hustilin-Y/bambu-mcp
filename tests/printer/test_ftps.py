@@ -180,6 +180,15 @@ def test_553_no_storage_maps_to_clear_error(fake, local):
         run(local, fake(stor_error=err))
     message = str(info.value)
     assert "553" in message and "USB" in message
+    assert "флешка" in info.value.text  # the owner's line, Russian
+
+
+def test_upload_errors_carry_a_russian_line(fake, local):
+    for kwargs in ({"stor_error": ftplib.error_perm("550 no")}, {"size_override": 1}):
+        with pytest.raises(UploadError) as info:
+            run(local, fake(**kwargs))
+        text = info.value.text
+        assert any("а" <= c <= "я" for c in text) and not any("a" <= c <= "z" for c in text), text
 
 
 def test_other_stor_refusal_reports_code_only(fake, local):

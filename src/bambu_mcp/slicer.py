@@ -85,8 +85,18 @@ def _json(data: bytes) -> object:
         return None
 
 
+_TOO_LARGE_TEXT = "нарезанный файл с ПК больше допустимого размера"
+
+
 class FetchError(Exception):
-    """A sliced file could not be fetched. The message is English, safe to show: no token, no URL."""
+    """A sliced file could not be fetched. The message is English, safe to show: no token, no URL.
+
+    ``text`` is the same for the owner: Russian, plain words, safe in Telegram Markdown.
+    """
+
+    def __init__(self, message: str, text: str = "ПК не отдал нарезанный файл") -> None:
+        super().__init__(message)
+        self.text = text
 
 
 class WakeError(Exception):
@@ -347,7 +357,7 @@ class SliceClient:
         left beside ``dest``.
         """
         if not _SLICED_RE.fullmatch(name):
-            raise FetchError("not a sliced file name")
+            raise FetchError("not a sliced file name", "ПК не отдал файл: имя не похоже на нарезанный файл")
         tmp = dest.with_name(f".{dest.name}.{secrets.token_hex(8)}.part")
         digest = hashlib.sha256()
         try:
@@ -355,25 +365,34 @@ class SliceClient:
                 "GET", f"{self._url}/sliced/{name}", headers=_bearer(self._token), timeout=FILE_TIMEOUT
             ) as resp:
                 if resp.status_code != 200:
-                    raise FetchError(f"slice-agent answered HTTP {resp.status_code} for the sliced file")
+                    raise FetchError(
+                        f"slice-agent answered HTTP {resp.status_code} for the sliced file",
+                        f"ПК не отдал нарезанный файл (HTTP {resp.status_code})",
+                    )
                 declared = resp.headers.get("content-length", "")
                 if declared.isdigit() and int(declared) > max_bytes:
-                    raise FetchError(f"the sliced file is over {max_bytes} bytes")
+                    raise FetchError(f"the sliced file is over {max_bytes} bytes", _TOO_LARGE_TEXT)
                 size = 0
                 with tmp.open("wb") as f:
                     async for chunk in resp.aiter_bytes():
                         size += len(chunk)
                         if size > max_bytes:
-                            raise FetchError(f"the sliced file is over {max_bytes} bytes")
+                            raise FetchError(f"the sliced file is over {max_bytes} bytes", _TOO_LARGE_TEXT)
                         digest.update(chunk)
                         f.write(chunk)
             os.replace(tmp, dest)
         except httpx.HTTPError as exc:
             log.warning("slice-agent sliced file fetch failed: %s", type(exc).__name__)
-            raise FetchError(f"the sliced file could not be fetched ({type(exc).__name__})") from None
+            raise FetchError(
+                f"the sliced file could not be fetched ({type(exc).__name__})",
+                "ПК не отдал нарезанный файл: нет связи",
+            ) from None
         except OSError as exc:
             log.warning("writing the sliced file failed: %s", type(exc).__name__)
-            raise FetchError(f"the sliced file could not be written ({type(exc).__name__})") from None
+            raise FetchError(
+                f"the sliced file could not be written ({type(exc).__name__})",
+                "файл с ПК не удалось сохранить на сервере",
+            ) from None
         finally:
             with contextlib.suppress(OSError):
                 tmp.unlink(missing_ok=True)

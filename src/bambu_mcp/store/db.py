@@ -742,6 +742,15 @@ class Store:
             if cur.rowcount == 0:
                 raise KeyError("no such confirmation")  # the id stays out of logs and errors
 
+    def undecided_confirmations(self, kind: str) -> list[Confirmation]:
+        """``used`` confirmations of ``kind`` with no outcome: a press a restart cut off. Oldest first."""
+        rows = self._conn().execute(
+            "SELECT * FROM confirmations WHERE kind = ? AND state = 'used' AND outcome IS NULL"
+            " ORDER BY created_at",
+            (kind,),
+        )
+        return [_confirmation(r) for r in rows]
+
     def cancel_confirmation(self, id: str) -> bool:
         """Cancel a pending confirmation. False when it is not pending (or unknown)."""
         with self._tx() as conn:

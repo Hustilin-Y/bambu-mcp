@@ -35,7 +35,14 @@ _UPLOAD_LOCK = threading.Lock()
 
 
 class UploadError(Exception):
-    """The upload failed. The message is English and carries no secrets."""
+    """The upload failed. The message is English and carries no secrets.
+
+    ``text`` is the same for the owner: Russian, plain words, safe in Telegram Markdown.
+    """
+
+    def __init__(self, message: str, text: str = "загрузка на принтер не удалась") -> None:
+        super().__init__(message)
+        self.text = text
 
 
 class ImplicitFTPS(ftplib.FTP_TLS):
@@ -119,11 +126,14 @@ def upload(
     try:
         local_size = Path(local).stat().st_size
     except OSError:
-        raise UploadError("local file to upload is missing") from None
+        raise UploadError("local file to upload is missing", "файла для загрузки нет на сервере") from None
     try:
         context = build_ftps_context(ca_file, serial)
     except (ValueError, OSError, ssl.SSLError):
-        raise UploadError("FTPS needs a readable CA file and the printer serial") from None
+        raise UploadError(
+            "FTPS needs a readable CA file and the printer serial",
+            "на сервере нет файла сертификатов или серийного номера принтера",
+        ) from None
 
     remote = f"/{remote_name}"
     with _UPLOAD_LOCK:
@@ -143,28 +153,39 @@ def _transfer(
     try:
         ftp.connect(host, FTPS_PORT)
     except ssl.SSLCertVerificationError:
-        raise UploadError("printer certificate check failed, refusing to log in") from None
+        raise UploadError(
+            "printer certificate check failed, refusing to log in", "сертификат принтера не прошёл проверку"
+        ) from None
     except ssl.SSLError:
-        raise UploadError("TLS handshake with the printer failed") from None
+        raise UploadError("TLS handshake with the printer failed", "не удалось установить защищённое соединение с принтером") from None
     except ftplib.Error:
-        raise UploadError("unexpected FTPS greeting from the printer") from None
+        raise UploadError("unexpected FTPS greeting from the printer", "принтер ответил не так, как ожидалось") from None
     except (OSError, EOFError):
-        raise UploadError("cannot reach the printer's FTPS port") from None
+        raise UploadError("cannot reach the printer's FTPS port", "принтер не отвечает, файл не передать") from None
 
     try:
         _verify_peer(ftp.sock, "ca", serial, None)
     except (ssl.SSLCertVerificationError, ValueError, AttributeError):
-        raise UploadError("printer certificate CN does not match, refusing to log in") from None
+        raise UploadError(
+            "printer certificate CN does not match, refusing to log in",
+            "сертификат принтера выдан на другой серийный номер",
+        ) from None
 
     try:
         ftp.login(FTPS_USER, access_code)
         ftp.prot_p()
     except ftplib.error_perm:
-        raise UploadError("printer refused the FTPS login (check the access code)") from None
+        raise UploadError(
+            "printer refused the FTPS login (check the access code)", "принтер не принял код доступа"
+        ) from None
     except ftplib.Error as err:
-        raise UploadError(f"FTPS login failed (reply {_reply_code(err)})") from None
+        raise UploadError(
+            f"FTPS login failed (reply {_reply_code(err)})", f"вход на принтер не удался (код {_reply_code(err)})"
+        ) from None
     except (OSError, EOFError):
-        raise UploadError("connection to the printer lost during FTPS login") from None
+        raise UploadError(
+            "connection to the printer lost during FTPS login", "связь с принтером прервалась при входе"
+        ) from None
 
     try:
         with local.open("rb") as fh:
@@ -173,23 +194,36 @@ def _transfer(
         code = _reply_code(err)
         if code == "553":
             raise UploadError(
-                "printer cannot store the file (553): no USB storage in the printer?"
+                "printer cannot store the file (553): no USB storage in the printer?",
+                "принтер не может сохранить файл, вставлена ли флешка?",
             ) from None
-        raise UploadError(f"printer refused the upload (reply {code})") from None
+        raise UploadError(f"printer refused the upload (reply {code})", f"принтер не принял файл (код {code})") from None
     except ftplib.Error as err:
-        raise UploadError(f"upload failed (reply {_reply_code(err)})") from None
+        raise UploadError(
+            f"upload failed (reply {_reply_code(err)})", f"передача файла не удалась (код {_reply_code(err)})"
+        ) from None
     except (OSError, EOFError):
-        raise UploadError("connection to the printer lost during upload") from None
+        raise UploadError(
+            "connection to the printer lost during upload", "связь с принтером прервалась во время передачи"
+        ) from None
 
     try:
         remote_size = ftp.size(remote)
     except ValueError:
-        raise UploadError("the printer sent an unreadable size reply") from None
+        raise UploadError(
+            "the printer sent an unreadable size reply", "принтер прислал непонятный размер файла"
+        ) from None
     except ftplib.Error as err:
-        raise UploadError(f"cannot read the uploaded size (reply {_reply_code(err)})") from None
+        raise UploadError(
+            f"cannot read the uploaded size (reply {_reply_code(err)})",
+            f"не удалось узнать размер переданного файла (код {_reply_code(err)})",
+        ) from None
     except (OSError, EOFError):
-        raise UploadError("connection lost while checking the uploaded size") from None
+        raise UploadError(
+            "connection lost while checking the uploaded size", "связь с принтером прервалась при проверке размера"
+        ) from None
     if remote_size != local_size:
         raise UploadError(
-            f"uploaded size {remote_size} differs from the local size {local_size}"
+            f"uploaded size {remote_size} differs from the local size {local_size}",
+            f"размер файла на принтере {remote_size} не совпадает с исходным {local_size}",
         )

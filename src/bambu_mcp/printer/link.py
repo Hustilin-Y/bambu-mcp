@@ -71,7 +71,7 @@ GCODE_3MF_SUFFIX: Final = ".gcode.3mf"
 PLATES: Final = range(1, 51)
 _FILE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.gcode\.3mf", re.ASCII)
 _MD5_RE: Final = re.compile(r"[0-9a-f]{32}", re.ASCII)
-_TASK_ID_RE: Final = re.compile(r"[0-9]{1,19}", re.ASCII)
+TASK_ID_RE: Final = re.compile(r"[0-9]{1,19}", re.ASCII)  # project_file task ids, stop buttons
 _PLATE_PARAM_RE: Final = re.compile(r"Metadata/plate_([1-9][0-9]?)\.gcode", re.ASCII)
 _PROJECT_KEYS: Final = frozenset(
     {
@@ -243,7 +243,7 @@ def project_file(
         raise ValueError("md5 must be 32 lower-case hex characters")
     if not (isinstance(subtask_name, str) and subtask_name == file.removesuffix(GCODE_3MF_SUFFIX)):
         raise ValueError("subtask_name must be the file name without .gcode.3mf")
-    if not (isinstance(task_id, str) and _TASK_ID_RE.fullmatch(task_id)):
+    if not (isinstance(task_id, str) and TASK_ID_RE.fullmatch(task_id)):
         raise ValueError("task_id must be 1..19 digits")
     _check_unit_slot(ams, slot)
     ams_id, slot_id = tray_ids(ams, slot)

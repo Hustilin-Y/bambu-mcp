@@ -132,6 +132,7 @@ def test_deploy_readme_covers_phase3():
     for key in (
         "USB stick", "print-cache", "30 s", "prepare_print", "pause_print", "request_stop",
         "never deletes", "project_file", "start_print", "resume", "990",
+        "PREPARE", "sha256", "slice it again", "bambu.db", "TLS session", 'sequence_id "0"', "task id",
     ):
         assert key in phase3, key
     readme = (ROOT / "README.md").read_text(encoding="utf-8")

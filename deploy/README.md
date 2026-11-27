@@ -215,6 +215,12 @@ Phase 3 starts prints on the printer, pauses them and stops them. There is no `s
 - Slicing set up (step 7): the sliced file is fetched from the PC, which is woken first.
 - The printer in LAN-only mode with Developer Mode on, as for the earlier phases.
 
+### Updating from phase 2
+
+1. Back up the database before the first restart on phase 3 code: that start migrates `bambu.db` to schema v8 (one new table, nothing else changes). For example `cp /srv/bambu/data/bambu.db /srv/bambu/data/bambu.db.v7` with the service stopped.
+2. Update the slice-agent on the PC to the same version and restart it (deploy/slice-agent/README.md, or run `install.ps1` again). Its `/slice` answer now carries the sliced file's `sha256`. With the old agent every new slice lacks it and every print is refused with "нарежь заново".
+3. Jobs sliced before the update have no recorded `sha256`: slice it again before printing such a job.
+
 ### Starting a print
 
 1. `prepare_print(job_id, plate)` or the "Печатать…" button under the sliced summary (a kit asks for the plate first) wakes the PC, fetches the sliced file into the print cache, asks the printer for a full report and runs the pre-flight. Hard stops: printer not connected or no fresh report, printer not `IDLE`/`FINISH`/`FAILED`, a fatal or serious HMS, no USB stick, another nozzle diameter, the slot empty or unmapped or holding another material, a plate that uses more than one filament, a retired spool, a spool remainder below the plate's grams x 1.15, the sliced file missing or changed since slicing. Warnings (shown, not blocking): another colour in the slot than at slicing, the part's material intent, the plate's hints. Every blocking reason is listed, and nothing is stored or sent.
@@ -234,7 +240,8 @@ The service never deletes anything from the stick. Every printed file stays at i
 ### Pause and stop
 
 - `pause_print()` sends `pause` once, only while the printer is `RUNNING`. There is no resume tool and no resume button: resume on the printer screen or in Bambu Studio.
-- `request_stop()` and the "Остановить…" button stop nothing themselves. They send "Остановить печать …?" with "Да, остановить" and "Отмена" (10 minutes, once). The press sends `stop` once, and only while the same print (task id and name) is still `RUNNING` or `PAUSE`. Otherwise it says why and sends nothing.
+- `request_stop()` and the "Остановить…" button stop nothing themselves. They send "Остановить печать …?" with "Да, остановить" and "Отмена" (10 minutes, once). The press sends `stop` once, and only while the same print (task id and name) is still `PREPARE` (heating, levelling), `RUNNING` or `PAUSE`. Otherwise it says why and sends nothing.
+- A restart in the middle of a start (during the upload or the 30 s watch) is reported at the next start of the service: the owner is asked to look at the printer, and the command is never sent again.
 
 ### Never exposed
 
@@ -243,7 +250,12 @@ The service never deletes anything from the stick. Every printed file stays at i
 
 ### Not yet checked on the printer
 
-The live check with the owner present confirms: that the P2S reports the task id the service sent (otherwise every start ends as `unconfirmed`), that it accepts the plate md5 in lower case, the `pause` and `stop` payload shape, and the FTPS upload path form.
+The live check with the owner present confirms:
+
+- that the P2S reports the task id the service sent (otherwise every start ends as `unconfirmed`),
+- that it answers `project_file` with a `SUCCESS` ack carrying `sequence_id "0"`, and accepts the plate md5 in lower case,
+- the `pause` and `stop` payload shapes, and `stop` during `PREPARE`,
+- TLS session reuse on the FTPS data socket, and the FTPS upload path form.
 
 ## Checks after deploy
 
