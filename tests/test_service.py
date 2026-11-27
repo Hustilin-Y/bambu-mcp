@@ -2221,6 +2221,33 @@ async def test_chosen_variant_is_inherited_by_the_next_job_with_the_same_goal(ha
     assert "2 стенки, 10% grid" in await service.propose(speed.id)
 
 
+async def test_goal_change_after_a_sliced_variant_applies_the_new_base_point(harness):
+    # Live bug on job 1: strength, «Вариант 1», «Резать», «Герметично», «Резать» sliced variant 1
+    # again. The job's own earlier slice must never be its "last job" layer.
+    slicer = EvalSlicer()
+    service, job = await eval_harness(harness, slicer)
+    await service.evaluate(job.id)
+    await service.choose_variant(job.id, 1)  # the balanced baseline: 3 walls, 15 %
+    await service.slice_job(job.id)
+    assert dict(slicer.requests[-1].overrides)["wall_loops"] == 3
+
+    queue = harness.notifier.press_queue
+    await queue.put(Press(1, "m4", f"job:{job.id}:goal:watertight", T0))
+    await until(lambda: harness.notifier.edits)
+    proposal = harness.notifier.edits[0][1]
+    assert "цель: герметично (выбрал ты)" in proposal and "требует" not in proposal
+    count = len(slicer.requests)
+    await queue.put(Press(2, "m4", f"job:{job.id}:slice", T0))
+    await until(lambda: len(slicer.requests) == count + 1)
+    await until(lambda: harness.store.job(job.id).status == "sliced")
+    sent = dict(slicer.requests[-1].overrides)
+    assert sent["wall_loops"] >= 4
+    assert sent["top_shell_layers"] >= 5 and sent["bottom_shell_layers"] >= 5
+    await until(lambda: harness.store.outbox_count() == 0)
+    summary = harness.notifier.sent[-1]["text"]
+    assert summary.startswith("lamp-arm, пластина 1:") and "требует" not in summary
+
+
 async def test_choose_variant_refusals(tmp_path):
     slicer = EvalSlicer(fail=lambda o: "boom" if o["wall_loops"] == 5 else None)
     service, store, _ = job_service(tmp_path, slicer)

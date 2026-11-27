@@ -1171,7 +1171,7 @@ class Service:
         ``goal`` (primary, secondary) is the owner's new goal: it replaces the job's and drops
         its chosen variant. Without it the job's goal (``job_goal``) and variant apply
         (``use_variant`` False: not the variant, an evaluation run's baseline). The last
-        sliced job of the part ranks above the goal's base point when its primary goal was
+        sliced job of the part (another job, never this one) ranks above the goal's base point when its primary goal was
         the same (ruling R4), below it otherwise. ``base_goal``: that goal's base point instead
         of the job goal's (an evaluation's balanced baseline), none for the fallback goal.
         ``explicit`` goes over the owner's settings stored with the job (``explicit_json``).
@@ -1191,8 +1191,10 @@ class Service:
         base = None
         if goal_now[2] != "fallback":
             base = goal_base(base_goal, None) if base_goal else goal_base(goal_now[0], goal_now[1])
-        last = last_settings(history, job.name)
-        if base is not None and last is not None and _last_primary(history, job.name) == base_key:
+        # The last job is another job of the part: the job's own earlier slice is never a layer
+        # (a goal change must not slice the old settings again).
+        last = last_settings(history, job.name, exclude_id=job.id)
+        if base is not None and last is not None and _last_primary(history, job.name, job.id) == base_key:
             base = {**base, **last}  # R4: the same goal keeps what the last job (or its variant) chose
         settings = resolve_settings(
             {**_explicit(job), **(explicit or {})},
@@ -2983,10 +2985,11 @@ def _eval_marker(job: Job) -> dict | None:
     return data if data is not None and data.get("state") == "running" else None
 
 
-def _last_primary(history: list[Job], name: str) -> str | None:
-    """The primary goal of the job ``last_settings`` takes the settings from (``history`` newest first)."""
+def _last_primary(history: list[Job], name: str, exclude_id: int | None = None) -> str | None:
+    """The primary goal of the job ``last_settings`` takes the settings from (``history`` newest
+    first, ``exclude_id`` skipped as there)."""
     for job in history:
-        if job.name != name or job.status != "sliced" or not job.settings_json:
+        if job.name != name or job.status != "sliced" or job.id == exclude_id or not job.settings_json:
             continue
         try:
             if not isinstance(json.loads(job.settings_json), dict):
