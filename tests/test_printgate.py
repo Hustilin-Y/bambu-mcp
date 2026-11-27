@@ -97,6 +97,36 @@ def test_add_confirmation_round_trip(store: Store):
     assert store.confirmation("nope") is None
 
 
+def test_add_confirmation_makes_its_own_id(store: Store):
+    c = store.add_confirmation(None, "start", job_id=None, plate=1, gate_hash="h", payload_json="{}", now=1.0)
+    assert len(c.id) == 32 and int(c.id, 16) >= 0
+    d = store.add_confirmation(None, "start", job_id=None, plate=1, gate_hash="h", payload_json="{}", now=1.0)
+    assert d.id != c.id
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "0" * 31, "0" * 33, "G" * 32, "A" * 32, " " + "0" * 31, 7])
+def test_add_confirmation_refuses_an_id_that_is_not_32_hex(store: Store, bad):
+    with pytest.raises(ValueError):
+        store.add_confirmation(bad, "start", job_id=None, plate=1, gate_hash="h", payload_json="{}", now=1.0)
+
+
+@pytest.mark.parametrize("ttl", [0, -1, 600.001, float("nan"), float("inf")])
+def test_add_confirmation_refuses_a_ttl_outside_ten_minutes(store: Store, ttl):
+    with pytest.raises(ValueError):
+        store.add_confirmation(None, "start", job_id=None, plate=1, gate_hash="h", payload_json="{}", now=1.0,
+                               ttl_s=ttl)
+
+
+def test_confirmation_outcome_is_recorded(store: Store):
+    c = _add(store)
+    assert store.claim_confirmation(c.id, now=1001.0) is not None
+    store.set_confirmation_outcome(c.id, "refused:preflight")
+    got = store.confirmation(c.id)
+    assert got.outcome == "refused:preflight" and got.state == "used"
+    with pytest.raises(KeyError):
+        store.set_confirmation_outcome("f" * 32, "started")
+
+
 def test_add_confirmation_rejects_unknown_kind(store: Store):
     with pytest.raises(sqlite3.IntegrityError):
         _add(store, kind="resume")
@@ -129,6 +159,7 @@ def test_claim_is_single_use_across_two_stores_on_one_file(tmp_path: Path):
         t.start()
     for t in threads:
         t.join()
+    assert len(results) == 2
     assert sum(r is not None for r in results) == 1
     # And sequentially: whichever store asks next gets nothing.
     assert a.claim_confirmation(c.id, now=1002.0) is None
@@ -219,9 +250,10 @@ def test_kit_plate_picks_its_md5_and_grams(tmp_path: Path):
     path = sliced_file(tmp_path / "desk-kit-9-kit.gcode.3mf")
     two = print_file_info(path, 2)
     assert two == PrintFileInfo(md5=MD5[2], grams=pytest.approx(18.0), minutes=pytest.approx(60.0),
-                                filament_types=("PLA",))
+                                filament_types=("PLA",), filament_count=2)
     one = print_file_info(path, 1)
     assert one.md5 == MD5[1] and one.grams == pytest.approx(3.1) and one.minutes == pytest.approx(10.0)
+    assert one.filament_count == 1
 
 
 def test_part_plate_file_info(tmp_path: Path):
@@ -372,6 +404,23 @@ def test_slot_material_differs_from_the_sliced_preset_blocks():
 
 def test_slot_material_match_ignores_case():
     assert _check(state=_state(trays=(Tray(0, 2, "petg", "161616FF", 80),))).blocking == []
+
+
+def test_more_than_one_filament_on_the_plate_blocks():
+    # Two filament ids of one material still need two AMS slots: project_file maps one.
+    info = PrintFileInfo(md5=MD5[1], grams=14.0, minutes=100.0, filament_types=("PETG",), filament_count=2)
+    _only_blocking(_check(info=info), "2", "филамент", "одного слота")
+
+
+def test_inactive_spool_in_the_slot_blocks():
+    _only_blocking(_check(spool=_spool(active=False)), "Катушка 1", "слоте 3", "списана")
+
+
+@pytest.mark.parametrize(("level", "word"), [(1, "критическая"), (2, "серьёзная")])
+def test_hms_line_names_the_severity_in_russian(level, word):
+    hms = (Hms(0x0300_0100, (level << 16) | 0x0002),)
+    (line,) = _check(state=_state(hms=hms)).blocking
+    assert word in line and "fatal" not in line and "serious" not in line
 
 
 def test_more_than_one_material_on_the_plate_blocks():

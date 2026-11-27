@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
+import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -23,6 +26,7 @@ from bambu_mcp.store.models import (
 )
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
+_CONFIRMATION_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
 _SCHEMA_VERSION = 8
 # schema.sql is the version-1 schema; each later version is one migration script.
 _MIGRATIONS = {
@@ -677,7 +681,7 @@ class Store:
 
     def add_confirmation(
         self,
-        id: str,
+        id: str | None,
         kind: str,
         *,
         job_id: int | None,
@@ -687,7 +691,17 @@ class Store:
         now: float,
         ttl_s: float = CONFIRMATION_TTL_S,
     ) -> Confirmation:
-        """A new ``pending`` confirmation, valid from ``now`` for ``ttl_s`` seconds."""
+        """A new ``pending`` confirmation, valid from ``now`` for ``ttl_s`` seconds.
+
+        ``id`` None makes a random 128-bit one (``printgate.new_confirmation_id``), a given
+        one must be 32 lower-case hex characters. ``ttl_s`` is over 0 and at most 10 minutes.
+        """
+        if id is None:
+            id = secrets.token_hex(16)
+        elif not (isinstance(id, str) and _CONFIRMATION_ID_RE.fullmatch(id)):
+            raise ValueError("a confirmation id is 32 lower-case hex characters")
+        if not (isinstance(ttl_s, int | float) and math.isfinite(ttl_s) and 0 < ttl_s <= CONFIRMATION_TTL_S):
+            raise ValueError(f"ttl_s must be over 0 and at most {CONFIRMATION_TTL_S:g} seconds")
         with self._tx() as conn:
             row = conn.execute(
                 "INSERT INTO confirmations (id, kind, job_id, plate, gate_hash, payload_json,"
@@ -720,6 +734,13 @@ class Store:
                 (id, now),
             )
             return None
+
+    def set_confirmation_outcome(self, id: str, outcome: str) -> None:
+        """What a press led to: ``started``, ``unconfirmed``, ``refused:<reason>`` or ``cancelled``."""
+        with self._tx() as conn:
+            cur = conn.execute("UPDATE confirmations SET outcome = ? WHERE id = ?", (outcome, id))
+            if cur.rowcount == 0:
+                raise KeyError(f"no confirmation {id}")
 
     def cancel_confirmation(self, id: str) -> bool:
         """Cancel a pending confirmation. False when it is not pending (or unknown)."""

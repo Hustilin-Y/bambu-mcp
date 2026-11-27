@@ -404,3 +404,80 @@ def render_sliced(
     lines = [head, *(f"Пластина {i}: {_result_text(m, g, c)}" for i, m, g, c in rows)]
     lines.append(f"Всего: {_result_text(sum(r[1] for r in rows), sum(r[2] for r in rows), total)}")
     return "\n".join([*lines, *warning])
+
+
+# -- printing (phase 3) ----------------------------------------------------------------
+
+PRINT_BUTTON_TEXT = "Печатать…"
+START_BUTTON_TEXT = "Стол чистый, печатать"  # the owner confirms the bed in the press itself
+START_CANCEL_TEXT = "Отмена"
+STOP_ASK_TEXT = "Остановить…"
+_PLATES_PER_ROW = 4
+
+
+def print_buttons(job_id: int) -> list[list[Button]]:
+    """The sliced summary's button: ``job:<id>:print``."""
+    return [[Button(f"job:{job_id}:print", PRINT_BUTTON_TEXT)]]
+
+
+def plate_question(name: str | None) -> str:
+    return f"Какую пластину «{job_name(name)}» печатать?"
+
+
+def plate_buttons(job_id: int, plates: Sequence[int]) -> list[list[Button]]:
+    """One ``job:<id>:print:<n>`` button per plate of a kit."""
+    buttons = [Button(f"job:{job_id}:print:{n}", f"Пластина {n}") for n in plates]
+    return [buttons[i : i + _PLATES_PER_ROW] for i in range(0, len(buttons), _PLATES_PER_ROW)]
+
+
+def start_buttons(confirm_id: str) -> list[list[Button]]:
+    return [[Button(f"start:{confirm_id}:go", START_BUTTON_TEXT), Button(f"start:{confirm_id}:cancel", START_CANCEL_TEXT)]]
+
+
+def stop_ask_buttons(task_id: str) -> list[list[Button]]:
+    return [[Button(f"stop:ask:{task_id}", STOP_ASK_TEXT)]]
+
+
+def render_start_confirmation(
+    name: str | None,
+    *,
+    plate: int | None,
+    slot_choice: SlotChoice,
+    minutes: float,
+    grams: float,
+    plate_type: str,
+    warnings: Sequence[str],
+) -> str:
+    """The question the start button answers. ``plate`` None for a part (always plate 1)."""
+    where = f", пластина {plate}" if plate is not None else ""
+    lines = [
+        f"🖨 Печатать «{job_name(name)}»{where}?",
+        f"{_slot_text(slot_choice)}, {_about(_duration(round(minutes)))}, {_grams(grams)}",
+        f"На столе должна лежать {md_literal(plate_type)}",
+        *(f"⚠️ {w}" for w in warnings),
+        "Проверь, что стол чистый и пустой. Кнопка действует 10 минут.",
+    ]
+    return "\n".join(lines)
+
+
+def render_print_refused(name: str | None, lines: Sequence[str], *, started: bool) -> str:
+    """Why a print was not prepared (``started`` False) or not started. ``lines`` are escaped."""
+    what = "не запущена" if started else "не подготовлена"
+    return "\n".join([f"❌ Печать «{job_name(name)}» {what}:", *lines])
+
+
+def render_print_started(name: str | None, plate: int | None) -> str:
+    where = f", пластина {plate}" if plate is not None else ""
+    return f"▶️ Печать началась\n«{job_name(name)}»{where}"
+
+
+def render_start_unconfirmed(name: str | None, watch_s: float, gcode_state: str, subtask_name: str | None) -> str:
+    """The printer did not report our task in the watch window. The command is never sent again."""
+    job = f"«{job_name(subtask_name)}»" if subtask_name else "без задания"
+    return "\n".join(
+        [
+            f"⚠️ Принтер не подтвердил старт «{job_name(name)}» за {watch_s:.0f} с",
+            f"Последнее, что он прислал: {md_literal(gcode_state)}, {job}",
+            "Команда повторно не отправляется. Посмотри на принтер, и если печати нет, подготовь её заново.",
+        ]
+    )

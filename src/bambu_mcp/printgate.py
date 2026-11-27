@@ -33,7 +33,7 @@ __all__ = [
 
 SPOOL_MARGIN = 1.15  # the spool must hold the plate's grams plus 15 %
 START_STATES = frozenset({"IDLE", "FINISH", "FAILED"})
-BLOCKING_HMS = frozenset({"fatal", "serious"})
+BLOCKING_HMS = {"fatal": "критическая", "serious": "серьёзная"}
 NOZZLE_TOLERANCE_MM = 0.001
 _MD5_RE = re.compile(r"[0-9A-Fa-f]{32}")
 _MD5_MAX_BYTES = 256
@@ -90,6 +90,7 @@ class PrintFileInfo:
     grams: float  # all filaments of the plate
     minutes: float
     filament_types: tuple[str, ...]  # distinct materials of the plate, in file order
+    filament_count: int = 1  # filament ids the plate uses: project_file maps exactly one slot
 
 
 def _plate_md5(path: Path, plate: int) -> str:
@@ -129,6 +130,7 @@ def print_file_info(path: Path, plate: int) -> PrintFileInfo:
         grams=sum(found.grams_by_filament.values()),
         minutes=found.minutes,
         filament_types=types,
+        filament_count=len(found.grams_by_filament),
     )
 
 
@@ -186,6 +188,11 @@ def _slot_lines(
         return [f"Слот {number} пустой, заправь его"]
     if spool is None:
         return [f"К слоту {number} не привязана катушка, привяжи её"]
+    if not spool.active:
+        return [f"Катушка {spool.id} в слоте {number} списана, привяжи к слоту другую"]
+    if info.filament_count > 1:
+        n = info.filament_count
+        return [f"Пластина нарезана под несколько филаментов ({n}), а печать идёт из одного слота"]
     if len(info.filament_types) != 1:
         listed = ", ".join(md_literal(t) for t in info.filament_types) or "не указан"
         return [f"Материал пластины в файле: {listed}, а печать идёт из одного слота"]
@@ -265,9 +272,10 @@ def preflight(
         if state.gcode_state not in START_STATES:
             blocking.append(f"Принтер занят: {md_literal(state.gcode_state)}, нужен IDLE, FINISH или FAILED")
         for h in state.hms:
-            if severity(h) in BLOCKING_HMS:
+            level = BLOCKING_HMS.get(severity(h))
+            if level is not None:
                 code = md_literal(f"HMS_{hms_code(h)}")
-                blocking.append(f"Ошибка принтера {code} ({severity(h)}), сначала устрани её")
+                blocking.append(f"Ошибка принтера {code} ({level}), сначала устрани её")
         if state.sdcard is None:
             blocking.append("Нет данных о флешке, подожди отчёт принтера")
         elif not state.sdcard:

@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -340,13 +341,14 @@ class SliceClient:
     async def fetch_file(self, name: str, dest: Path, max_bytes: int = MAX_FILE_BYTES) -> str:
         """Stream the sliced file ``name`` to ``dest`` and return its sha256 (lower-case hex).
 
-        Never holds the whole body: chunks go to a temporary file next to ``dest``, renamed
-        over it once complete. ``FetchError`` past ``max_bytes`` or on any failure, and then
-        nothing is left at ``dest`` or beside it.
+        Never holds the whole body: chunks go to a temporary file next to ``dest`` (its own
+        name per fetch, so two fetches of one file never mix), renamed over it once complete.
+        ``FetchError`` past ``max_bytes`` or on any failure, and then nothing of this fetch is
+        left beside ``dest``.
         """
         if not _SLICED_RE.fullmatch(name):
             raise FetchError("not a sliced file name")
-        tmp = dest.with_name(f".{dest.name}.part")
+        tmp = dest.with_name(f".{dest.name}.{secrets.token_hex(8)}.part")
         digest = hashlib.sha256()
         try:
             async with self._http.stream(

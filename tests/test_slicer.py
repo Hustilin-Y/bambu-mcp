@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import zipfile
@@ -482,6 +483,31 @@ async def test_fetch_file_streams_and_caps(tmp_path):
     agent = Agent(httpx.Response(200, content=streamed(3)))
     await agent.client().fetch_file("lamp-arm-7-p1.gcode.3mf", exact, max_bytes=3 * len(chunk))
     assert exact.stat().st_size == 3 * len(chunk)
+
+
+async def test_two_fetches_of_one_file_use_their_own_part_files(tmp_path):
+    """Two prepares of one job may fetch at once: neither may write into the other's file."""
+
+    def body(byte: bytes):
+        async def stream():
+            for _ in range(4):
+                await asyncio.sleep(0)  # let the other fetch write in between
+                yield byte * 1024
+        return stream()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        handler.count += 1
+        return httpx.Response(200, content=body(b"a" if handler.count == 1 else b"b"))
+
+    handler.count = 0
+    client = SliceClient(AGENT, TOKEN, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    dest = tmp_path / "lamp-arm-7-p1.gcode.3mf"
+    shas = await asyncio.gather(
+        client.fetch_file("lamp-arm-7-p1.gcode.3mf", dest), client.fetch_file("lamp-arm-7-p1.gcode.3mf", dest)
+    )
+    assert sorted(shas) == sorted(hashlib.sha256(b * 4096).hexdigest() for b in (b"a", b"b"))
+    assert hashlib.sha256(dest.read_bytes()).hexdigest() in shas  # whole, one of the two
+    assert sorted(p.name for p in tmp_path.iterdir()) == [dest.name]
 
 
 async def test_fetch_file_declared_length_over_the_cap_reads_nothing(tmp_path):
