@@ -2399,6 +2399,90 @@ async def test_finished_print_with_a_currency_refusal_says_so(harness):
     assert finished.split("\n")[-1] == "Стоимость не посчитана: тариф с 01.06.2024 в UAH, а печать в EUR"
 
 
+# -- resetting the owner's explicit settings ------------------------------------------
+
+
+def reset_ids(rows) -> list[tuple[str, str]]:
+    return [(b.id, b.text) for row in rows or [] for b in row if b.id.endswith(":reset")]
+
+
+async def test_proposal_names_the_explicit_settings_and_offers_a_reset(tmp_path):
+    service, store, notifier = job_service(tmp_path)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    assert "твои настройки" not in await service.propose(job.id)
+    store.update_job(job.id, explicit_json=json.dumps({"wall_loops": 2, "sparse_infill_density": 25}))
+    text = await service.propose(job.id)
+    assert "твои настройки: 2 стенки, 25% заполнение" in text
+    await drain(service)
+    assert reset_ids(notifier.sent[0]["buttons"]) == []
+    assert reset_ids(notifier.sent[1]["buttons"]) == [(f"job:{job.id}:reset", "↺ Сбросить мои настройки")]
+    store.close()
+
+
+async def test_reset_press_clears_the_layer_without_slicing(harness):
+    _service, job, _blue = await slot_harness(harness)
+    harness.store.update_job(job.id, explicit_json=json.dumps({"wall_loops": 2}))
+    await harness.notifier.press_queue.put(Press(1, "m4", f"job:{job.id}:reset", T0))
+    await until(lambda: harness.notifier.edits)
+    message_id, text = harness.notifier.edits[0]
+    assert message_id == "m4" and "твои настройки" not in text
+    assert "4 стенки, 25% gyroid" in text  # the hints again, not the owner's 2 walls
+    assert reset_ids(harness.notifier.edit_buttons[0]) == []
+    assert harness.store.job(job.id).explicit_json is None
+    assert harness.slicer.requests == [] and harness.waker.budgets == []
+    assert harness.store.outbox_count() == 0 and harness.store.job(job.id).status == "new"
+    # While the job is slicing the press changes nothing.
+    harness.store.update_job(job.id, explicit_json=json.dumps({"wall_loops": 2}), status="slicing")
+    await harness.notifier.press_queue.put(Press(2, "m4", f"job:{job.id}:reset", T0))
+    await until(lambda: len(harness.notifier.edits) == 2)
+    assert harness.notifier.edits[1] == ("m4", "Уже режу «lamp-arm»")
+    assert json.loads(harness.store.job(job.id).explicit_json) == {"wall_loops": 2}
+
+
+async def test_reset_settings_all_or_some_keys(tmp_path):
+    service, store, _ = job_service(tmp_path)
+    add_spool(store)
+    job = add_job(store, service._settings)
+    store.update_job(job.id, explicit_json=json.dumps({"wall_loops": 2, "sparse_infill_density": 40}))
+    settings = await service.reset_settings(job.id, ["wall_loops"])
+    assert json.loads(store.job(job.id).explicit_json) == {"sparse_infill_density": 40}
+    assert (settings["wall_loops"], settings["sparse_infill_density"]) == (4, 40)
+    settings = await service.reset_settings(job.id)
+    assert store.job(job.id).explicit_json is None
+    assert (settings["wall_loops"], settings["sparse_infill_density"]) == (4, 25)
+    store.update_job(job.id, status="slicing")
+    with pytest.raises(JobBusy):
+        await service.reset_settings(job.id)
+    store.close()
+
+
+async def test_reset_button_takes_a_goal_place_with_16_slots(tmp_path):
+    service, store, notifier = job_service(tmp_path, EvalSlicer())
+    trays = []
+    for number in range(1, 17):
+        ams, slot = divmod(number - 1, 4)
+        trays.append(Tray(ams, slot, "PETG", "FFFFFFFF", None))
+        spool = store.add_spool("Elegoo", "PETG", f"цвет{number}", "#FFFFFF", PRESET, 550.0, 1000.0)
+        store.map_slot(ams, slot, spool)
+    service._state = replace(PrinterState.empty(), trays=tuple(trays))
+    job = add_job(store, service._settings, hints=STRENGTH_HINTS)
+    store.update_job(job.id, explicit_json=json.dumps({"wall_loops": 4}))
+    await service.propose(job.id, slot=16)
+    await drain(service)
+    ids = notifier.button_ids(-1)
+    assert len(ids) == 24 and f"job:{job.id}:reset" in ids and f"job:{job.id}:slot:16" in ids
+    goals = [i for i in ids if ":goal:" in i]
+    assert len(goals) == 7 and f"job:{job.id}:goal:strength" in goals  # the current goal stays
+    # After an evaluation the variant row replaces the goal rows, the reset button stays.
+    await service.evaluate(job.id)
+    await drain(service)
+    ids = notifier.button_ids(-1)
+    assert len(ids) <= 24 and f"job:{job.id}:reset" in ids and not any(":goal:" in i for i in ids)
+    assert sum(":variant:" in i for i in ids) == 6
+    store.close()
+
+
 # -- phase 3: prepare, confirm and start a print -------------------------------------------
 
 MD5_1 = "DD49CB18BFA49DB2DCDC78948AEFBA81"  # Bambu Studio writes it in upper case

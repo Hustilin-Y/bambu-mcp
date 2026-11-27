@@ -36,6 +36,7 @@ _SLOTS_PER_ROW = 4
 _GOALS_PER_ROW = 4
 MAX_BUTTONS = 24  # per Telegram message (global constraints)
 EVAL_BUTTON_TEXT = "🔍 Подобрать"
+RESET_BUTTON_TEXT = "↺ Сбросить мои настройки"
 CHOSEN_MARK = "✓ "
 # Characters the add-in's rich Markdown reads as formatting (multiclaude telegram.markdown_literal).
 _MARKDOWN_SPECIAL = re.compile(r"([\\`*_~=|\[\]$])")
@@ -282,6 +283,27 @@ def goal_buttons(job_id: int, current: str) -> list[list[Button]]:
         for g in GOALS.values()
     ]
     return [buttons[i : i + _GOALS_PER_ROW] for i in range(0, len(buttons), _GOALS_PER_ROW)]
+
+
+def reset_buttons(job_id: int) -> list[list[Button]]:
+    """«↺ Сбросить мои настройки» (``job:<id>:reset``): clears the owner's explicit settings."""
+    return [[Button(f"job:{job_id}:reset", RESET_BUTTON_TEXT)]]
+
+
+def explicit_line(explicit: Mapping) -> str | None:
+    """'твои настройки: 4 стенки, 25% gyroid': what «Сбросить мои настройки» clears. None: none."""
+    if not explicit:
+        return None
+    parts = _setting_parts(explicit)
+    covered = {
+        "wall_loops", "sparse_infill_density", "sparse_infill_pattern", "enable_support", "brim_type",
+        "layer_height", "wall_generator", "top_shell_layers", "bottom_shell_layers", "outer_wall_speed",
+        "seam_position", "ironing_type",
+    }
+    if "enable_support" in explicit and explicit.get("enable_support"):
+        covered.add("support_type")
+    parts += [md_literal(f"{k} {v}") for k, v in explicit.items() if k not in covered]
+    return f"твои настройки: {', '.join(parts)}"
 
 
 def eval_buttons(job_id: int) -> list[list[Button]]:
@@ -599,6 +621,7 @@ def render_proposal(
     symbol: str = DEFAULT_SYMBOL,
     goal: tuple[str, str | None, str, str | None] | None = None,
     stale_minutes: bool = False,
+    explicit: Mapping | None = None,
 ) -> str:
     """What the service is about to slice. ``estimate``: grams per plate index (None: the manifest's).
 
@@ -606,7 +629,8 @@ def render_proposal(
     ``cost``: the predicted cost of the whole job (its lines follow the grams), priced as
     if the print started now. ``stale_minutes``: its time comes from a slice made with other
     settings, which a line says. ``goal``: (primary, secondary, source, reason) from
-    ``evaluation.job_goal``, its line follows the cost.
+    ``evaluation.job_goal``, its line follows the cost. ``explicit``: the owner's stored
+    settings, named on their own line after the goal.
     """
     manifest = _job_manifest(job)
     grams = dict(estimate) if estimate is not None else {p.index: p.estimate_g for p in manifest.plates}
@@ -621,6 +645,9 @@ def render_proposal(
             lines.append(STALE_MINUTES_TEXT)
     if goal is not None:
         lines.append(goal_line(*goal))
+    owner_line = explicit_line(explicit or {})
+    if owner_line:
+        lines.append(owner_line)
     material, reason = job_material(manifest)
     if reason:
         lines.append(f"Почему {md_literal(material)}: {md_literal(reason)}")

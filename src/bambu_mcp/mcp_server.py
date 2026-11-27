@@ -25,7 +25,7 @@ import logging
 import math
 import re
 import socket
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import date
 from pathlib import Path
 from typing import Any, Protocol
@@ -158,6 +158,8 @@ class StatusSource(Protocol):
     ) -> asyncio.Task: ...
 
     async def choose_variant(self, job_id: int, n: int) -> str: ...
+
+    async def reset_settings(self, job_id: int, keys: Sequence[str] | None = None) -> dict: ...
 
     def start_slice(
         self,
@@ -1165,6 +1167,27 @@ def build_mcp(
         except ValueError as exc:
             raise ToolError(str(exc)) from None
         return {"job_id": job_id, "text": text}
+
+    @mcp.tool(annotations=WRITE)
+    async def reset_settings(job_id: int, keys: list[str] | None = None) -> dict[str, Any]:
+        """Clear the owner's explicit settings of a job (those slice_job or evaluate_job stored),
+        when the owner asks to drop them: all of them, or only `keys` (setting names, as in
+        slice_job). Returns `explicit` (what is left) and `settings` (the job's settings now).
+        Nothing is sliced. Refused while the job is being sliced or evaluated."""
+        job_or_error(job_id)
+        for key in keys or []:
+            if key not in OVERRIDE_KEYS:
+                raise ToolError(f"{key}: unknown setting, allowed: {', '.join(OVERRIDE_KEYS)}")
+        try:
+            settings = await service.reset_settings(job_id, keys)
+        except JobBusy:
+            raise ToolError(f"job {job_id} is being sliced or evaluated already") from None
+        except KeyError:
+            raise ToolError(f"job {job_id} not found") from None
+        except ValueError as exc:
+            raise ToolError(str(exc)) from None
+        job = store.job(job_id)
+        return {"job_id": job_id, "explicit": _loads(job.explicit_json if job else None) or {}, "settings": settings}
 
     @mcp.tool(annotations=READ)
     async def job_status(job_id: int) -> dict[str, Any]:

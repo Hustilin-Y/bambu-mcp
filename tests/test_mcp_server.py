@@ -65,6 +65,7 @@ TOOL_NAMES = {
     "slice_job",
     "evaluate_job",
     "choose_variant",
+    "reset_settings",
     "job_status",
     "jobs",
     "load_spool",
@@ -1382,3 +1383,21 @@ def test_rate_caps(jh):
     text = jh.error("set_amortization", valid_from="2027-01-01", printer_price=2e6, life_hours=1)
     assert "1000000" in text
     assert jh.store.amortization_on(datetime(2027, 2, 1).date()) is None
+
+
+def test_reset_settings_tool(jh):
+    job_id = jh.add_job()
+    jh.store.update_job(job_id, explicit_json=json.dumps({"wall_loops": 2, "sparse_infill_density": 40}))
+    some = jh.call("reset_settings", job_id=job_id, keys=["wall_loops"])
+    assert some["explicit"] == {"sparse_infill_density": 40}
+    assert (some["settings"]["wall_loops"], some["settings"]["sparse_infill_density"]) == (4, 40)
+    text = jh.error("reset_settings", job_id=job_id, keys=["walls"])
+    assert text.startswith("walls: unknown setting, allowed: ") and "wall_loops" in text
+    assert json.loads(jh.store.job(job_id).explicit_json) == {"sparse_infill_density": 40}
+    every = jh.call("reset_settings", job_id=job_id)
+    assert every["explicit"] == {} and every["settings"]["sparse_infill_density"] == 25
+    assert jh.store.job(job_id).explicit_json is None
+    jh.store.update_job(job_id, status="slicing")
+    assert "being sliced or evaluated" in jh.error("reset_settings", job_id=job_id)
+    assert jh.error("reset_settings", job_id=999) == "job 999 not found"
+    assert jh.waker.calls == 0 and jh.slicer.requests == []

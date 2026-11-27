@@ -22,7 +22,7 @@ import secrets as _secrets
 import shutil
 import signal
 import uuid
-from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -73,6 +73,7 @@ from bambu_mcp.messages import (
     plate_question,
     post_print_buttons,
     print_buttons,
+    reset_buttons,
     render_event,
     render_print_refused,
     render_print_started,
@@ -904,6 +905,9 @@ class Service:
                 return
             if _variant_press(press.button_id) is not None:
                 await self._on_variant_press(press)
+                return
+            if _reset_press(press.button_id) is not None:
+                await self._on_reset_press(press)
                 return
             if press.button_id.startswith("job:"):
                 text = self._on_job_press(press)
@@ -1959,6 +1963,50 @@ class Service:
         await self._notifier.edit(press.message_id, f"{run.before_text}\n{EVALUATING_TEXT}", run.before_buttons)
         self._spawn_eval(run)
 
+    # -- jobs: resetting the owner's explicit settings ---------------------------
+
+    async def reset_settings(self, job_id: int, keys: Sequence[str] | None = None) -> dict[str, object]:
+        """Clear the owner's explicit settings (``explicit_json``): all, or only ``keys``.
+
+        Returns the job's settings resolved after the reset. Nothing is sliced and the PC is
+        not woken. ``KeyError`` (unknown job), ``JobBusy`` (slicing or evaluating),
+        ``ValueError`` when the settings then do not resolve (a stored slot was emptied).
+        """
+        job = self._job(job_id)
+        if job.status not in CLAIMABLE:
+            raise JobBusy(f"job {job.id} is being sliced or evaluated already")
+        remaining = {} if keys is None else {k: v for k, v in _explicit(job).items() if k not in set(keys)}
+        # A slice or a run claimed in the meantime keeps its own plan.
+        if not self._store.transition_job(job.id, CLAIMABLE, explicit_json=json.dumps(remaining) if remaining else None):
+            raise JobBusy(f"job {job.id} is being sliced or evaluated already")
+        return self._plan(self._job(job.id), None, DEFAULT_NAMED_SET).settings
+
+    async def _on_reset_press(self, press: Press) -> None:
+        """``job:<id>:reset``: clear the explicit layer and edit the proposal in place. Never slices."""
+        job_id = _reset_press(press.button_id)
+        assert job_id is not None
+        job = self._store.job(job_id)
+        if job is None:
+            log.warning("reset press for unknown job %d ignored", job_id)
+            return
+        if job.status == "slicing":
+            await self._notifier.edit(press.message_id, self._busy_text(job))
+            return
+        if not self._store.transition_job(job.id, CLAIMABLE, explicit_json=None):
+            await self._notifier.edit(press.message_id, self._busy_text(self._job(job.id)))
+            return
+        try:
+            fresh = self._job(job.id)
+            text, buttons = self._proposal(fresh, self._plan(fresh, None, DEFAULT_NAMED_SET))
+        except ValueError as exc:  # SlotUnusable too: the stored slot was emptied since
+            log.warning("job %d: the proposal after a reset failed: %s", job.id, exc)
+            text = f"Мои настройки для «{job_name(job.name)}» сброшены, но предложение не собралось: {md_literal(str(exc))}"
+            self._enqueue("job_reset", text, _job_key(job.id, "reset"))
+            return
+        if not await self._notifier.edit(press.message_id, text, buttons):
+            log.warning("job %d: editing the proposal failed, sending it again", job.id)
+            self._enqueue("job_proposal", text, _job_key(job.id, "proposal"), buttons=buttons)
+
     async def choose_variant(self, job_id: int, n: int) -> str:
         """Make variant ``n`` of the job's last evaluation its ``variant`` layer and queue the
         proposal. Returns its text. ``KeyError`` (unknown job), ``ValueError`` (no evaluation,
@@ -2841,6 +2889,16 @@ def _eval_press(button_id: str) -> int | None:
     return int(parts[1])
 
 
+def _reset_press(button_id: str) -> int | None:
+    """The job id of a ``job:<id>:reset`` button, None for any other button."""
+    parts = button_id.split(":")
+    if len(parts) != 3 or parts[0] != "job" or parts[2] != "reset":
+        return None
+    if not (parts[1].isascii() and parts[1].isdigit() and len(parts[1]) <= 18):
+        return None
+    return int(parts[1])
+
+
 def _variant_press(button_id: str) -> tuple[int, int] | None:
     """(job id, variant number) of a ``job:<id>:variant:<n>`` button, None for any other button."""
     parts = button_id.split(":")
@@ -2942,9 +3000,10 @@ def _proposal(
     for a part, «Подобрать», then the variant row after an evaluation. At most
     ``MAX_BUTTONS``: the slot rows give way, and the goal rows to the variant row.
     ``stale``: the cost's time is from a slice made with other settings."""
+    explicit = _explicit(job)
     text = render_proposal(
         job, plan.settings, plan.choice, plan.plate_type, None, cost, symbol=symbol, goal=plan.goal,
-        stale_minutes=stale,
+        stale_minutes=stale, explicit=explicit,
     )
     for warning in (goal_warning(plan.goal[0], plan.settings), _preset_warning(plan)):
         if warning:
@@ -2963,11 +3022,23 @@ def _proposal(
     head = [Button(f"job:{job.id}:slice", SLICE_BUTTON_TEXT), Button(f"job:{job.id}:change", CHANGE_BUTTON_TEXT)]
     goals = goal_buttons(job.id, plan.goal[0])
     evaluate = eval_buttons(job.id) if plan.manifest.kind == "part" else []
-    fixed = len(head) + sum(len(r) for r in (*evaluate, *variants))
+    reset = reset_buttons(job.id) if explicit else []
+    fixed = len(head) + sum(len(r) for r in (*evaluate, *variants, *reset))
     if variants and fixed + sum(len(r) for r in goals) + len(plan.usable) > MAX_BUTTONS:
         goals = []  # spec 5.8: after an evaluation the variant row replaces the goal rows
+    elif reset and fixed + sum(len(r) for r in goals) + len(plan.usable) > MAX_BUTTONS:
+        goals = _without_one_goal(goals, plan.goal[0])  # the reset button takes a goal's place
     room = MAX_BUTTONS - fixed - sum(len(r) for r in goals)
-    return text, [head, *slot_buttons(job.id, plan.usable, chosen, room), *goals, *evaluate, *variants]
+    rows = [head, *slot_buttons(job.id, plan.usable, chosen, room), *goals, *evaluate, *variants, *reset]
+    return text, rows
+
+
+def _without_one_goal(rows: list[list[Button]], current: str) -> list[list[Button]]:
+    """The goal rows less their last button that is not the ``current`` goal."""
+    flat = [b for row in rows for b in row]
+    drop = next(i for i in range(len(flat) - 1, -1, -1) if not flat[i].id.endswith(f":goal:{current}"))
+    flat = flat[:drop] + flat[drop + 1:]
+    return [flat[i : i + 4] for i in range(0, len(flat), 4)]
 
 
 def _sliced_minutes(job: Job) -> dict[int, float] | None:
