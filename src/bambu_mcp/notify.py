@@ -77,6 +77,7 @@ class Press:
     message_id: str
     button_id: str
     at: datetime
+    via: str = "telegram"  # or "miniapp": the same button pressed in the Mini App (service-notify says)
 
 
 class Notifier(Protocol):
@@ -305,6 +306,7 @@ class ServiceNotifyClient:
                             message_id=str(item["message_id"]),
                             button_id=str(item["button_id"]),
                             at=datetime.fromtimestamp(float(item["at"]), UTC),
+                            via="miniapp" if item.get("via") == "miniapp" else "telegram",
                         )
                     )
                 except (KeyError, TypeError, ValueError, OverflowError, OSError):

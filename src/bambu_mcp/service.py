@@ -2462,7 +2462,7 @@ class Service:
                 log.exception("print start failed")
                 self._finish_start(confirm_id, "refused:internal", name, [INTERNAL_TEXT])
             else:
-                log.info("print start %s", outcome)
+                log.info("print start %s (press via %s)", outcome, press.via)
         finally:
             self._start_lock.release()
 
@@ -2812,7 +2812,7 @@ class Service:
             self._store.set_confirmation_outcome(key, outcome)
         except Exception:
             log.exception("recording a stop outcome failed")
-        log.info("stop press: %s", outcome)
+        log.info("stop press: %s (via %s)", outcome, press.via)
         await self._notifier.edit(press.message_id, text)
 
     async def _stop_claimed(self, confirmation: Any) -> tuple[str, str]:
