@@ -872,3 +872,15 @@ def render_start_unconfirmed(name: str | None, watch_s: float, gcode_state: str,
             "Команда повторно не отправляется. Посмотри на принтер, и если печати нет, подготовь её заново.",
         ]
     )
+
+
+# Every button kind the service sends to Telegram, for the Mini App's Capabilities screen.
+# The senders use the same text constants, so the screen can't drift from the buttons.
+BUTTONS: tuple[dict[str, str], ...] = (
+    {"label": START_BUTTON_TEXT, "what": "starts the print the confirmation names, after the checks run again"},
+    {"label": START_CANCEL_TEXT, "what": "cancels a start or stop confirmation"},
+    {"label": PAUSE_BUTTON_TEXT, "what": "pauses the running print"},
+    {"label": RESUME_BUTTON_TEXT, "what": "resumes the paused print (owner's press only, no tool can)"},
+    {"label": STOP_ASK_TEXT, "what": "asks for a stop confirmation"},
+    {"label": STOP_GO_TEXT, "what": "stops the print, it cannot be resumed then"},
+)
