@@ -16,6 +16,8 @@ UNIT_DIR="$HOME/.config/systemd/user"
 WORKSPACE="$HOME/workspaces/$OWNER"
 CA_URL="https://raw.githubusercontent.com/greghesp/ha-bambulab/main/custom_components/bambu_lab/pybambu/certs/bambu.cert"
 MCP_URL="http://127.0.0.1:8765/mcp"
+APP_URL="http://127.0.0.1:8765"         # the Mini App tab's /v1/ API, read by the router module
+APP_CONFIG="$CONF_DIR/miniapp.json"
 export PATH="$HOME/.local/bin:$PATH"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -75,6 +77,18 @@ fi
 if ! has CLIENT_TOKEN_ASSISTANT; then
   printf 'CLIENT_TOKEN_ASSISTANT=%s\n' "$(python3 -I -c 'import secrets; print(secrets.token_urlsafe(32))')" >> "$ENV_FILE"
 fi
+
+# -- 5b. the Mini App tab's token: reaches only /v1/, never /mcp ----------------------
+if ! has APP_TOKEN_MINIAPP; then
+  printf 'APP_TOKEN_MINIAPP=%s\n' "$(python3 -I -c 'import secrets; print(secrets.token_urlsafe(32))')" >> "$ENV_FILE"
+fi
+app_tok=$(mktemp "$CONF_DIR/.tok.XXXXXX")
+app_out=$(mktemp "$CONF_DIR/.miniapp.XXXXXX")
+chmod 600 "$app_tok" "$app_out"
+grep -E '^APP_TOKEN_MINIAPP=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '\n' > "$app_tok"
+jq -n --rawfile tok "$app_tok" --arg url "$APP_URL" '{url: $url, token: $tok}' > "$app_out"
+rm -f "$app_tok"
+mv "$app_out" "$APP_CONFIG"
 
 # -- 6. config.toml (only when absent: yours after that) ------------------------------
 if [ ! -f "$CONFIG" ]; then

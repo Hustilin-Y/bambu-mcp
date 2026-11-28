@@ -206,3 +206,86 @@ def test_addon_has_no_owner_values():
     owner_value_hits = module.owner_value_hits
 
     assert [h for h in owner_value_hits() if h.startswith("multiclaude/")] == []
+
+
+# -- the Mini App's Print tab (design 2026-11-28, 6.4) ---------------------------------------
+
+ADDONS_INIT = (
+    '"""The add-ins."""\n'
+    'ALL = ("slack", "siri", "voice-notes", "stickers", "locations", "reminders", "quiet-hours", "model-fallback",\n'
+    '       "skill-notes", "backup", "chat", "service-notify")\n'
+    "\n\ndef names():\n    return ALL\n"
+)
+ALL_LINE = 'ALL += ("bambu",)  # bambu-mcp install.sh'
+
+
+def _with_core(env: Env, init: str = ADDONS_INIT) -> Path:
+    path = env.root / "lib" / "multiclaude" / "addons" / "__init__.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(init)
+    return path
+
+
+def test_install_adds_router_module_and_all_line(tmp_path):
+    env = Env(tmp_path)
+    init = _with_core(env)
+    assert env.install().returncode == 0
+    module = env.root / "lib" / "multiclaude" / "addons" / "bambu"
+    assert (module / "__init__.py").is_file() and (module / "client.py").is_file()
+    assert init.read_text().rstrip().endswith(ALL_LINE)
+    assert (env.root / "addons" / "bambu" / "relay-public").is_dir()
+    namespace: dict = {}
+    exec(init.read_text(), namespace)
+    assert namespace["ALL"][-1] == "bambu"
+
+
+def test_install_twice_adds_line_once(tmp_path):
+    env = Env(tmp_path)
+    init = _with_core(env)
+    env.install()
+    env.install()
+    assert init.read_text().count(ALL_LINE) == 1
+
+
+def test_uninstall_removes_line_and_module(tmp_path):
+    env = Env(tmp_path)
+    init = _with_core(env)
+    env.install()
+    assert env.run("bash", str(INSTALL), "--root", str(env.root), "--uninstall").returncode == 0
+    assert init.read_text() == ADDONS_INIT
+    assert not (env.root / "lib" / "multiclaude" / "addons" / "bambu").exists()
+
+
+def test_install_after_local_gpu_patch(tmp_path):
+    env = Env(tmp_path)
+    patched = ADDONS_INIT.replace('"chat", "service-notify")', '"chat", "service-notify", "local-gpu")')
+    init = _with_core(env, patched)
+    env.install()
+    text = init.read_text()
+    assert '"service-notify", "local-gpu")' in text and text.rstrip().endswith(ALL_LINE)
+    env.run("bash", str(INSTALL), "--root", str(env.root), "--uninstall")
+    assert init.read_text() == patched
+
+
+def test_install_without_module_support_still_installs(e):
+    assert not (e.root / "lib").exists()
+    assert (e.root / "addons" / "bambu" / "setup").is_file()
+
+
+def test_setup_writes_miniapp_json_600(e):
+    assert e.setup().returncode == 0
+    path = e.home / ".config" / "bambu" / "miniapp.json"
+    data = json.loads(path.read_text())
+    token = next(line.split("=", 1)[1] for line in e.env_file.read_text().splitlines() if line.startswith("APP_TOKEN_MINIAPP="))
+    assert data == {"url": "http://127.0.0.1:8765", "token": token} and len(token) >= 32
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert e.setup().returncode == 0  # again: the same token
+    assert json.loads(path.read_text())["token"] == token
+    assert token not in e.log.read_text()
+
+
+def test_teardown_removes_miniapp_json(e):
+    e.setup()
+    assert e.teardown().returncode == 0
+    assert not (e.home / ".config" / "bambu" / "miniapp.json").exists()
+    assert "APP_TOKEN_MINIAPP=" in e.env_file.read_text()
