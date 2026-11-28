@@ -22,13 +22,14 @@ from bambu_mcp.store.models import (
     OutboxRow,
     Plate,
     PrintRow,
+    SentRef,
     Spool,
     Tariff,
 )
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
 _CONFIRMATION_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
-_SCHEMA_VERSION = 12
+_SCHEMA_VERSION = 13
 # schema.sql is the version-1 schema; each later version is one migration script.
 _MIGRATIONS = {
     2: "ALTER TABLE prints ADD COLUMN deducted_spool_id INTEGER REFERENCES spools(id);\n"
@@ -109,6 +110,15 @@ _MIGRATIONS = {
     "ALTER TABLE jobs ADD COLUMN variants_json TEXT;",
     # The owner's explicit settings (their words, ruling R2), kept as their own layer. NULL: none.
     12: "ALTER TABLE jobs ADD COLUMN explicit_json TEXT;",
+    # What a queued message is for, and the Telegram message each one became once sent
+    # (a confirmation's, a print's control buttons), so the Mini App can press its buttons.
+    13: "ALTER TABLE outbox ADD COLUMN ref TEXT;\n"
+    "CREATE TABLE sent_refs (\n"
+    "    ref TEXT PRIMARY KEY,\n"
+    "    message_id TEXT NOT NULL,\n"
+    "    text TEXT NOT NULL,\n"
+    "    sent_at REAL NOT NULL\n"
+    ");",
 }
 _SEEN_TTL_S = 30 * 24 * 3600
 _DEFAULT_TARIFF = (date(2024, 6, 1), 4.32, None)
@@ -684,6 +694,7 @@ class Store:
         snapshot: bool = False,
         now: float,
         expires_at: float | None = None,
+        ref: str | None = None,
     ) -> bool:
         """Queue a message. False when one with the same dedupe key is already waiting.
 
@@ -692,7 +703,7 @@ class Store:
         with self._tx() as conn:
             cur = conn.execute(
                 "INSERT OR IGNORE INTO outbox (kind, text, buttons, snapshot, dedupe, created_at,"
-                " next_attempt_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " next_attempt_at, expires_at, ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     kind,
                     text,
@@ -702,9 +713,22 @@ class Store:
                     now,
                     now,
                     expires_at,
+                    ref,
                 ),
             )
             return cur.rowcount == 1
+
+    def record_sent(self, ref: str, message_id: str, text: str, now: float) -> None:
+        """Remember the message ``ref`` became (replacing an older one with the same ref)."""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO sent_refs (ref, message_id, text, sent_at) VALUES (?, ?, ?, ?)",
+                (ref, message_id, text, now),
+            )
+
+    def sent_message(self, ref: str) -> SentRef | None:
+        row = self._conn().execute("SELECT message_id, text FROM sent_refs WHERE ref = ?", (ref,)).fetchone()
+        return SentRef(row["message_id"], row["text"]) if row else None
 
     def outbox_head(self) -> OutboxRow | None:
         """The oldest waiting message: delivery is strictly in order."""
@@ -722,6 +746,7 @@ class Store:
             attempts=row["attempts"],
             next_attempt_at=row["next_attempt_at"],
             expires_at=row["expires_at"],
+            ref=row["ref"],
         )
 
     def outbox_defer(self, id: int, attempts: int, next_attempt_at: float) -> None:
@@ -868,6 +893,14 @@ class Store:
             cur = conn.execute("UPDATE confirmations SET outcome = ? WHERE id = ?", (outcome, id))
             if cur.rowcount == 0:
                 raise KeyError("no such confirmation")  # the id stays out of logs and errors
+
+    def pending_confirmations(self, now: float) -> list[Confirmation]:
+        """Pending confirmations still valid at ``now``, newest first."""
+        rows = self._conn().execute(
+            "SELECT * FROM confirmations WHERE state = 'pending' AND expires_at > ? ORDER BY created_at DESC",
+            (now,),
+        )
+        return [_confirmation(r) for r in rows]
 
     def undecided_confirmations(self, kind: str) -> list[Confirmation]:
         """``used`` confirmations of ``kind`` with no outcome: a press a restart cut off. Oldest first."""

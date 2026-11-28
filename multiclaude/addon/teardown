@@ -22,6 +22,8 @@ if [ -f "$ENV_FILE" ]; then  # a revoked token is useless: setup issues a new on
   mv "$tmp" "$ENV_FILE"
 fi
 
+rm -f "$CONF_DIR/miniapp.json"  # the router module stops reading the service; the token stays in .env
+
 claude_json="$HOME/.claude.json"
 if [ -f "$claude_json" ]; then
   tmp=$(mktemp "$HOME/.claude.json.XXXXXX")

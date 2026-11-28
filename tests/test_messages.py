@@ -311,3 +311,13 @@ def test_render_variants_uses_each_entry_currency():
         "1️⃣ ✅ 3 стенки · ⏱ 50 мин · ⚖️ 8 г · 💰 14.45 грн · 💪 1.0×",
         "2️⃣ 4 стенки · ⏱ 50 мин · ⚖️ 8 г · 💰 1.50 EUR · 💪 ?",
     ]
+
+
+def test_control_buttons_order():
+    from bambu_mcp.messages import PAUSE_BUTTON_TEXT, RESUME_BUTTON_TEXT, STOP_ASK_TEXT, control_buttons
+
+    running = control_buttons("12", False)
+    paused = control_buttons("12", True)
+    assert [(b.id, b.text) for b in running[0]] == [("pause:12", PAUSE_BUTTON_TEXT), ("stop:ask:12", STOP_ASK_TEXT)]
+    assert [(b.id, b.text) for b in paused[0]] == [("resume:12", RESUME_BUTTON_TEXT), ("stop:ask:12", STOP_ASK_TEXT)]
+    assert len(running) == len(paused) == 1

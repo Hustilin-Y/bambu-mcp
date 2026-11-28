@@ -27,6 +27,7 @@ from bambu_mcp.printer.link import (
     PAUSE_PRINT,
     PUSH_ALL,
     READ_COMMANDS,
+    RESUME_PRINT,
     STOP_PRINT,
     TRAY_TYPES,
     LinkStatus,
@@ -596,7 +597,7 @@ def _pf_without(key: str) -> dict:
 @pytest.mark.parametrize(
     "payload",
     [
-        {"print": {"sequence_id": "0", "command": "resume", "param": ""}},
+        {"print": {"sequence_id": "0", "command": "resume", "param": "1"}},
         {"print": {"sequence_id": "0", "command": "resume"}},
         {"print": {"sequence_id": "0", "command": "gcode_line", "param": "G28"}},
         {"print": {"sequence_id": "0", "command": "gcode_line", "param": ""}},
@@ -680,7 +681,7 @@ def test_publish_refuses_everything_else(h, payload):
 def test_publish_accepts_exactly_the_allowed_payloads(h):
     h.client.fire_connect()
     h.client.calls.clear()
-    allowed = (GET_VERSION, PUSH_ALL, TRAY_PAYLOAD, PROJECT_PAYLOAD, PAUSE_PRINT, STOP_PRINT)
+    allowed = (GET_VERSION, PUSH_ALL, TRAY_PAYLOAD, PROJECT_PAYLOAD, PAUSE_PRINT, RESUME_PRINT, STOP_PRINT)
     for payload in allowed:
         h.link._publish(payload)
     assert _sent(h) == list(allowed)
@@ -1039,3 +1040,11 @@ def test_link_uses_settings_profile():
     with pytest.raises(ValueError):
         harness.link.set_tray(ams=0, slot=0, tray_info_idx="GFA00", tray_type="PLA", color_rgba="FF8800FF",
                               nozzle_temp_min=190, nozzle_temp_max=230)
+
+
+def test_resume_payload_exact_and_sent(h):
+    assert RESUME_PRINT == {"print": {"sequence_id": "0", "command": "resume", "param": ""}}
+    h.client.fire_connect()
+    h.client.calls.clear()
+    assert h.link.resume() is None
+    assert h.client.calls == [("publish", f"device/{SERIAL}/request", RESUME_PRINT)]

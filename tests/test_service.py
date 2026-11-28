@@ -41,6 +41,7 @@ from bambu_mcp.service import (
 )
 from bambu_mcp.slicer import FetchError, SliceOutcome, WakeError
 from bambu_mcp.store.db import Store
+from bambu_mcp.store.models import SentRef
 
 FIXTURES = Path(__file__).parent / "fixtures" / "p2s"
 T0 = datetime(2026, 11, 22, 10, 0, tzinfo=UTC)
@@ -303,6 +304,7 @@ async def test_fit_press_updates_journal_and_edits_message(harness):
     spool_mid = f"m{len(harness.notifier.sent)}"
     queue = harness.notifier.press_queue
 
+    harness.notifier.edits.clear()  # the print's control buttons came off at its end
     await queue.put(Press(1, fit_mid, f"fit:{row.id}:tight", T0))
     await until(lambda: len(harness.notifier.edits) == 1)
     assert harness.store.print_by_identity(row.identity).fit == "tight"
@@ -2610,6 +2612,11 @@ class PrintLink(FakeLink):
             raise PrinterNotConnected("printer link is not connected, nothing was sent")
         self.events.append("pause")
 
+    def resume(self) -> None:
+        if self.refuse:
+            raise PrinterNotConnected("printer link is not connected, nothing was sent")
+        self.events.append("resume")
+
     def stop_print(self) -> None:
         if self.refuse:
             raise PrinterNotConnected("printer link is not connected, nothing was sent")
@@ -2836,7 +2843,7 @@ async def test_press_starts_once_then_started_message(harness):
     }
     started = [m for m in harness.notifier.sent if "Печать началась" in m["text"]]
     assert len(started) == 1
-    assert plain(started[0]["buttons"]) == [[(f"stop:ask:{task_id}", "Остановить…")]]
+    assert plain(started[0]["buttons"]) == [[(f"pause:{task_id}", "⏸ Пауза"), (f"stop:ask:{task_id}", "Остановить…")]]
 
 
 async def test_a_start_after_a_finished_print_is_announced_once(harness):
@@ -2861,7 +2868,7 @@ async def test_a_start_after_a_finished_print_is_announced_once(harness):
     await until(lambda: harness.store.outbox_count() == 0)
     started = [m for m in harness.notifier.sent if "Печать началась" in m["text"]]
     assert len(started) == 1
-    assert plain(started[0]["buttons"]) == [[(f"stop:ask:{task_id}", "Остановить…")]]
+    assert plain(started[0]["buttons"]) == [[(f"pause:{task_id}", "⏸ Пауза"), (f"stop:ask:{task_id}", "Остановить…")]]
 
 
 async def test_double_press_and_restart_replay_start_once(harness):
@@ -3193,7 +3200,8 @@ async def test_stop_ask_button_sends_the_confirmation(harness):
     cid = message["buttons"][0][0].id.split(":")[1]
     assert plain(message["buttons"]) == [[(f"stop:{cid}:go", STOP_GO_TEXT), (f"stop:{cid}:cancel", "Отмена")]]
     assert harness.store.confirmation(cid).kind == "stop"
-    assert harness.notifier.edits == []  # the start message keeps its text
+    sent_texts = {f"m{i + 1}": m["text"] for i, m in enumerate(harness.notifier.sent)}
+    assert all(text == sent_texts[mid] for mid, text in harness.notifier.edits)  # the start message keeps its text
     assert "stop" not in harness.events
 
 
@@ -3254,8 +3262,8 @@ async def test_stop_press_after_print_changed_refuses(harness, change):
         expected = "истекло"
 
     await press(harness, f"stop:{cid}:go", "m7")
-    await until(lambda: harness.notifier.edits)
-    answer = harness.notifier.edits[0][1]
+    await until(lambda: any(mid == "m7" for mid, _ in harness.notifier.edits))
+    answer = next(text for mid, text in harness.notifier.edits if mid == "m7")
     assert expected in answer
     assert "—" not in answer and ";" not in answer
     assert "stop" not in harness.events
@@ -3553,10 +3561,10 @@ async def test_stop_during_prepare(harness, entry):
     assert "stop" not in harness.events
 
     await press(harness, f"stop:{cid}:go", "m7")
-    await until(lambda: harness.notifier.edits)
-    assert harness.notifier.edits[-1] == ("m7", "⏹ Команда остановки отправлена")
+    await until(lambda: any(mid == "m7" for mid, _ in harness.notifier.edits))
+    assert [e for e in harness.notifier.edits if e[0] == "m7"] == [("m7", "⏹ Команда остановки отправлена")]
     await press(harness, f"stop:{cid}:go", "m7")
-    await until(lambda: len(harness.notifier.edits) == 2)
+    await until(lambda: len([e for e in harness.notifier.edits if e[0] == "m7"]) == 2)
     assert harness.events.count("stop") == 1
 
 
@@ -3609,3 +3617,237 @@ def test_tray_now_254_is_the_external_spool():
     assert _tray_slot({"print": {"ams": {"tray_now": "254"}}}) == (255, 254)
     assert _tray_slot({"print": {"ams": {"tray_now": "255"}}}) is None  # nothing feeding
     assert _tray_slot({"print": {"ams": {"tray_now": "2"}}}) == (0, 2)
+
+
+async def test_send_records_the_message_of_a_ref(tmp_path):
+    clock = Clock(T0)
+    notifier = RecordingNotifier()
+    service, store = bare_service(tmp_path, notifier, clock)
+    service._enqueue("stop_confirm", "stop?", "stop|x", ref="confirm:abc")
+    service._enqueue("started", "go", "started|x")
+    await service.send_next()
+    await service.send_next()
+    assert store.sent_message("confirm:abc") == SentRef("m1", "stop?")
+    store.close()
+
+
+
+# -- pause and resume buttons (Mini App design 6.2) ---------------------------------
+
+
+def _control_message(harness, task_id: str = "777") -> tuple[str, dict]:
+    for i, message in enumerate(harness.notifier.sent):
+        if any(b.id == f"pause:{task_id}" for row in message["buttons"] for b in row):
+            return f"m{i + 1}", message
+    raise AssertionError("no control message")
+
+
+async def _printing(harness, printer, **kw):
+    await running(harness, printer, **kw)
+    await until(lambda: harness.store.outbox_count() == 0)
+
+
+async def test_started_gets_control_buttons(harness):
+    _service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, message = _control_message(harness)
+    assert plain(message["buttons"]) == [[("pause:777", "⏸ Пауза"), ("stop:ask:777", "Остановить…")]]
+    assert harness.store.sent_message("control:777") == SentRef(message_id, message["text"])
+
+
+async def test_started_without_task_id_gets_no_control_buttons(harness):
+    _service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer, task_id="x12")
+    assert not any(b.id.startswith("pause:") for m in harness.notifier.sent for row in m["buttons"] for b in row)
+    assert harness.store.sent_message("control:x12") is None
+
+
+async def test_pause_press_pauses_and_buttons_follow_the_printer(harness):
+    _service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, message = _control_message(harness)
+    await press(harness, "pause:777", message_id)
+    await until(lambda: "pause" in harness.events and harness.notifier.edits)
+    assert harness.events.count("pause") == 1
+    assert harness.notifier.edits[-1] == (message_id, message["text"])
+    # the printer still says RUNNING: the buttons say what is true, not what was asked
+    assert plain(harness.notifier.edit_buttons[-1])[0][0][0] == "pause:777"
+    await running(harness, printer, state="PAUSE")
+    await until(lambda: len(harness.notifier.edits) >= 2)
+    assert plain(harness.notifier.edit_buttons[-1]) == [[("resume:777", "▶️ Продолжить"), ("stop:ask:777", "Остановить…")]]
+
+
+async def test_resume_press_sends_once(harness):
+    _service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, _message = _control_message(harness)
+    await running(harness, printer, state="PAUSE")
+    await press(harness, "resume:777", message_id)
+    await press(harness, "resume:777", message_id)
+    await until(lambda: len(harness.notifier.edits) >= 3)
+    await until(lambda: harness.store.outbox_count() == 0)
+    assert harness.events.count("resume") == 1
+    assert plain(harness.notifier.edit_buttons[-1])[0][0][0] == "resume:777"  # the second press: still paused
+    await running(harness, printer, state="RUNNING")
+    await press(harness, "resume:777", message_id)
+    await until(lambda: len(harness.notifier.edits) >= 4)
+    assert harness.events.count("resume") == 1  # running again: nothing to resume
+
+
+async def test_resume_press_refused_while_running(harness):
+    _service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, message = _control_message(harness)
+    sent = len(harness.notifier.sent)
+    await press(harness, "resume:777", message_id)
+    await until(lambda: harness.notifier.edits and len(harness.notifier.sent) > sent)
+    assert "resume" not in harness.events
+    assert "не на паузе" in harness.notifier.sent[-1]["text"]
+    assert harness.notifier.edits[-1] == (message_id, message["text"])
+    assert plain(harness.notifier.edit_buttons[-1])[0][0][0] == "pause:777"
+
+
+async def test_buttons_restored_after_refused_pause(harness):
+    _service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, message = _control_message(harness)
+    await running(harness, printer, state="PAUSE")
+    await until(lambda: harness.notifier.edits)
+    edits = len(harness.notifier.edits)
+    await press(harness, "pause:777", message_id)
+    await until(lambda: len(harness.notifier.edits) > edits)
+    assert "pause" not in harness.events
+    assert harness.notifier.edits[-1] == (message_id, message["text"])
+    assert plain(harness.notifier.edit_buttons[-1])[0][0][0] == "resume:777"
+
+
+async def test_pause_seen_in_report_switches_buttons(harness):
+    _service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, message = _control_message(harness)
+    await running(harness, printer, state="PAUSE")
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits[-1] == (message_id, message["text"])
+    assert plain(harness.notifier.edit_buttons[-1])[0][0][0] == "resume:777"
+    await running(harness, printer, state="RUNNING")
+    await until(lambda: len(harness.notifier.edits) >= 2)
+    assert plain(harness.notifier.edit_buttons[-1])[0][0][0] == "pause:777"
+
+
+async def test_control_buttons_off_when_the_print_ends(harness):
+    _service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, message = _control_message(harness)
+    await running(harness, printer, state="FINISH")
+    await until(lambda: harness.notifier.edits)
+    assert harness.notifier.edits[-1] == (message_id, message["text"])
+    assert harness.notifier.edit_buttons[-1] == []
+
+
+async def test_stop_ask_keeps_control_buttons(harness):
+    _service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, message = _control_message(harness)
+    sent = len(harness.notifier.sent)
+    await press(harness, "stop:ask:777", message_id)
+    await until(lambda: len(harness.notifier.sent) > sent and harness.notifier.edits)
+    assert harness.notifier.sent[-1]["buttons"][0][0].id.endswith(":go")
+    assert harness.notifier.edits[-1] == (message_id, message["text"])
+    assert plain(harness.notifier.edit_buttons[-1])[0][0][0] == "pause:777"
+    assert "stop" not in harness.events
+
+
+# -- Mini App background prepare and snapshot (design 6.1) --------------------------
+
+
+async def test_start_prepare_refusal_becomes_note(harness):
+    service, job, printer = await print_harness(harness)
+    await running(harness, printer)  # busy: the pre-flight refuses
+    assert service.start_prepare(job.id, 1) is True
+    assert service.start_prepare(job.id, 1) is False  # one at a time
+    await until(lambda: service.app_notes)
+    (note,) = service.app_notes
+    assert note["text"].startswith("Печать не подготовлена:") and "занят" in note["text"]
+    assert "\\" not in note["text"] and ";" not in note["text"]
+    assert service.start_prepare(job.id, 1) is True  # the first one is over
+
+
+async def test_start_prepare_unknown_job_becomes_note(harness):
+    service, _job, _printer = await print_harness(harness)
+    assert service.start_prepare(9999, 1) is True
+    await until(lambda: service.app_notes)
+    assert "не найдено" in service.app_notes[-1]["text"]
+
+
+async def test_send_snapshot_queues_once_a_minute(tmp_path):
+    clock = Clock(T0)
+    notifier = RecordingNotifier()
+    service, store = bare_service(tmp_path, notifier, clock)
+    assert service.send_snapshot() is True
+    assert service.send_snapshot() is False
+    await service.send_next()
+    assert notifier.sent[0]["files"] == [("snapshot.jpg", JPEG)]
+    store.close()
+
+
+
+# -- final review fixes (2026-11-28) -----------------------------------------------------
+
+
+async def test_a_lost_resume_can_be_pressed_again(harness):
+    _service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, _message = _control_message(harness)
+    await running(harness, printer, state="PAUSE")
+    await press(harness, "resume:777", message_id)
+    await until(lambda: "resume" in harness.events)
+    # the printer never left PAUSE: the buttons still offer Resume, a second press soon is refused
+    await until(lambda: plain(harness.notifier.edit_buttons[-1])[0][0][0] == "resume:777")
+    await press(harness, "resume:777", message_id)
+    await until(lambda: harness.store.outbox_count() == 0 and any("уже отправлена" in m["text"] for m in harness.notifier.sent))
+    assert harness.events.count("resume") == 1
+    harness.clock.advance(seconds=61)
+    await press(harness, "resume:777", message_id)
+    await until(lambda: harness.events.count("resume") == 2)
+
+
+async def test_tab_press_refusal_becomes_a_note(harness):
+    service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, _message = _control_message(harness)
+    harness.seq = getattr(harness, "seq", 0) + 1
+    await harness.notifier.press_queue.put(Press(harness.seq, message_id, "resume:777", T0, "miniapp"))
+    await until(lambda: service.app_notes)
+    assert "не на паузе" in service.app_notes[-1]["text"]
+
+
+async def test_telegram_press_refusal_makes_no_note(harness):
+    service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, _message = _control_message(harness)
+    await press(harness, "resume:777", message_id)
+    await until(lambda: any("не на паузе" in m["text"] for m in harness.notifier.sent))
+    assert not service.app_notes
+
+
+async def test_tab_stop_outcome_becomes_a_note(harness):
+    service, _job, printer = await print_harness(harness)
+    await running(harness, printer)
+    cid = (await service.request_stop()).confirm_id
+    harness.seq = getattr(harness, "seq", 0) + 1
+    await harness.notifier.press_queue.put(Press(harness.seq, "m7", f"stop:{cid}:go", T0, "miniapp"))
+    await until(lambda: service.app_notes)
+    assert "остановки отправлена" in service.app_notes[-1]["text"]
+
+
+async def test_tab_start_refusal_becomes_a_note(harness):
+    service, job, printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await until(lambda: harness.store.outbox_count() == 0)
+    await running(harness, printer)  # busy now: the start's own re-check refuses
+    harness.seq = getattr(harness, "seq", 0) + 1
+    await harness.notifier.press_queue.put(Press(harness.seq, "m1", f"start:{cid}:go", T0, "miniapp"))
+    await until(lambda: harness.store.confirmation(cid).outcome is not None, timeout=5)
+    assert harness.store.confirmation(cid).outcome.startswith("refused")
+    await until(lambda: service.app_notes)
+    assert service.app_notes[-1]["text"].startswith("Печать не началась")

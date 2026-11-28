@@ -310,3 +310,24 @@ async def test_presses_skips_malformed_items(caplog):
                 break
     assert got == [1, 3]
     assert "malformed press skipped" in caplog.text
+
+
+async def test_press_via_parsed():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "presses": [
+                    {"seq": 1, "message_id": "m", "button_id": "b", "at": 1700000000, "via": "miniapp"},
+                    {"seq": 2, "message_id": "m", "button_id": "b", "at": 1700000000},
+                    {"seq": 3, "message_id": "m", "button_id": "b", "at": 1700000000, "via": "carrier-pigeon"},
+                ]
+            },
+        )
+
+    got = []
+    async for press in make(handler).presses():
+        got.append(press)
+        if len(got) == 3:
+            break
+    assert [p.via for p in got] == ["miniapp", "telegram", "telegram"]

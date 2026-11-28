@@ -96,6 +96,15 @@ class OutboxRow:
     attempts: int
     next_attempt_at: float
     expires_at: float | None = None  # epoch seconds the buttons stop working (a confirmation's)
+    ref: str | None = None  # what the message is for, to find its Telegram id later ("confirm:<id>", "control:<task>")
+
+
+@dataclass(frozen=True)
+class SentRef:
+    """A sent message the service may need again: its id in service-notify and its text as sent."""
+
+    message_id: str
+    text: str
 
 
 @dataclass(frozen=True)

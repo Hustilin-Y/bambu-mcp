@@ -794,6 +794,21 @@ def stop_ask_buttons(task_id: str) -> list[list[Button]]:
     return [[Button(f"stop:ask:{task_id}", STOP_ASK_TEXT)]]
 
 
+PAUSE_BUTTON_TEXT = "⏸ Пауза"
+RESUME_BUTTON_TEXT = "▶️ Продолжить"
+
+
+def control_buttons(task_id: str, paused: bool) -> list[list[Button]]:
+    """A print's buttons: Pause (or Resume while paused) first, then the stop question.
+
+    The Mini App relies on the order: index 0 pauses or resumes, index 1 asks to stop.
+    """
+    first = (
+        Button(f"resume:{task_id}", RESUME_BUTTON_TEXT) if paused else Button(f"pause:{task_id}", PAUSE_BUTTON_TEXT)
+    )
+    return [[first, Button(f"stop:ask:{task_id}", STOP_ASK_TEXT)]]
+
+
 def stop_buttons(confirm_id: str) -> list[list[Button]]:
     return [[Button(f"stop:{confirm_id}:go", STOP_GO_TEXT), Button(f"stop:{confirm_id}:cancel", START_CANCEL_TEXT)]]
 
@@ -857,3 +872,15 @@ def render_start_unconfirmed(name: str | None, watch_s: float, gcode_state: str,
             "Команда повторно не отправляется. Посмотри на принтер, и если печати нет, подготовь её заново.",
         ]
     )
+
+
+# Every button kind the service sends to Telegram, for the Mini App's Capabilities screen.
+# The senders use the same text constants, so the screen can't drift from the buttons.
+BUTTONS: tuple[dict[str, str], ...] = (
+    {"label": START_BUTTON_TEXT, "what": "starts the print the confirmation names, after the checks run again"},
+    {"label": START_CANCEL_TEXT, "what": "cancels a start or stop confirmation"},
+    {"label": PAUSE_BUTTON_TEXT, "what": "pauses the running print"},
+    {"label": RESUME_BUTTON_TEXT, "what": "resumes the paused print (owner's press only, no tool can)"},
+    {"label": STOP_ASK_TEXT, "what": "asks for a stop confirmation"},
+    {"label": STOP_GO_TEXT, "what": "stops the print, it cannot be resumed then"},
+)

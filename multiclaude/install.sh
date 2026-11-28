@@ -5,7 +5,9 @@
 #   multiclaude/install.sh [--root DIR] --uninstall      turn it off and remove it
 #
 # DIR is the multiclaude checkout: $ASSISTANT_ROOT, or ~/assistant. NAME is the multiclaude user
-# whose assistant drives the printer (default: the owner in users.json). The service itself runs
+# whose assistant drives the printer (default: the owner in users.json). install adds one line to
+# multiclaude's tracked lib/multiclaude/addons/__init__.py (the Mini App tab): before a `git pull` in
+# that checkout, run --uninstall, pull, then install again (as local-gpu's install.sh asks too). The service itself runs
 # from this clone of bambu-mcp. The add-in needs the service-notify add-in (the print and stop
 # buttons in Telegram); `setup` stops with a pointer when it is missing.
 set -euo pipefail
@@ -20,7 +22,7 @@ while [ $# -gt 0 ]; do
     --root) ROOT="${2:?--root needs a directory}"; shift 2 ;;
     --user) user="${2:?--user needs a name}"; shift 2 ;;
     --uninstall) action=uninstall; shift ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -28,10 +30,28 @@ done
 [ -f "$ROOT/bin/assistant" ] && [ -d "$ROOT/addons" ] || { echo "error: no multiclaude checkout at $ROOT (--root DIR)" >&2; exit 1; }
 ROOT="$(cd "$ROOT" && pwd)"
 FOLDER="$ROOT/addons/$NAME"
+# The Mini App's Print tab: the router module goes into multiclaude's add-in package, and its name is
+# added to the add-in list by one line at the end of that file (never by a patch: local-gpu's patch
+# edits the list's own line, and both must apply in any order).
+ADDONS_INIT="$ROOT/lib/multiclaude/addons/__init__.py"
+MODULE="$ROOT/lib/multiclaude/addons/bambu"
+ALL_LINE='ALL += ("bambu",)  # bambu-mcp install.sh'
 is_on() { jq -e --arg n "$NAME" '.addons // [] | any(. == $n)' "$ROOT/config.json" >/dev/null 2>&1; }
+
+drop_all_line() {
+  [ -f "$ADDONS_INIT" ] || return 0
+  local tmp
+  tmp=$(mktemp "$ADDONS_INIT.XXXXXX")
+  grep -vxF "$ALL_LINE" "$ADDONS_INIT" > "$tmp" || true
+  # the line went in after one newline of its own: take that off too, so the file is as it was
+  python3 -I -c 'import sys; p = sys.argv[1]; t = open(p).read(); open(p, "w").write(t[:-1] if t.endswith("\n\n") else t)' "$tmp"
+  cat "$tmp" > "$ADDONS_INIT" && rm -f "$tmp"
+}
 
 if [ "$action" = uninstall ]; then
   if is_on; then "$ROOT/bin/assistant" addon disable "$NAME"; fi
+  drop_all_line
+  rm -rf "$MODULE"
   rm -rf "$FOLDER"
   echo "$NAME is out of $ROOT. The service's settings and data ($HOME/.config/bambu, $HOME/.local/share/bambu) are kept."
   exit 0
@@ -63,10 +83,25 @@ fill "$HERE/addon/bambu-service.service" > "$FOLDER/bambu-service.service" && ch
 for script in setup teardown; do
   fill "$HERE/addon/$script" > "$FOLDER/$script" && chmod 755 "$FOLDER/$script"
 done
+# The Print tab's page module: `assistant relay deploy` uploads relay-public/, which is public.
+rm -rf "$FOLDER/relay-public" && cp -R "$HERE/addon/relay-public" "$FOLDER/relay-public"
+
+# The Print tab's router module, where multiclaude has add-in modules (the chat Mini App).
+if [ -f "$ADDONS_INIT" ]; then
+  rm -rf "$MODULE" && mkdir -p "$MODULE"
+  install -m 644 "$HERE"/router/bambu/*.py "$MODULE/"
+  if ! grep -qxF "$ALL_LINE" "$ADDONS_INIT"; then
+    printf '\n%s\n' "$ALL_LINE" >> "$ADDONS_INIT"
+  fi
+else
+  echo "This multiclaude has no add-in modules: the Mini App's Print tab is left out."
+fi
 
 # Keep the copied folder out of the checkout's `git status` and out of the way of `git pull`.
 if [ -d "$ROOT/.git" ]; then
-  grep -qxF "/addons/$NAME/" "$ROOT/.git/info/exclude" 2>/dev/null || echo "/addons/$NAME/" >> "$ROOT/.git/info/exclude"
+  for path in "/addons/$NAME/" /lib/multiclaude/addons/bambu/; do
+    grep -qxF "$path" "$ROOT/.git/info/exclude" 2>/dev/null || echo "$path" >> "$ROOT/.git/info/exclude"
+  done
 fi
 
 echo "$NAME is in $ROOT: the service from $BAMBU_HOME, for $user ($display)."
