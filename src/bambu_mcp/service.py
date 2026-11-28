@@ -10,6 +10,7 @@ slice, send the summary with the plate picture).
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import functools
 import hashlib
@@ -232,6 +233,8 @@ STOP_NOT_CONNECTED_TEXT = "Принтер не на связи, остановк
 STOP_NOT_FRESH_TEXT = "Принтер ещё не прислал свежий отчёт после переподключения, остановка не отправлена"
 STOP_OVER_TEXT = "Эта печать уже не идёт, останавливать нечего"
 STOP_UNSURE_TEXT = "⚠️ Не знаю, дошла ли команда остановки. Посмотри на принтер, повторно она не отправляется"
+APP_NOTES_KEPT = 5
+SNAPSHOT_TEXT = "📷 Снимок"
 CONTROL_NOT_RUNNING_TEXT = "Печать не идёт, ставить на паузу нечего"
 CONTROL_NOT_PAUSED_TEXT = "Печать не на паузе, продолжать нечего"
 CONTROL_OTHER_TEXT = "Сейчас идёт другая печать, а кнопка была для прежней. Ничего не отправлено"
@@ -519,6 +522,8 @@ class Service:
         self._report_waiters: set[asyncio.Event] = set()
         self._restore_wait_s = restore_wait_s
         self._watch: _StartWatch | None = None
+        self.app_notes: collections.deque[dict[str, Any]] = collections.deque(maxlen=APP_NOTES_KEPT)
+        self._preparing: asyncio.Task | None = None  # the Mini App's prepare, one at a time
         self._control: dict[str, bool] = {}  # task id -> paused variant last put on its control message
         self._resumed: set[str] = set()  # resume sent, the printer not yet out of PAUSE
         self._own_tasks: set[str] = set()  # task ids this process sent: their start gets the stop button
@@ -767,12 +772,13 @@ class Service:
         snapshot: bool = False,
         expires_at: float | None = None,
         ref: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Queue a message. ``expires_at`` (epoch seconds): when its buttons stop working.
 
         ``ref`` names what the message is for, so its Telegram id can be found once sent.
+        False when a message with the same dedupe key is already waiting.
         """
-        self._store.outbox_add(
+        queued = self._store.outbox_add(
             kind,
             text,
             notify_dedupe(dedupe),
@@ -784,6 +790,7 @@ class Service:
         )
         if self._outbox_wake is not None:
             self._outbox_wake.set()
+        return queued
 
     async def _snapshot_for(self, row_id: int) -> bytes | None:
         """The head message's picture: taken at its first attempt, reused for retries."""
@@ -2636,6 +2643,40 @@ class Service:
 
     # -- printing: pause and the confirmed stop (phase 3) -----------------------------
 
+    def start_prepare(self, job_id: int, plate: int) -> bool:
+        """``prepare_print`` for the Mini App, in the background: False while one runs.
+
+        Its refusal or failure becomes a Russian line in ``app_notes`` (the tab shows it), and the
+        confirmation itself appears in the snapshot's pending list once it went out.
+        """
+        if self._preparing is not None and not self._preparing.done():
+            return False
+        self._preparing = asyncio.create_task(self._prepare_for_app(job_id, plate), name=f"bambu-app-prepare-{job_id}")
+        self._press_tasks.add(self._preparing)
+        self._preparing.add_done_callback(self._press_tasks.discard)
+        return True
+
+    async def _prepare_for_app(self, job_id: int, plate: int) -> None:
+        try:
+            await self.prepare_print(job_id, plate)
+        except PrintRefused as exc:
+            self._app_note("Печать не подготовлена: " + ". ".join(_plain(line).rstrip(".") for line in exc.lines))
+        except KeyError:
+            self._app_note(f"Печать не подготовлена: задание {job_id} не найдено")
+        except ValueError as exc:
+            self._app_note(f"Печать не подготовлена: {_plain(str(exc))}")
+        except Exception:
+            log.exception("job %d: preparing for the Mini App failed", job_id)
+            self._app_note(f"Печать не подготовлена: {INTERNAL_TEXT}")
+
+    def _app_note(self, text: str) -> None:
+        self.app_notes.append({"at": self._clock().timestamp(), "text": text})
+
+    def send_snapshot(self) -> bool:
+        """One camera frame to the owner's Telegram, at most one queued a minute."""
+        minute = int(self._clock().timestamp() // 60)
+        return self._enqueue("snapshot", SNAPSHOT_TEXT, f"snap|{minute}", snapshot=True)
+
     async def pause_print(self) -> dict[str, str | None]:
         """Pause the running print, once. Only while ``RUNNING``. Resume is the owner's button only.
 
@@ -2909,6 +2950,11 @@ def _control_task(task_id: str | None) -> bool:
     """Whether a print's task id can carry control buttons: digits, and not "0", which the
     printer reports for prints without a task of their own and so tells no two prints apart."""
     return bool(task_id) and task_id != "0" and TASK_ID_RE.fullmatch(task_id) is not None
+
+
+def _plain(text: str) -> str:
+    """A Markdown-escaped line as plain text, for the Mini App."""
+    return re.sub(r"\\(.)", r"\1", text)
 
 
 _CONTROL_PRESS_RE = re.compile(r"(pause|resume):([0-9]{1,19})", re.ASCII)

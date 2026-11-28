@@ -1330,7 +1330,11 @@ def build_app(
     app.router.routes.append(
         Route(JOBS_PATH, _jobs_endpoint(store, settings, max_job_file_bytes), methods=["POST"])
     )
-    app.router.routes.extend(app_routes or [])
+    if app_routes is None:
+        from bambu_mcp.app_api import app_routes as v1_routes
+
+        app_routes = v1_routes(service, store, settings, mcp)
+    app.router.routes.extend(app_routes)
     app.add_middleware(BearerTokenMiddleware, tokens=secrets.client_tokens, app_tokens=secrets.app_tokens)
     return app
 

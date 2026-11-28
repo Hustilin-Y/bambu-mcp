@@ -9,11 +9,17 @@ access code, a token or a server path.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 
 from bambu_mcp.config import Settings
 from bambu_mcp.messages import BUTTONS, control_buttons, start_buttons, stop_buttons
 from bambu_mcp.printer.state import EXTERNAL_AMS, EXTERNAL_TRAY
+from bambu_mcp.printgate import ControlRefused
 from bambu_mcp.proposal import slot_number
 from bambu_mcp.store.db import Store
 from bambu_mcp.store.models import Confirmation, Job, PrintRow, Spool
@@ -205,3 +211,61 @@ def _loads(text: str | None) -> dict[str, Any]:
     except ValueError:
         return {}
     return value if isinstance(value, dict) else {}
+
+
+# -- endpoints -------------------------------------------------------------------------
+
+
+def app_routes(service: Any, store: Store, settings: Settings, mcp: Any) -> list[Route]:
+    """The ``/v1/`` routes. The bearer middleware lets only app tokens reach them."""
+
+    async def snapshot(_request: Request) -> Response:
+        return JSONResponse(build_snapshot(service, store, settings, time.time()))
+
+    async def capabilities(_request: Request) -> Response:
+        return JSONResponse(await build_capabilities(mcp, settings))
+
+    async def pause(_request: Request) -> Response:
+        try:
+            await service.pause_print()
+        except ControlRefused as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        return JSONResponse({"sent": "pause"})
+
+    async def request_stop(_request: Request) -> Response:
+        try:
+            await service.request_stop()  # its confirmation id stays in the service
+        except ControlRefused as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        return JSONResponse({"asked": True}, status_code=202)
+
+    async def prepare(request: Request) -> Response:
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        job_id = body.get("job_id") if isinstance(body, dict) else None
+        plate = body.get("plate") if isinstance(body, dict) else None
+        if not (_positive_int(job_id) and _positive_int(plate)):
+            return JSONResponse({"error": "job_id and plate must be positive integers"}, status_code=422)
+        if not service.start_prepare(job_id, plate):
+            return JSONResponse({"error": "уже готовлю печать"}, status_code=409)
+        return JSONResponse({"pending": True}, status_code=202)
+
+    async def snapshot_to_telegram(_request: Request) -> Response:
+        if not service.send_snapshot():
+            return JSONResponse({"error": "снимок уже в очереди"}, status_code=409)
+        return JSONResponse({"queued": True}, status_code=202)
+
+    return [
+        Route("/v1/snapshot", snapshot, methods=["GET"]),
+        Route("/v1/capabilities", capabilities, methods=["GET"]),
+        Route("/v1/pause", pause, methods=["POST"]),
+        Route("/v1/request-stop", request_stop, methods=["POST"]),
+        Route("/v1/prepare", prepare, methods=["POST"]),
+        Route("/v1/snapshot-to-telegram", snapshot_to_telegram, methods=["POST"]),
+    ]
+
+
+def _positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0

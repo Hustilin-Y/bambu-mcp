@@ -153,3 +153,114 @@ async def test_capabilities_lists_every_tool(api_env):
     assert by_name["printer_status"]["summary"].startswith("Current printer state")
     assert any(b["label"] == "▶️ Продолжить" for b in caps["buttons"])
     assert caps["printer"]["model"] == settings.profile.model_name
+
+
+# -- endpoints (6.1) ---------------------------------------------------------------
+
+from starlette.testclient import TestClient  # noqa: E402
+
+from bambu_mcp.mcp_server import build_app  # noqa: E402
+from bambu_mcp.service import ControlRefused, StopRequest  # noqa: E402
+
+APP = {"Authorization": f"Bearer {APP_TOKEN}"}
+BASE_URL = "http://127.0.0.1:8765"
+
+
+class EndpointService(StubService):
+    def __init__(self, state):
+        super().__init__(state)
+        self.calls = []
+        self.control_error = None
+        self.preparing = False
+        self.snapshot_queued = False
+
+    async def pause_print(self):
+        self.calls.append("pause")
+        if self.control_error:
+            raise self.control_error
+        return {"task_id": "777", "job_name": "bracket"}
+
+    async def request_stop(self):
+        self.calls.append("request_stop")
+        if self.control_error:
+            raise self.control_error
+        return StopRequest("b" * 32, "stop?")
+
+    def start_prepare(self, job_id, plate):
+        self.calls.append(("prepare", job_id, plate))
+        if self.preparing:
+            return False
+        self.preparing = True
+        return True
+
+    def send_snapshot(self):
+        self.calls.append("snapshot")
+        if self.snapshot_queued:
+            return False
+        self.snapshot_queued = True
+        return True
+
+
+@pytest.fixture
+def app_client(tmp_path):
+    env = _env(tmp_path)
+    service = EndpointService(env.service.state)
+    app = build_app(service, env.store, SECRETS, env.settings, camera=None)
+    with TestClient(app, base_url=BASE_URL) as client:
+        client.service = service
+        yield client
+    env.store.close()
+
+
+def test_snapshot_endpoint(app_client):
+    r = app_client.get("/v1/snapshot", headers=APP)
+    assert r.status_code == 200 and r.json()["status"]["gcode_state"] == "RUNNING"
+    assert app_client.get("/v1/snapshot", headers={"Authorization": f"Bearer {CLIENT_TOKEN}"}).status_code == 403
+
+
+def test_capabilities_endpoint(app_client):
+    r = app_client.get("/v1/capabilities", headers=APP)
+    assert r.status_code == 200 and any(t["name"] == "printer_status" for t in r.json()["tools"])
+
+
+def test_pause_endpoint(app_client):
+    r = app_client.post("/v1/pause", headers=APP)
+    assert r.status_code == 200 and r.json() == {"sent": "pause"}
+
+
+def test_pause_refused_when_not_connected(app_client):
+    app_client.service.control_error = ControlRefused("the printer is not connected (link disconnected), nothing was sent")
+    r = app_client.post("/v1/pause", headers=APP)
+    assert r.status_code == 409 and "not connected" in r.json()["error"]
+
+
+def test_request_stop_endpoint(app_client):
+    r = app_client.post("/v1/request-stop", headers=APP)
+    assert r.status_code == 202 and r.json() == {"asked": True}
+    assert "b" * 32 not in r.text
+
+
+def test_prepare_runs_in_background(app_client):
+    r = app_client.post("/v1/prepare", json={"job_id": 7, "plate": 1}, headers=APP)
+    assert r.status_code == 202 and r.json() == {"pending": True}
+    assert app_client.service.calls[-1] == ("prepare", 7, 1)
+    assert app_client.post("/v1/prepare", json={"job_id": 7, "plate": 1}, headers=APP).status_code == 409
+
+
+@pytest.mark.parametrize("body", [None, {}, {"job_id": "7"}, {"job_id": 7, "plate": 0}, {"job_id": True, "plate": 1}, [1]])
+def test_prepare_bad_body(app_client, body):
+    r = app_client.post("/v1/prepare", json=body, headers=APP)
+    assert r.status_code == 422
+    assert not any(isinstance(c, tuple) for c in app_client.service.calls)
+
+
+def test_snapshot_to_telegram(app_client):
+    assert app_client.post("/v1/snapshot-to-telegram", headers=APP).status_code == 202
+    assert app_client.post("/v1/snapshot-to-telegram", headers=APP).status_code == 409
+
+
+def test_v1_has_no_start_resume_stop_route(app_client):
+    paths = {getattr(r, "path", "") for r in app_client.app.router.routes}
+    assert {"/v1/snapshot", "/v1/pause", "/v1/prepare"} <= paths
+    assert not any(word in p for p in paths if p.startswith("/v1/") for word in ("start", "resume", "confirm"))
+    assert "/v1/stop" not in paths

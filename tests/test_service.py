@@ -3751,3 +3751,36 @@ async def test_stop_ask_keeps_control_buttons(harness):
     assert harness.notifier.edits[-1] == (message_id, message["text"])
     assert plain(harness.notifier.edit_buttons[-1])[0][0][0] == "pause:777"
     assert "stop" not in harness.events
+
+
+# -- Mini App background prepare and snapshot (design 6.1) --------------------------
+
+
+async def test_start_prepare_refusal_becomes_note(harness):
+    service, job, printer = await print_harness(harness)
+    await running(harness, printer)  # busy: the pre-flight refuses
+    assert service.start_prepare(job.id, 1) is True
+    assert service.start_prepare(job.id, 1) is False  # one at a time
+    await until(lambda: service.app_notes)
+    (note,) = service.app_notes
+    assert note["text"].startswith("Печать не подготовлена:") and "занят" in note["text"]
+    assert "\\" not in note["text"] and ";" not in note["text"]
+    assert service.start_prepare(job.id, 1) is True  # the first one is over
+
+
+async def test_start_prepare_unknown_job_becomes_note(harness):
+    service, _job, _printer = await print_harness(harness)
+    assert service.start_prepare(9999, 1) is True
+    await until(lambda: service.app_notes)
+    assert "не найдено" in service.app_notes[-1]["text"]
+
+
+async def test_send_snapshot_queues_once_a_minute(tmp_path):
+    clock = Clock(T0)
+    notifier = RecordingNotifier()
+    service, store = bare_service(tmp_path, notifier, clock)
+    assert service.send_snapshot() is True
+    assert service.send_snapshot() is False
+    await service.send_next()
+    assert notifier.sent[0]["files"] == [("snapshot.jpg", JPEG)]
+    store.close()
