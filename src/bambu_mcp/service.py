@@ -88,6 +88,7 @@ from bambu_mcp.messages import (
     spool_buttons,
     spool_question,
     start_buttons,
+    control_buttons,
     stop_ask_buttons,
     stop_buttons,
     tariff_reminder,
@@ -231,6 +232,10 @@ STOP_NOT_CONNECTED_TEXT = "Принтер не на связи, остановк
 STOP_NOT_FRESH_TEXT = "Принтер ещё не прислал свежий отчёт после переподключения, остановка не отправлена"
 STOP_OVER_TEXT = "Эта печать уже не идёт, останавливать нечего"
 STOP_UNSURE_TEXT = "⚠️ Не знаю, дошла ли команда остановки. Посмотри на принтер, повторно она не отправляется"
+CONTROL_NOT_RUNNING_TEXT = "Печать не идёт, ставить на паузу нечего"
+CONTROL_NOT_PAUSED_TEXT = "Печать не на паузе, продолжать нечего"
+CONTROL_OTHER_TEXT = "Сейчас идёт другая печать, а кнопка была для прежней. Ничего не отправлено"
+CONTROL_RESUME_SENT_TEXT = "Команда продолжить уже отправлена, жду принтер"
 STOP_OTHER_TEXT = "Сейчас идёт другая печать, а кнопка была для прежней. Остановка не отправлена"
 _STOP_SPENT_TEXTS = {
     "used": "Эта кнопка уже нажата, остановка второй раз не отправляется",
@@ -514,6 +519,8 @@ class Service:
         self._report_waiters: set[asyncio.Event] = set()
         self._restore_wait_s = restore_wait_s
         self._watch: _StartWatch | None = None
+        self._control: dict[str, bool] = {}  # task id -> paused variant last put on its control message
+        self._resumed: set[str] = set()  # resume sent, the printer not yet out of PAUSE
         self._own_tasks: set[str] = set()  # task ids this process sent: their start gets the stop button
         self._last_task_id = 0
 
@@ -904,6 +911,9 @@ class Service:
             if press.button_id.startswith("stop:"):
                 await self._on_stop_press(press)
                 return
+            if _control_press(press.button_id) is not None:
+                await self._on_control_press(press)
+                return
             if _print_press(press.button_id) is not None:
                 await self._on_print_press(press)
                 return
@@ -962,6 +972,8 @@ class Service:
                         self._process(event)
                 except Exception:
                     log.exception("handling a %s event failed", event.kind)
+        if state_report:
+            self._sync_control(new)
         # After the events: a STARTED message for our task is queued before the press goes on.
         if state_report:
             for waiter in self._report_waiters:
@@ -1033,12 +1045,13 @@ class Service:
 
         code, symbol = self._store.currency()
         text = render_event(event, self._hms_texts, cost, duration, tz=self._tz, symbol=symbol, code=code)
-        buttons = None
+        buttons = ref = None
         task_id = event.state.task_id
-        if event.kind is EventKind.STARTED and task_id and task_id in self._own_tasks:
-            buttons = stop_ask_buttons(task_id)  # a print started from our button
+        if event.kind is EventKind.STARTED and _control_task(task_id):
+            buttons, ref = control_buttons(task_id, False), f"control:{task_id}"  # any print: pause and stop
+            self._control[task_id] = False
         self._enqueue(
-            str(event.kind), text, event.dedupe_key, buttons=buttons, snapshot=event.kind in SNAPSHOT_KINDS
+            str(event.kind), text, event.dedupe_key, buttons=buttons, snapshot=event.kind in SNAPSHOT_KINDS, ref=ref
         )
         if buttons is not None and self._watch is not None and self._watch.task_id == task_id:
             self._watch.announced = True
@@ -2604,8 +2617,10 @@ class Service:
                     "print_started",
                     render_print_started(target.job.name, plate),
                     f"start|{_id_tag(confirm_id)}|started",
-                    buttons=stop_ask_buttons(watch.task_id),
+                    buttons=control_buttons(watch.task_id, False),
+                    ref=f"control:{watch.task_id}",
                 )
+                self._control[watch.task_id] = False
         return "started"
 
     def _record_unconfirmed(self, confirm_id: str, name: str | None) -> None:
@@ -2622,7 +2637,7 @@ class Service:
     # -- printing: pause and the confirmed stop (phase 3) -----------------------------
 
     async def pause_print(self) -> dict[str, str | None]:
-        """Pause the running print, once. Only while ``RUNNING``. There is no resume.
+        """Pause the running print, once. Only while ``RUNNING``. Resume is the owner's button only.
 
         Raises ``ControlRefused`` (English) when nothing was sent.
         """
@@ -2732,6 +2747,7 @@ class Service:
         key, action = parsed
         if action == "ask":
             await self._on_stop_ask(key)
+            await self._put_control(key)
             return
         confirmation = self._store.confirmation(key)
         if confirmation is None or confirmation.kind != "stop":
@@ -2786,6 +2802,90 @@ class Service:
             return "unconfirmed", STOP_UNSURE_TEXT
         return "sent", STOP_SENT_TEXT
 
+    async def _on_control_press(self, press: Press) -> None:
+        """``pause:<task id>`` pauses, ``resume:<task id>`` resumes, each only for the current print
+        and in its state. The message's buttons are put back after the press either way."""
+        parsed = _control_press(press.button_id)
+        assert parsed is not None  # _handle_press
+        action, task_id = parsed
+        if not self.state_fresh:
+            await self._refresh_state()
+        refusal, paused_after = self._control_refusal(action, task_id), None
+        if refusal is None:
+            link = self._link
+            assert link is not None  # _control_refusal
+            try:
+                if action == "pause":
+                    link.pause()
+                    paused_after = True
+                else:
+                    link.resume()
+                    self._resumed.add(task_id)
+                    paused_after = False
+                log.info("%s sent from its button", action)
+            except PrinterNotConnected:
+                refusal = STOP_NOT_CONNECTED_TEXT.replace("остановка", "команда")
+        if refusal is not None:
+            log.info("%s press refused", action)
+            self._enqueue("control_refused", f"{'⏸' if action == 'pause' else '▶️'} {refusal}", f"control|{uuid.uuid4().hex}")
+        await self._put_control(task_id, paused_after)
+
+    def _control_refusal(self, action: str, task_id: str) -> str | None:
+        """Why a pause or resume press can't be sent now, None when it can."""
+        if self._link is None or self._link_status is not LinkStatus.CONNECTED:
+            return STOP_NOT_CONNECTED_TEXT.replace("остановка", "команда")
+        if not self.state_fresh:
+            return STOP_NOT_FRESH_TEXT.replace("остановка", "команда")
+        state = self._state
+        if (state.task_id or "") != task_id:
+            return CONTROL_OTHER_TEXT
+        if action == "pause" and state.gcode_state != "RUNNING":
+            return CONTROL_NOT_RUNNING_TEXT
+        if action == "resume":
+            if state.gcode_state != "PAUSE":
+                return CONTROL_NOT_PAUSED_TEXT
+            if task_id in self._resumed:
+                return CONTROL_RESUME_SENT_TEXT
+        return None
+
+    async def _put_control(self, task_id: str, paused: bool | None = None) -> None:
+        """Put a print's control message back as it was sent, with the buttons for ``paused``
+        (the printer's state when None), or with none once that print is over."""
+        sent = self._store.sent_message(f"control:{task_id}")
+        if sent is None:
+            return
+        state = self._state
+        live = (state.task_id or "") == task_id and state.gcode_state in self._settings.profile.stoppable_states
+        if live:
+            if paused is None:
+                paused = state.gcode_state == "PAUSE"
+            self._control[task_id] = paused
+            buttons = control_buttons(task_id, paused)
+        else:
+            self._control.pop(task_id, None)
+            self._resumed.discard(task_id)
+            buttons = []
+        await self._notifier.edit(sent.message_id, sent.text, buttons=buttons)
+
+    def _sync_control(self, state: PrinterState) -> None:
+        """After a state report: control messages whose buttons no longer fit the printer get
+        them changed (a pause from the printer's screen shows Resume, an ended print none)."""
+        if state.gcode_state != "PAUSE":
+            self._resumed.discard(state.task_id or "")
+        for task_id, paused in list(self._control.items()):
+            live = (state.task_id or "") == task_id and state.gcode_state in self._settings.profile.stoppable_states
+            if live and paused == (state.gcode_state == "PAUSE"):
+                continue
+            if live and task_id in self._resumed:
+                continue  # resume sent, the buttons already say Pause
+            if not live:
+                self._control.pop(task_id, None)
+            else:
+                self._control[task_id] = state.gcode_state == "PAUSE"
+            task = asyncio.create_task(self._put_control(task_id), name="bambu-control-buttons")
+            self._press_tasks.add(task)
+            task.add_done_callback(self._press_tasks.discard)
+
     async def _on_stop_ask(self, task_id: str) -> None:
         """The "Остановить…" button of a print this service started: a new stop confirmation."""
         if not self.state_fresh:
@@ -2803,6 +2903,21 @@ class Service:
 def _id_tag(confirm_id: str) -> str:
     """A confirmation's stand-in for dedupe keys: the id itself never leaves the database."""
     return hashlib.sha256(confirm_id.encode("ascii")).hexdigest()[:16]
+
+
+def _control_task(task_id: str | None) -> bool:
+    """Whether a print's task id can carry control buttons: digits, and not "0", which the
+    printer reports for prints without a task of their own and so tells no two prints apart."""
+    return bool(task_id) and task_id != "0" and TASK_ID_RE.fullmatch(task_id) is not None
+
+
+_CONTROL_PRESS_RE = re.compile(r"(pause|resume):([0-9]{1,19})", re.ASCII)
+
+
+def _control_press(button_id: str) -> tuple[str, str] | None:
+    """(``pause`` or ``resume``, task id) of a control button, else None."""
+    match = _CONTROL_PRESS_RE.fullmatch(button_id)
+    return (match.group(1), match.group(2)) if match else None
 
 
 def _stop_press(button_id: str) -> tuple[str, str] | None:

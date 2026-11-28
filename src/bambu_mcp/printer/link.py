@@ -66,8 +66,10 @@ _TRAY_KEYS: Final = frozenset(
 _COLOR_RE: Final = re.compile(r"[0-9A-F]{8}", re.ASCII)
 TRAY_INFO_IDX_RE: Final = re.compile(r"[A-Z0-9]{3,8}", re.ASCII)
 
-# Phase 3 writes. pause and stop as ha-bambulab sends them, resume is never allowed.
+# Phase 3 writes. pause and stop as ha-bambulab sends them. resume only on the owner's press
+# on the service's Resume button (the service's press handler is its one caller).
 PAUSE_PRINT: Final = {"print": {"sequence_id": "0", "command": "pause", "param": ""}}
+RESUME_PRINT: Final = {"print": {"sequence_id": "0", "command": "resume", "param": ""}}
 STOP_PRINT: Final = {"print": {"sequence_id": "0", "command": "stop", "param": ""}}
 PROJECT_FILE: Final = "project_file"
 GCODE_3MF_SUFFIX: Final = ".gcode.3mf"
@@ -349,9 +351,9 @@ def _is_project_file(payload: Any, profile: PrinterProfile) -> bool:
 
 
 def _is_allowed(payload: Any, profile: PrinterProfile) -> bool:
-    """The whole write allowlist: the reads, a tray setting, project_file, pause, stop,
-    each as built for ``profile``."""
-    if any(_same_json(payload, fixed) for fixed in (*READ_COMMANDS, PAUSE_PRINT, STOP_PRINT)):
+    """The whole write allowlist: the reads, a tray setting, project_file, pause, resume,
+    stop, each as built for ``profile``."""
+    if any(_same_json(payload, fixed) for fixed in (*READ_COMMANDS, PAUSE_PRINT, RESUME_PRINT, STOP_PRINT)):
         return True
     return _is_tray_setting(payload, profile) or _is_project_file(payload, profile)
 
@@ -570,9 +572,17 @@ class PrinterLink:
         log.info("sent project_file: %s plate %d task_id %s AMS %d slot %d", file, plate, task_id, ams, slot)
 
     def pause(self) -> None:
-        """Pause the running print. ``PrinterNotConnected`` when nothing was sent. No resume exists."""
+        """Pause the running print. ``PrinterNotConnected`` when nothing was sent."""
         self._send_once(PAUSE_PRINT)
         log.info("sent pause")
+
+    def resume(self) -> None:
+        """Resume a paused print. Only the owner's press on the Resume button calls this.
+
+        ``PrinterNotConnected`` when nothing was sent.
+        """
+        self._send_once(RESUME_PRINT)
+        log.info("sent resume")
 
     def stop_print(self) -> None:
         """Stop (cancel) the current print. ``PrinterNotConnected`` when nothing was sent.
@@ -592,7 +602,7 @@ class PrinterLink:
         """Publish an allowed payload. False when the link is not verified or paho refuses it."""
         if not _is_allowed(payload, self._profile):
             raise ValueError(
-                "only the read commands, a valid tray setting, project_file, pause and stop may be sent"
+                "only the read commands, a valid tray setting, project_file, pause, resume and stop may be sent"
             )
         if not self._verified:
             log.debug("printer link not verified, request dropped")

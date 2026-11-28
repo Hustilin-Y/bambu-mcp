@@ -794,6 +794,21 @@ def stop_ask_buttons(task_id: str) -> list[list[Button]]:
     return [[Button(f"stop:ask:{task_id}", STOP_ASK_TEXT)]]
 
 
+PAUSE_BUTTON_TEXT = "⏸ Пауза"
+RESUME_BUTTON_TEXT = "▶️ Продолжить"
+
+
+def control_buttons(task_id: str, paused: bool) -> list[list[Button]]:
+    """A print's buttons: Pause (or Resume while paused) first, then the stop question.
+
+    The Mini App relies on the order: index 0 pauses or resumes, index 1 asks to stop.
+    """
+    first = (
+        Button(f"resume:{task_id}", RESUME_BUTTON_TEXT) if paused else Button(f"pause:{task_id}", PAUSE_BUTTON_TEXT)
+    )
+    return [[first, Button(f"stop:ask:{task_id}", STOP_ASK_TEXT)]]
+
+
 def stop_buttons(confirm_id: str) -> list[list[Button]]:
     return [[Button(f"stop:{confirm_id}:go", STOP_GO_TEXT), Button(f"stop:{confirm_id}:cancel", START_CANCEL_TEXT)]]
 

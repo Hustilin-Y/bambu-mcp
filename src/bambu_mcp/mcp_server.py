@@ -121,8 +121,9 @@ PREPARE_NOTE = (
     "Telegram (valid 10 minutes). No tool can start a print."
 )
 PAUSE_NOTE = (
-    "Sent once, not retried. There is no resume tool: the owner resumes on the printer screen "
-    "or in Bambu Studio. printer_status shows the printer's next report."
+    "Sent once, not retried. There is no resume tool: the owner resumes with the Resume button "
+    "(Telegram or the Mini App), on the printer screen or in Bambu Studio. "
+    "printer_status shows the printer's next report."
 )
 STOP_NOTE = (
     "Nothing is stopped yet. The owner must press the stop button under the confirmation in "
@@ -1281,7 +1282,7 @@ def build_mcp(
     async def pause_print() -> dict[str, Any]:
         """Pause the current print. Works only while the printer is RUNNING, sent once.
 
-        There is no resume tool: the owner resumes on the printer or in Bambu Studio.
+        There is no resume tool: only the owner resumes, with the Resume button.
         """
         try:
             paused = await service.pause_print()

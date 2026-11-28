@@ -27,6 +27,7 @@ from bambu_mcp.printer.link import (
     PAUSE_PRINT,
     PUSH_ALL,
     READ_COMMANDS,
+    RESUME_PRINT,
     STOP_PRINT,
     TRAY_TYPES,
     LinkStatus,
@@ -1039,3 +1040,11 @@ def test_link_uses_settings_profile():
     with pytest.raises(ValueError):
         harness.link.set_tray(ams=0, slot=0, tray_info_idx="GFA00", tray_type="PLA", color_rgba="FF8800FF",
                               nozzle_temp_min=190, nozzle_temp_max=230)
+
+
+def test_resume_payload_exact_and_sent(h):
+    assert RESUME_PRINT == {"print": {"sequence_id": "0", "command": "resume", "param": ""}}
+    h.client.fire_connect()
+    h.client.calls.clear()
+    assert h.link.resume() is None
+    assert h.client.calls == [("publish", f"device/{SERIAL}/request", RESUME_PRINT)]

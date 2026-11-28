@@ -121,7 +121,7 @@ A kit is sliced once, each plate is its own print, confirmation and journal row.
 - The confirmation is always a Telegram button sent by the service through the notify add-in, for requests from Claude Code and from Telegram alike, and the press goes to the service, never to Claude (section 16).
 - Pre-flight (review finding 5): printer idle or finished, no fatal or serious HMS, nozzle diameter matches, plate type confirmed, slot material equals the filament preset's (hard stop), colour difference is a warning, the spool's tracked remainder covers grams x 1.15, the manifest's material intent (for example PETG near a lamp) is respected or warned about, the bed is confirmed clear by the owner in the confirmation itself.
 - Upload by FTPS, size check, then the `project_file` command with a unique `subtask_name`/`task_id`. Then watch reports for 15 to 30 s and answer `started` or `unconfirmed`. **Never resend** on `unconfirmed`: tell the owner.
-- Exposed physical controls: pause (while printing) and stop (while preparing, printing or paused; stop asks for a confirmation). Not exposed at all: resume, raw G-code, axis moves, heating, AMS load or unload, HMS clearing, file deletion, LAN and Developer Mode settings.
+- Exposed physical controls: pause (while printing, from a tool or the Pause button), resume (while paused, only the owner's press on the Resume button the service sent, in Telegram or the Mini App, never a tool or a token, changed 2026-11-28) and stop (while preparing, printing or paused, stop asks for a confirmation). Not exposed at all: raw G-code, axis moves, heating, AMS load or unload, HMS clearing, file deletion, LAN and Developer Mode settings.
 
 ## 10. Monitoring and notifications (phase 1)
 

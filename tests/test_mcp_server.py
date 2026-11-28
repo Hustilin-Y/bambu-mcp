@@ -1525,3 +1525,8 @@ def test_app_token_only_reaches_v1(tmp_path, caplog):
         assert client.post("/mcp", json=TOOLS_LIST, headers=_bearer("pc-token-abc")).status_code == 200
     store.close()
     assert "app-token-xyz" not in caplog.text
+
+
+def test_no_tool_resumes(h):
+    names = {t["name"] for t in h.rpc("tools/list")["tools"]}
+    assert not any("resume" in name for name in names)
