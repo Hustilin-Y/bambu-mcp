@@ -523,7 +523,7 @@ class Service:
         self._restore_wait_s = restore_wait_s
         self._watch: _StartWatch | None = None
         self.app_notes: collections.deque[dict[str, Any]] = collections.deque(maxlen=APP_NOTES_KEPT)
-        self._preparing: asyncio.Task | None = None  # the Mini App's prepare, one at a time
+        self._app_preparing: asyncio.Task | None = None  # the Mini App's prepare, one at a time
         self._control: dict[str, bool] = {}  # task id -> paused variant last put on its control message
         self._resumed: set[str] = set()  # resume sent, the printer not yet out of PAUSE
         self._own_tasks: set[str] = set()  # task ids this process sent: their start gets the stop button
@@ -2649,11 +2649,11 @@ class Service:
         Its refusal or failure becomes a Russian line in ``app_notes`` (the tab shows it), and the
         confirmation itself appears in the snapshot's pending list once it went out.
         """
-        if self._preparing is not None and not self._preparing.done():
+        if self._app_preparing is not None and not self._app_preparing.done():
             return False
-        self._preparing = asyncio.create_task(self._prepare_for_app(job_id, plate), name=f"bambu-app-prepare-{job_id}")
-        self._press_tasks.add(self._preparing)
-        self._preparing.add_done_callback(self._press_tasks.discard)
+        self._app_preparing = asyncio.create_task(self._prepare_for_app(job_id, plate), name=f"bambu-app-prepare-{job_id}")
+        self._press_tasks.add(self._app_preparing)
+        self._app_preparing.add_done_callback(self._press_tasks.discard)
         return True
 
     async def _prepare_for_app(self, job_id: int, plate: int) -> None:
