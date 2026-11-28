@@ -79,6 +79,20 @@ def test_non_dict_or_info_messages_ignored():
 
 
 @pytest.mark.synthetic
+def test_a_command_echo_is_not_a_report():
+    # The printer answers project_file by echoing the request, new job's name and task id
+    # included, while it still reports the last job's FINISH: that is no state of the printer.
+    base = apply(PrinterState.empty(), load("finish"))
+    echo = {"print": {
+        "command": "project_file", "sequence_id": "7", "result": "success",
+        "param": "Metadata/plate_1.gcode", "subtask_name": "new-job-1-p1", "task_id": "1795862079",
+    }}
+    assert apply(base, echo) == base
+    pushed = apply(base, {"print": {"command": "push_status", "gcode_state": "PREPARE", "task_id": "1795862079"}})
+    assert (pushed.gcode_state, pushed.task_id) == ("PREPARE", "1795862079")
+
+
+@pytest.mark.synthetic
 def test_hms_and_error_parsed():
     report = {"print": {"hms": [{"attr": 5, "code": 7}, {"bad": 1}], "print_error": 3}}
     state = apply(PrinterState.empty(), report)
