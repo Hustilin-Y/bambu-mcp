@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Run by `assistant addon disable bambu`: stops the service, revokes its service-notify key and
+# removes the `bambu` MCP server from the owner's workspace. Settings and data stay.
+set -euo pipefail
+
+OWNER="{{BAMBU_USER}}"
+ROOT="{{ASSISTANT_ROOT}}"
+CONF_DIR="$HOME/.config/bambu"
+DATA_DIR="$HOME/.local/share/bambu"
+ENV_FILE="$CONF_DIR/.env"
+WORKSPACE="$HOME/workspaces/$OWNER"
+
+systemctl --user disable --now bambu-service 2>/dev/null || true
+rm -f "$HOME/.config/systemd/user/bambu-service.service"
+systemctl --user daemon-reload 2>/dev/null || true
+
+"$ROOT/bin/assistant" service revoke bambu || true
+if [ -f "$ENV_FILE" ]; then  # a revoked token is useless: setup issues a new one next time
+  tmp=$(mktemp "$CONF_DIR/.env.XXXXXX")
+  grep -vE '^NOTIFY_TOKEN=' "$ENV_FILE" > "$tmp" || true
+  chmod 600 "$tmp"
+  mv "$tmp" "$ENV_FILE"
+fi
+
+claude_json="$HOME/.claude.json"
+if [ -f "$claude_json" ]; then
+  tmp=$(mktemp "$HOME/.claude.json.XXXXXX")
+  jq --arg ws "$WORKSPACE" 'if .projects[$ws].mcpServers then del(.projects[$ws].mcpServers.bambu) else . end' \
+    "$claude_json" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$claude_json"
+fi
+
+echo "bambu is off. Kept: settings and secrets in $CONF_DIR, the journal and inventory in $DATA_DIR."

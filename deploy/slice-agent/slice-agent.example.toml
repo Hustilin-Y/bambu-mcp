@@ -5,6 +5,10 @@
 # TOML does not expand %VARIABLES%: write absolute paths, in single quotes so that
 # backslashes stay literal.
 
+# Printer model: a profile in src/bambu_profiles (p2s, a1). It gives the defaults for
+# machine, process_sets and filaments below and the model the output check expects.
+# printer = "p2s"
+
 # The pinned Bambu Studio copy (README.md, "Pinned Bambu Studio"). Defaults: the installed
 # copy under C:\Program Files\Bambu Studio, which updates itself.
 # studio_exe = 'C:\Users\<you>\AppData\Local\bambu-mcp\studio-<version>\bambu-studio.exe'
@@ -24,7 +28,7 @@
 # [host, port]. The firewall rule from install.ps1 lets only workshop reach the port.
 listen = ["0.0.0.0", 11436]
 
-# Filament presets to flatten. A job's filament must be one of these names.
+# Filament presets to flatten. Default: the profile's. A job's filament must be one of these names.
 # Bambu system preset names only: user presets are not supported.
 filaments = ["Generic PETG @BBL P2S"]
 

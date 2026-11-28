@@ -53,14 +53,14 @@ def _one_line(text: str) -> str:
 def test_upload_cli_posts_multipart(manifest, capsys):
     rec = Recorder()
     code = upload.main(
-        ["upload", str(manifest), "--url", "http://192.168.88.11:8765/"], transport=rec.transport
+        ["upload", str(manifest), "--url", "http://192.0.2.10:8765/"], transport=rec.transport
     )
     out = capsys.readouterr()
     assert code == 0
     assert out.out == "42\n"
     (req,) = rec.requests
     assert req.method == "POST"
-    assert str(req.url) == "http://192.168.88.11:8765/jobs"
+    assert str(req.url) == "http://192.0.2.10:8765/jobs"
     assert req.headers["authorization"] == f"Bearer {TOKEN}"
     assert req.headers["content-type"].startswith("multipart/form-data; boundary=")
     body = req.content

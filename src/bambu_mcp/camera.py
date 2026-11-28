@@ -1,7 +1,9 @@
 """One JPEG frame from the printer camera, for Telegram notifications.
 
-PyAV only (phase 0 verified it against the real P2S: 1920x1080 in 2-3 s,
-about +20 MB RSS). The RTSPS URL embeds the access code, so it exists only
+Two backends, picked by ``settings.camera_backend`` (default from the printer profile):
+``pyav``, RTSPS on port 322 (phase 0 verified it against the real P2S: 1920x1080 in
+2-3 s, about +20 MB RSS), and ``jpeg_6000``, the A1 and P1 series JPEG stream on port
+6000 behind the MQTT link's TLS check (unverified on any printer we have). The RTSPS URL embeds the access code, so it exists only
 inside this module: it is passed to the worker thread as an argument, never put
 in an argv (no ffmpeg subprocess) and never in an exception or log line that
 leaves this module. Failures return None after a redacted warning.
@@ -22,9 +24,13 @@ import asyncio
 import contextlib
 import io
 import logging
+import socket
+import struct
 import threading
+from collections.abc import Callable
 
 from bambu_mcp.config import Secrets, Settings
+from bambu_mcp.printer.link import build_tls_context
 from bambu_mcp.redact import redact
 
 log = logging.getLogger(__name__)
@@ -49,6 +55,46 @@ def _grab_jpeg(url: str) -> bytes | None:
     return None
 
 
+# The A1 and P1 series camera (ha-bambulab's chamber_image): TLS to port 6000, an 80-byte
+# auth packet, then frames each behind a 16-byte header whose first 4 bytes are the
+# little-endian JPEG length. Unverified on any printer we have.
+JPEG_PORT = 6000
+JPEG_MAX_BYTES = 4 * 1024 * 1024
+_JPEG_HEADER = 16
+_AUTH_HEAD = struct.pack("<IIII", 0x40, 0x3000, 0, 0)
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    data = bytearray()
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError(f"camera closed the stream after {len(data)} of {n} bytes")
+        data += chunk
+    return bytes(data)
+
+
+def _grab_jpeg6000(secrets: Secrets, settings: Settings, timeout_s: float) -> bytes | None:
+    """Blocking: one JPEG frame from the port 6000 stream, None when it is not a JPEG.
+
+    The TLS context is the MQTT link's: the same CA and CN (or pin) check runs inside the
+    handshake, so the access code is sent only to the verified printer.
+    """
+    context = build_tls_context(settings, serial=secrets.serial)
+    with socket.create_connection((secrets.host, JPEG_PORT), timeout=timeout_s) as raw:
+        with context.wrap_socket(raw, server_hostname=None) as tls:
+            tls.sendall(
+                _AUTH_HEAD + b"bblp".ljust(32, b"\0") + secrets.access_code.encode("ascii").ljust(32, b"\0")
+            )
+            length = struct.unpack("<I", _recv_exact(tls, _JPEG_HEADER)[:4])[0]
+            if not 0 < length <= JPEG_MAX_BYTES:
+                raise ValueError(f"camera frame of {length} bytes is outside 1..{JPEG_MAX_BYTES}")
+            frame = _recv_exact(tls, length)
+    if not (frame.startswith(b"\xff\xd8") and frame.endswith(b"\xff\xd9")):
+        return None
+    return frame
+
+
 class CameraBusy(Exception):
     """Another snapshot is still running (``wait=False`` callers only)."""
 
@@ -60,15 +106,15 @@ _busy = threading.Lock()
 _BUSY_POLL_S = 0.1
 
 
-def _worker(url: str, secrets: tuple[str, ...]) -> tuple[bytes | None, str | None]:
-    """Run ``_grab_jpeg`` and turn any failure into redacted text (never raises)."""
+def _worker(grab: Callable[[], bytes | None], secrets: tuple[str, ...]) -> tuple[bytes | None, str | None]:
+    """Run ``grab`` and turn any failure into redacted text (never raises)."""
     try:
-        return _grab_jpeg(url), None
+        return grab(), None
     except Exception as exc:  # noqa: BLE001
         return None, redact(f"{type(exc).__name__}: {exc}", secrets)
 
 
-def _start_grab(url: str, mask: tuple[str, ...]) -> asyncio.Future:
+def _start_grab(grab: Callable[[], bytes | None], mask: tuple[str, ...]) -> asyncio.Future:
     """Run the worker in its own daemon thread; it releases ``_busy`` when it ends.
 
     The caller holds ``_busy``. Once ``start()`` returns, the release is guaranteed
@@ -83,7 +129,7 @@ def _start_grab(url: str, mask: tuple[str, ...]) -> asyncio.Future:
 
     def run() -> None:
         try:
-            result = _worker(url, mask)
+            result = _worker(grab, mask)
         finally:
             _busy.release()
         with contextlib.suppress(RuntimeError):  # loop closed after a timeout
@@ -113,16 +159,26 @@ async def snapshot(
     service) waits for it within ``timeout_s``, ``wait=False`` (the MCP tool)
     raises ``CameraBusy`` at once.
     """
-    del settings  # only the "pyav" backend exists, nothing to select
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
     if not await _acquire(wait, deadline):
         log.warning("camera snapshot skipped: camera busy for %.1f s", timeout_s)
         return None
-    url = f"rtsps://bblp:{secrets.access_code}@{secrets.host}:322/streaming/live/1"
-    mask = (secrets.access_code, url)
+    if settings.camera_backend == "jpeg_6000":
+        mask: tuple[str, ...] = (secrets.access_code,)
+        budget = max(deadline - loop.time(), 1.0)
+
+        def grab_fn() -> bytes | None:
+            return _grab_jpeg6000(secrets, settings, budget)
+    else:
+        url = f"rtsps://bblp:{secrets.access_code}@{secrets.host}:322/streaming/live/1"
+        mask = (secrets.access_code, url)
+
+        def grab_fn() -> bytes | None:
+            return _grab_jpeg(url)
+
     try:
-        grab = _start_grab(url, mask)
+        grab = _start_grab(grab_fn, mask)
     except BaseException:
         _busy.release()
         raise

@@ -7,8 +7,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, get_args
 
+from bambu_profiles import PROFILE_NAMES, PrinterProfile, load_profile
+
 TlsMode = Literal["ca", "ca-no-hostname", "pin"]
-CameraBackend = Literal["pyav"]
+CameraBackend = Literal["pyav", "jpeg_6000"]
+# The camera backend a profile's camera kind uses unless config.toml names one.
+_PROFILE_CAMERA = {"rtsps_322": "pyav", "jpeg_6000": "jpeg_6000"}
 
 _CLIENT_PREFIX = "CLIENT_TOKEN_"
 
@@ -96,11 +100,13 @@ class Secrets:
 
 
 def _default_listen() -> list[tuple[str, int]]:
-    return [("192.168.88.11", 8765), ("127.0.0.1", 8765)]
+    # Loopback only: a LAN address is set in config.toml (deploy/README.md).
+    return [("127.0.0.1", 8765)]
 
 
 @dataclass
 class Settings:
+    printer: str = "p2s"  # a bambu_profiles name
     data_dir: Path = Path("data")
     listen: list[tuple[str, int]] = field(default_factory=_default_listen)
     tls_mode: TlsMode = "ca"
@@ -118,6 +124,11 @@ class Settings:
     # True when config.toml names the timezone: the country's default then does not apply.
     timezone_explicit: bool = field(default=False, compare=False, repr=False)
 
+    @property
+    def profile(self) -> PrinterProfile:
+        """The printer model's profile (``load_profile`` caches it)."""
+        return load_profile(self.printer)
+
     @classmethod
     def load(cls, toml_path: Path) -> Settings:
         toml_path = Path(toml_path)
@@ -129,10 +140,15 @@ class Settings:
         if unknown:
             raise ValueError(f"unknown settings keys: {', '.join(sorted(unknown))}")
 
+        printer = raw.get("printer", defaults.printer)
+        if printer not in PROFILE_NAMES:
+            raise ValueError(f"unknown printer {printer!r}, known: {', '.join(PROFILE_NAMES)}")
+        profile = load_profile(printer)
+
         tls_mode = raw.get("tls_mode", defaults.tls_mode)
         if tls_mode not in get_args(TlsMode):
             raise ValueError(f"tls_mode must be one of {get_args(TlsMode)}, got {tls_mode!r}")
-        backend = raw.get("camera_backend", defaults.camera_backend)
+        backend = raw.get("camera_backend", _PROFILE_CAMERA[profile.camera])
         if backend not in get_args(CameraBackend):
             raise ValueError(
                 f"camera_backend must be one of {get_args(CameraBackend)}, got {backend!r}"
@@ -147,7 +163,7 @@ class Settings:
                     raise ValueError(f"listen entries must look like 'host:port', got {item!r}")
                 listen.append((host, int(port)))
 
-        power_w = {k: float(v) for k, v in raw.get("power_w", defaults.power_w).items()}
+        power_w = {k: float(v) for k, v in raw.get("power_w", profile.power_w).items()}
         if "PLA" not in power_w:
             raise ValueError("power_w must have a PLA entry (the fallback for other materials)")
 
@@ -160,6 +176,7 @@ class Settings:
 
         ca_file = raw.get("ca_file")
         return cls(
+            printer=printer,
             data_dir=Path(raw.get("data_dir", defaults.data_dir)),
             listen=listen,
             tls_mode=tls_mode,
@@ -168,7 +185,7 @@ class Settings:
             notify_url=raw.get("notify_url"),
             camera_backend=backend,
             power_w=power_w,
-            heatup_kwh=float(raw.get("heatup_kwh", defaults.heatup_kwh)),
+            heatup_kwh=float(raw.get("heatup_kwh", profile.heatup_kwh)),
             timezone=raw.get("timezone", defaults.timezone),
             timezone_explicit="timezone" in raw,
             jobs_root_allowed=Path(jobs_root) if jobs_root else None,

@@ -14,14 +14,24 @@ from datetime import datetime
 from bambu_mcp.config import Settings
 from bambu_mcp.cost import CostBreakdown, CurrencyMismatch, full_cost, print_kwh
 from bambu_mcp.manifest import Manifest
-from bambu_mcp.printer.state import Tray
+from bambu_mcp.printer.state import EXTERNAL_AMS, EXTERNAL_TRAY, Tray
 from bambu_mcp.store.models import Amortization, Job, Spool, Tariff
 from slice_agent.runner import Overrides
 
 DEFAULT_NOZZLE = "0.4"
 SLOTS_PER_AMS = 4
 AMS_UNITS_MAX = 4
-MAX_SLOT_NUMBER = AMS_UNITS_MAX * SLOTS_PER_AMS  # the owner's slot numbers are 1..16
+MAX_SLOT_NUMBER = AMS_UNITS_MAX * SLOTS_PER_AMS  # the owner's AMS slot numbers are 1..16 (P2S)
+EXTERNAL_SLOT_NUMBER = 0  # the external spool holder
+EXTERNAL_LABEL = "внешняя катушка"
+
+
+def slot_words(number: int) -> dict[str, str]:
+    """Russian phrases for the owner's slot ``number``: "nom" (слот 3), "in" (в слоте 3),
+    "to" (к слоту 3); for the external spool "внешняя катушка", "на внешней катушке", ..."""
+    if number == EXTERNAL_SLOT_NUMBER:
+        return {"nom": EXTERNAL_LABEL, "in": "на внешней катушке", "to": "к внешней катушке"}
+    return {"nom": f"слот {number}", "in": f"в слоте {number}", "to": f"к слоту {number}"}
 
 # Overrides on top of the slice-agent process set of the same name. The owner may edit them.
 NAMED_SETS: dict[str, dict[str, object]] = {
@@ -177,15 +187,22 @@ class SlotChoice:
 def slot_number(ams: int, slot: int) -> int:
     """The slot as the owner counts it: 1..4 on the first AMS, 5..8 on the second.
 
-    With ``slot_position`` the only place that knows the numbering.
+    The external spool is 0. With ``slot_position`` the only place that knows the numbering.
     """
+    if (ams, slot) == (EXTERNAL_AMS, EXTERNAL_TRAY):
+        return EXTERNAL_SLOT_NUMBER
     return ams * SLOTS_PER_AMS + slot + 1
 
 
-def slot_position(number: int) -> tuple[int, int]:
-    """(ams, slot) of the owner's slot ``number`` (1..16), the inverse of ``slot_number``."""
-    if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= MAX_SLOT_NUMBER:
-        raise ValueError(f"slot must be 1..{MAX_SLOT_NUMBER}, got {number!r}")
+def slot_position(number: int, max_slot: int = MAX_SLOT_NUMBER) -> tuple[int, int]:
+    """(ams, slot) of the owner's slot ``number``, the inverse of ``slot_number``.
+
+    0 is the external spool, 1..``max_slot`` the AMS slots (the profile's ``max_slot_number``).
+    """
+    if isinstance(number, bool) or not isinstance(number, int) or not 0 <= number <= max_slot:
+        raise ValueError(f"slot must be 0 (external spool) or 1..{max_slot}, got {number!r}")
+    if number == EXTERNAL_SLOT_NUMBER:
+        return EXTERNAL_AMS, EXTERNAL_TRAY
     return divmod(number - 1, SLOTS_PER_AMS)
 
 
@@ -200,8 +217,9 @@ class UsableSlot:
 
     @property
     def label(self) -> str:
-        """'2 PETG синий': plain text, for buttons and tool errors."""
-        return f"{self.number} {self.spool.material} {self.spool.color_name}"
+        """'2 PETG синий' or 'внешняя катушка PLA белый': plain text, for buttons and tool errors."""
+        where = EXTERNAL_LABEL if self.number == EXTERNAL_SLOT_NUMBER else str(self.number)
+        return f"{where} {self.spool.material} {self.spool.color_name}"
 
 
 class SlotUnusable(ValueError):
@@ -216,10 +234,16 @@ class SlotUnusable(ValueError):
         )
 
 
-def _loaded(trays: Sequence[Tray]) -> list[Tray]:
-    # A tray type that is not a string (raw MQTT data) counts as not loaded.
+def _loaded(trays: Sequence[Tray], spools_by_slot: Mapping[tuple[int, int], Spool]) -> list[Tray]:
+    """Trays with filament, AMS slots first. A tray type that is not a string (raw MQTT data)
+    counts as not loaded. The external spool counts only with a spool mapped to it: the
+    printer reports a type there even when the holder is empty (P2S ``vir_slot``)."""
     return sorted(
-        (t for t in trays if isinstance(t.tray_type, str) and t.tray_type.strip()),
+        (
+            t for t in trays
+            if isinstance(t.tray_type, str) and t.tray_type.strip()
+            and (t.ams != EXTERNAL_AMS or (t.ams, t.slot) in spools_by_slot)
+        ),
         key=lambda t: (t.ams, t.slot),
     )
 
@@ -227,7 +251,7 @@ def _loaded(trays: Sequence[Tray]) -> list[Tray]:
 def usable_slots(trays: Sequence[Tray], spools_by_slot: Mapping[tuple[int, int], Spool]) -> list[UsableSlot]:
     """Loaded slots mapped to an active spool with a filament preset, in slot order."""
     out = []
-    for tray in _loaded(trays):
+    for tray in _loaded(trays, spools_by_slot):
         spool = spools_by_slot.get((tray.ams, tray.slot))
         if spool is None or not spool.active or not (spool.filament_preset or "").strip():
             continue
@@ -270,7 +294,7 @@ def pick_slot(
 
     if forced is not None:
         return _forced_slot(trays, spools_by_slot, material, forced)
-    loaded = _loaded(trays)
+    loaded = _loaded(trays, spools_by_slot)
     if not loaded:
         return SlotChoice(None, None, None, f"⚠️ В AMS нет заправленных слотов, а нужен {md_literal(material)}")
     matching = [t for t in loaded if _norm(t.tray_type) == _norm(material)]
@@ -286,7 +310,7 @@ def pick_slot(
         have = md_literal(tray.tray_type or "")
         want = md_literal(material)
         warning = (
-            f"⚠️ Нужен {want}, а в AMS его нет: выбран слот {slot_number(tray.ams, tray.slot)} {have}. "
+            f"⚠️ Нужен {want}, а в AMS его нет: выбран {slot_words(slot_number(tray.ams, tray.slot))['nom']} {have}. "
             f"Заправь {want} или подтверди печать из {have}"
         )
     spool = spools_by_slot.get((tray.ams, tray.slot))
@@ -317,7 +341,10 @@ def _forced_slot(
     warning = None
     if _norm(tray_type) != _norm(material):
         have = md_literal(tray_type or "")
-        warning = f"⚠️ Нужен {md_literal(material)}, а выбран слот {chosen.number} {have}: печать будет из {have}"
+        warning = (
+            f"⚠️ Нужен {md_literal(material)}, а выбран {slot_words(chosen.number)['nom']} {have}: "
+            f"печать будет из {have}"
+        )
     spool = chosen.spool
     return SlotChoice(
         chosen.ams,

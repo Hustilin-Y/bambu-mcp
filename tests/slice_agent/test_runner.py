@@ -387,3 +387,18 @@ def test_slice_isolated_leftover_that_cannot_be_removed_fails_cleanly(tmp_path, 
     with pytest.raises(OSError):
         go(cfg, fake)
     assert "argv" not in fake.calls  # never started
+
+
+def test_overrides_layer_from_profile():
+    from dataclasses import replace
+
+    from bambu_profiles import load_profile
+
+    p2s = load_profile("p2s")
+    Overrides.parse({"layer_height": 0.2}, "0.4", p2s)
+    custom = replace(p2s, layer_heights={"0.4": (0.1,)}, plate_types=("Cool Plate",))
+    Overrides.parse({"layer_height": 0.1, "curr_bed_type": "Cool Plate"}, "0.4", custom)
+    with pytest.raises(ValueError, match="layer_height"):
+        Overrides.parse({"layer_height": 0.2}, "0.4", custom)
+    with pytest.raises(ValueError, match="curr_bed_type"):
+        Overrides.parse({"curr_bed_type": "Textured PEI Plate"}, "0.4", custom)

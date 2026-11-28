@@ -25,6 +25,7 @@ dependencies = [
 bambu-service = "bambu_mcp.service:main"
 slice-agent = "slice_agent.app:main"
 bambu-mcp = "bambu_mcp.upload:main"
+bambu-printer-check = "bambu_mcp.printer_check:main"
 
 [dependency-groups]
 dev = [
@@ -33,7 +34,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/bambu_mcp", "src/slice_agent"]
+packages = ["src/bambu_mcp", "src/slice_agent", "src/bambu_profiles"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

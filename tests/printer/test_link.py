@@ -947,3 +947,95 @@ def test_repeated_connect_failures_are_logged_once(h, caplog):
     assert len(failed) == 1
     assert len(reconnecting) <= 1
     assert len(h.scheduled) == 1  # still retrying
+
+
+# -- profiles and the external spool ---------------------------------------------------
+
+from dataclasses import replace as _replace  # noqa: E402
+
+from bambu_mcp.printer.link import _is_allowed  # noqa: E402
+from bambu_profiles import load_profile  # noqa: E402
+
+P2S = load_profile("p2s")
+P2S_EXT = _replace(P2S, external_spool=True)  # the P2S once its external holder is checked live
+A1 = load_profile("a1")
+EXT = {"ams": 255, "slot": 254}
+
+
+def test_p2s_project_file_unchanged_with_profile():
+    assert project_file(**PROJECT, profile=P2S) == PROJECT_PAYLOAD
+
+
+@pytest.mark.synthetic
+def test_external_project_file():
+    body = project_file(**{**PROJECT, **EXT}, profile=A1)["print"]
+    assert body["use_ams"] is False
+    assert body["ams_mapping"] == [-1]
+    assert "ams_mapping2" not in body
+    assert body["layer_inspect"] is False  # the A1 profile's flag
+    assert _is_allowed({"print": body}, A1)
+    assert _is_allowed({"print": body}, P2S) is False  # P2S flags differ (layer_inspect)
+    p2s_body = project_file(**{**PROJECT, **EXT}, profile=P2S_EXT)
+    assert _is_allowed(p2s_body, P2S_EXT)
+
+
+@pytest.mark.synthetic
+def test_external_project_file_tampered_refused():
+    body = project_file(**{**PROJECT, **EXT}, profile=A1)["print"]
+    for change in ({"use_ams": True}, {"ams_mapping": [0]}, {"ams_mapping2": [{"ams_id": 255, "slot_id": 254}]}):
+        assert not _is_allowed({"print": {**body, **change}}, A1)
+
+
+@pytest.mark.synthetic
+def test_tray_setting_external_allowed():
+    payload = tray_setting(**{**TRAY, **EXT}, profile=A1)
+    assert (payload["print"]["ams_id"], payload["print"]["tray_id"]) == (255, 254)
+    assert _is_allowed(payload, A1)
+    assert _is_allowed(tray_setting(**{**TRAY, **EXT}, profile=P2S_EXT), P2S_EXT)
+
+
+def test_p2s_refuses_the_external_spool_until_checked():
+    with pytest.raises(ValueError, match="no external spool"):
+        tray_setting(**{**TRAY, **EXT})
+    with pytest.raises(ValueError, match="no external spool"):
+        project_file(**{**PROJECT, **EXT})
+    assert not _is_allowed(tray_setting(**{**TRAY, **EXT}, profile=P2S_EXT), P2S)
+    assert not _is_allowed(project_file(**{**PROJECT, **EXT}, profile=P2S_EXT), P2S)
+
+
+@pytest.mark.synthetic
+@pytest.mark.parametrize("ams, slot", [(255, 0), (0, 254), (254, 255), (255, 255)])
+def test_mixed_pairs_rejected(ams, slot):
+    with pytest.raises(ValueError):
+        tray_setting(**{**TRAY, "ams": ams, "slot": slot}, profile=P2S_EXT)
+    payload = tray_setting(**{**TRAY, **EXT}, profile=P2S_EXT)
+    payload["print"].update(ams_id=ams, tray_id=slot)
+    assert not _is_allowed(payload, P2S_EXT)
+
+
+def test_a1_rejects_ams_slots():
+    with pytest.raises(ValueError):
+        tray_setting(**{**TRAY, "ams": 0, "slot": 0}, profile=A1)
+    with pytest.raises(ValueError):
+        project_file(**{**PROJECT, "ams": 0, "slot": 0}, profile=A1)
+    assert not _is_allowed(tray_setting(**{**TRAY, "ams": 0, "slot": 0}), A1)
+
+
+def test_a1_temp_cap_300():
+    tray_setting(**{**TRAY, **EXT, "nozzle_temp_max": 300}, profile=A1)
+    with pytest.raises(ValueError, match="150..300"):
+        tray_setting(**{**TRAY, **EXT, "nozzle_temp_max": 310}, profile=A1)
+
+
+def test_no_external_on_a_profile_without_one():
+    no_ext = _replace(A1, external_spool=False)
+    with pytest.raises(ValueError):
+        tray_setting(**{**TRAY, **EXT}, profile=no_ext)
+    assert not _is_allowed(tray_setting(**{**TRAY, **EXT}, profile=A1), no_ext)
+
+
+def test_link_uses_settings_profile():
+    harness = Harness(Settings(tls_mode="ca", ca_file=TLS / "ca.pem", printer="a1"))
+    with pytest.raises(ValueError):
+        harness.link.set_tray(ams=0, slot=0, tray_info_idx="GFA00", tray_type="PLA", color_rgba="FF8800FF",
+                              nozzle_temp_min=190, nozzle_temp_max=230)

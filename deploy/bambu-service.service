@@ -1,12 +1,13 @@
 [Unit]
 Description=bambu-mcp: Bambu Lab P2S monitor and MCP server
-# The MCP listener binds 192.168.88.11 and does not retry a failed bind.
+# The MCP listener binds the LAN address from config.toml and does not retry a failed bind.
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=shiba-srv
+# The user that owns /srv/bambu (deploy/README.md).
+User=bambu
 WorkingDirectory=/srv/bambu/app
 Environment=BAMBU_ENV=/srv/bambu/.env
 ExecStart=/srv/bambu/app/.venv/bin/bambu-service

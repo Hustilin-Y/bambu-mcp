@@ -105,7 +105,7 @@ from bambu_mcp.printer.link import (
     PrinterLink,
     PrinterNotConnected,
 )
-from bambu_mcp.printer.state import PrinterState, apply
+from bambu_mcp.printer.state import EXTERNAL_AMS, EXTERNAL_TRAY, PrinterState, apply
 from bambu_mcp.printgate import (
     ControlRefused,
     PrintFileError,
@@ -141,13 +141,11 @@ from bambu_mcp.slicer import (
 )
 from bambu_mcp.store.db import Store
 from bambu_mcp.store.models import Job, OutboxRow, Spool
-from slice_agent.runner import PLATE_TYPES
 
 log = logging.getLogger(__name__)
 
 DEFAULT_ENV = "/srv/bambu/.env"
 DB_NAME = "bambu.db"
-HMS_FILE = "hms_en_22E.json"  # scripts/extract_hms.py output for the P2S, kept in data_dir
 SNAPSHOT_NAME = "snapshot.jpg"
 SNAPSHOT_KINDS = frozenset({EventKind.FIRST_LAYER_DONE, EventKind.FINISHED, EventKind.FAILED})
 ACTIVE_STATES = frozenset({"PREPARE", "RUNNING", "PAUSE"})
@@ -193,7 +191,6 @@ PRINT_CACHE_KEEP = 3  # sliced files kept, newest first
 START_WATCH_S = 30.0  # after project_file: our task_id must show up PREPARE or RUNNING
 REPORT_WAIT_S = 5.0  # a fresh pushall before the checks
 START_REPORTED = frozenset({"PREPARE", "RUNNING"})
-STOPPABLE_STATES = frozenset({"PREPARE", "RUNNING", "PAUSE"})  # PREPARE: heating and levelling
 UPLOAD_TIMEOUT_S = 300.0  # the whole FTPS upload: ftps.upload has only per-socket timeouts
 _CONFIRM_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
 _HASH_CHUNK = 1 << 16
@@ -435,6 +432,8 @@ def _tray_slot(report: dict) -> Slot | None:
         tray = int(raw)
     except (TypeError, ValueError):
         return None
+    if tray == EXTERNAL_TRAY:  # 255 means nothing is feeding
+        return EXTERNAL_AMS, EXTERNAL_TRAY
     if not 0 <= tray <= _MAX_AMS_TRAY:
         return None
     return slot_position(tray + 1)
@@ -479,9 +478,11 @@ class Service:
         self._tz = ZoneInfo(settings.timezone)
         self._journal = Journal(store, settings)
         self._detector = EventDetector(store)
-        hms_path = Path(settings.data_dir) / HMS_FILE
-        if not hms_path.is_file():
-            log.warning("HMS text table %s not found, HMS messages show codes only", hms_path)
+        # scripts/extract_hms.py output for the profile's device prefix, kept in data_dir.
+        hms_name = settings.profile.hms_file
+        hms_path = Path(settings.data_dir) / hms_name if hms_name else None
+        if hms_path is None or not hms_path.is_file():
+            log.warning("HMS text table %s not found, HMS messages show codes only", hms_path or "(no prefix)")
         self._hms_texts = HmsTexts.load(hms_path)
 
         self._state = PrinterState.empty()
@@ -1214,7 +1215,7 @@ class Service:
             if spool is not None:
                 spools[(tray.ams, tray.slot)] = spool
         number = slot if slot is not None else job.slot
-        forced = slot_position(number) if number is not None else None
+        forced = slot_position(number, self._settings.profile.max_slot_number) if number is not None else None
         choice = pick_slot(trays, spools, wanted, _last_color(history, job.name), forced=forced)
         where = (choice.ams, choice.slot)
         spool = spools.get(where) if choice.ams is not None else None
@@ -1299,7 +1300,7 @@ class Service:
     def _default_plate_type(self) -> str:
         for plate in self._store.plates():
             if plate.is_default:
-                if plate.bed_type in PLATE_TYPES:
+                if plate.bed_type in self._settings.profile.plate_types:
                     return plate.bed_type
                 log.warning("default plate %d has an unknown bed type, using %s", plate.id, DEFAULT_PLATE_TYPE)
         return DEFAULT_PLATE_TYPE
@@ -2122,6 +2123,7 @@ class Service:
             file_sha,
             target.nozzle,
             fresh=self.state_fresh,
+            profile=self._settings.profile,
         )
         if check.blocking:
             raise PrintRefused(check.blocking)
@@ -2556,6 +2558,7 @@ class Service:
             file_sha,
             target.nozzle,
             fresh=self.state_fresh,
+            profile=self._settings.profile,
         )
         if check.blocking:
             raise _StartRefused("preflight", check.blocking)
@@ -2671,7 +2674,7 @@ class Service:
                 STOP_NOT_FRESH_TEXT,
             )
         state = self._state
-        if state.gcode_state not in STOPPABLE_STATES:
+        if state.gcode_state not in self._settings.profile.stoppable_states:  # PREPARE: heating, levelling
             return _StopProblem(
                 "print_over", f"the printer is {state.gcode_state}: there is no print to stop", STOP_OVER_TEXT
             )

@@ -1,0 +1,21 @@
+# Example only (deploy/slicing-options.md, option b). Build the image from Dockerfile.example first.
+services:
+  slice-agent:
+    image: bambu-slice-agent
+    restart: unless-stopped
+    # Loopback only: bambu-service runs on the same host.
+    ports:
+      - "127.0.0.1:11436:11436"
+    env_file:
+      - ./slice-agent.env            # SLICE_AGENT_TOKEN=..., mode 600, not in git
+    volumes:
+      - ./slice-agent.toml:/home/slicer/.config/bambu-mcp/slice-agent.toml:ro
+      - studio-data:/home/slicer/.config/BambuStudio
+      - profiles:/home/slicer/.local/share/bambu-mcp/profiles
+      - sliced:/home/slicer/bambu-mcp/sliced
+    mem_limit: 4g
+
+volumes:
+  studio-data:
+  profiles:
+  sliced:

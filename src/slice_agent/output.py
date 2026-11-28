@@ -19,8 +19,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-EXPECTED_MODEL = "Bambu Lab P2S"
-EXPECTED_BED = (256, 256)
+from bambu_profiles import PrinterProfile, load_profile
+
 MAX_XML_BYTES = 1024 * 1024
 MAX_MEMBER_BYTES = 50 * 1024 * 1024
 MAX_PNG_BYTES = 10 * 1024 * 1024
@@ -311,14 +311,17 @@ def read_plate_png(path: Path, plate: int) -> bytes | None:
             raise OutputError(f"cannot read plate {plate} preview: {type(e).__name__}") from None
 
 
-def check_output(result: SliceResult, nozzle: str) -> None:
-    """Raise OutputError unless the file is a P2S, 256 x 256 bed, matching nozzle, with gcode."""
+def check_output(result: SliceResult, nozzle: str, profile: PrinterProfile | None = None) -> None:
+    """Raise OutputError unless the file is for the profile's model and bed (default P2S),
+    with the matching nozzle and gcode."""
+    profile = profile or load_profile()
+    bed = profile.bed_mm[:2]
     if result.gcode_missing:
         names = ", ".join(f"Metadata/plate_{i}.gcode" for i in result.gcode_missing)
         raise OutputError(f"missing {names}")
-    if result.printer_model != EXPECTED_MODEL:
-        raise OutputError(f"printer_model {result.printer_model!r}, expected {EXPECTED_MODEL!r}")
-    if result.bed_xy != EXPECTED_BED:
-        raise OutputError(f"bed {result.bed_xy[0]}x{result.bed_xy[1]}, expected 256x256")
+    if result.printer_model != profile.model_name:
+        raise OutputError(f"printer_model {result.printer_model!r}, expected {profile.model_name!r}")
+    if result.bed_xy != bed:
+        raise OutputError(f"bed {result.bed_xy[0]}x{result.bed_xy[1]}, expected {profile.bed_area}")
     if result.nozzle != nozzle:
         raise OutputError(f"nozzle {result.nozzle!r}, expected {nozzle!r}")

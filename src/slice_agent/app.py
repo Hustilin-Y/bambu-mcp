@@ -144,7 +144,7 @@ def parse_job(raw: bytes, cfg: AgentConfig) -> Job:
     if not isinstance(raw_overrides, dict):
         raise BadRequest("overrides must be a JSON object")
     try:
-        overrides = Overrides.parse(raw_overrides, names["nozzle"])
+        overrides = Overrides.parse(raw_overrides, names["nozzle"], cfg.profile)
         job = Job(job_id, name, kit, tuple(plates), overrides=overrides, **names)
         # The runner's own checks: out name, nozzle/process_set/filament/plate_type against the config.
         build_command(cfg, input_3mf=Path("upload.3mf"), out_name=job.out_name, kit=kit, overrides=overrides, **names)
@@ -459,7 +459,7 @@ class SliceAgent:
             return 500, self._failed(detail, run.log_tail)
         try:
             result = read_output(final, job.plates[0], feature_plates=job.plates)
-            check_output(result, job.nozzle)
+            check_output(result, job.nozzle, self.cfg.profile)
             present = {p.index for p in result.plates}
             for plate in job.plates:
                 if plate not in present:

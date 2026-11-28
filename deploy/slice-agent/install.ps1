@@ -13,7 +13,7 @@
   from the user environment (deploy/slice-agent/README.md, "Tokens").
 #>
 param(
-    [string]$ServerAddress = "192.168.88.11",
+    [Parameter(Mandatory = $true)][string]$ServerAddress,  # the bambu-service host, the only one let in
     [int]$Port = 11436,
     [string]$TaskName = "bambu-mcp slice-agent",
     [switch]$FirewallOnly

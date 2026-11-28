@@ -9,8 +9,22 @@ from typing import Any
 KNOWN_STATES = frozenset(
     {"FAILED", "FINISH", "IDLE", "INIT", "OFFLINE", "PAUSE", "PREPARE", "RUNNING", "SLICING"}
 )
+# The order state names are listed in to people: the start states first, as before profiles.
+STATE_ORDER = ("IDLE", "FINISH", "FAILED", "INIT", "OFFLINE", "PAUSE", "PREPARE", "RUNNING", "SLICING")
+
+
+def ordered_states(states) -> list[str]:
+    """``states`` in ``STATE_ORDER``, unknown names last and sorted."""
+    return sorted(states, key=lambda s: (STATE_ORDER.index(s) if s in STATE_ORDER else len(STATE_ORDER), s))
+
+
 _PLATE_KEYS = ("plate_idx", "plate_id", "gcode_file")
 _IDENTITY_KEYS = ("subtask_name", "task_id", "gcode_start_time")
+# The external spool holder (no AMS, or next to one): ams_id 255 and tray_id 254, as
+# ha-bambulab and Bambu Studio name it. Older firmware reports it as ``vt_tray`` (one
+# object), newer (P2S 01.03) as ``vir_slot`` (a list, one entry per extruder).
+EXTERNAL_AMS = 255
+EXTERNAL_TRAY = 254
 _PLATE_GCODE = re.compile(r"plate_([1-9][0-9]{0,3})\.gcode", re.ASCII)
 
 
@@ -78,6 +92,34 @@ def _str(value: Any) -> str | None:
     return None if value is None else str(value)
 
 
+def _tray(ams: int, slot: int, raw: dict) -> Tray:
+    remain = _int(raw.get("remain"))
+    return Tray(
+        ams=ams,
+        slot=slot,
+        tray_type=raw.get("tray_type") or None,
+        color_rgba=raw.get("tray_color") or None,
+        remain_pct=remain if remain is not None and remain >= 0 else None,
+    )
+
+
+def _parse_external(p: dict) -> Tray | None:
+    """The external spool from ``vt_tray`` or a one-entry ``vir_slot``, None when neither is usable."""
+    raw = p.get("vt_tray")
+    if raw is None:
+        slots = p.get("vir_slot")
+        raw = slots[0] if isinstance(slots, list) and len(slots) == 1 else None
+    if not isinstance(raw, dict):
+        return None
+    tray_type = raw.get("tray_type")
+    if tray_type is not None and not isinstance(tray_type, str):
+        return None
+    color = raw.get("tray_color")
+    if color is not None and not isinstance(color, str):
+        return None
+    return _tray(EXTERNAL_AMS, EXTERNAL_TRAY, raw)
+
+
 def _parse_trays(ams_block: Any) -> tuple[Tray, ...] | None:
     units = ams_block.get("ams") if isinstance(ams_block, dict) else None
     if not isinstance(units, list):
@@ -91,16 +133,7 @@ def _parse_trays(ams_block: Any) -> tuple[Tray, ...] | None:
             slot = _int(raw.get("id")) if isinstance(raw, dict) else None
             if ams_id is None or slot is None:
                 continue
-            remain = _int(raw.get("remain"))
-            trays.append(
-                Tray(
-                    ams=ams_id,
-                    slot=slot,
-                    tray_type=raw.get("tray_type") or None,
-                    color_rgba=raw.get("tray_color") or None,
-                    remain_pct=remain if remain is not None and remain >= 0 else None,
-                )
-            )
+            trays.append(_tray(ams_id, slot, raw))
     return tuple(trays)
 
 
@@ -182,7 +215,13 @@ def apply(state: PrinterState, report: dict) -> PrinterState:
     nozzle = _parse_nozzle(p)
     if nozzle is not None:
         changes["nozzle_diameter"] = nozzle
-    trays = _parse_trays(p.get("ams"))
-    if trays is not None:
-        changes["trays"] = trays
+    ams_trays = _parse_trays(p.get("ams"))
+    external = _parse_external(p)
+    if ams_trays is not None or external is not None:
+        # Each block replaces only its own trays: a report with one keeps the other's.
+        keep_ams = tuple(t for t in state.trays if t.ams != EXTERNAL_AMS)
+        keep_ext = tuple(t for t in state.trays if t.ams == EXTERNAL_AMS)
+        changes["trays"] = (ams_trays if ams_trays is not None else keep_ams) + (
+            (external,) if external is not None else keep_ext
+        )
     return replace(state, **changes) if changes else state

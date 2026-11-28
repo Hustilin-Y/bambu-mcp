@@ -61,7 +61,7 @@ def _parser() -> argparse.ArgumentParser:
         "upload", help="send a print manifest and its 3MF to the service", allow_abbrev=False
     )
     up.add_argument("manifest", type=Path, help="the <name>.print.json written by CAD Workshop")
-    up.add_argument("--url", help="service base URL, e.g. http://192.168.88.11:8765")
+    up.add_argument("--url", help="service base URL, e.g. http://192.0.2.10:8765")
     up.add_argument(
         "--token-env",
         default=DEFAULT_TOKEN_ENV,
