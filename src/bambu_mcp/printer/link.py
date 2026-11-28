@@ -32,7 +32,9 @@ import paho.mqtt.client as mqtt
 
 from bambu_mcp.config import Secrets, Settings
 from bambu_mcp.logthrottle import Throttle
+from bambu_mcp.printer.state import EXTERNAL_AMS, EXTERNAL_TRAY
 from bambu_mcp.redact import redact
+from bambu_profiles import PrinterProfile, load_profile
 
 log = logging.getLogger(__name__)
 
@@ -44,9 +46,10 @@ READ_COMMANDS: Final = (GET_VERSION, PUSH_ALL)
 AMS_FILAMENT_SETTING: Final = "ams_filament_setting"
 # Bambu filament_type spellings; support material is PLA-S (no bare "SUPPORT" type exists).
 TRAY_TYPES: Final = ("PLA", "PETG", "ABS", "ASA", "TPU", "PC", "PA", "PLA-CF", "PETG-CF", "PVA", "PLA-S")
-AMS_UNITS: Final = range(4)
+AMS_UNITS: Final = range(4)  # the P2S geometry; a printer's own comes from its profile
 AMS_SLOTS: Final = range(4)
 NOZZLE_TEMP_RANGE: Final = (150, 320)
+EXTERNAL: Final = (EXTERNAL_AMS, EXTERNAL_TRAY)
 _TRAY_KEYS: Final = frozenset(
     {
         "sequence_id",
@@ -73,6 +76,16 @@ _FILE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.gcode\.3mf", re
 _MD5_RE: Final = re.compile(r"[0-9a-f]{32}", re.ASCII)
 TASK_ID_RE: Final = re.compile(r"[0-9]{1,19}", re.ASCII)  # project_file task ids, stop buttons
 _PLATE_PARAM_RE: Final = re.compile(r"Metadata/plate_([1-9][0-9]?)\.gcode", re.ASCII)
+_FLAG_ORDER: Final = (  # the profile's print_flags, in the order of the phase 0 payload
+    "timelapse",
+    "bed_type",
+    "bed_leveling",
+    "bed_levelling",
+    "auto_bed_leveling",
+    "flow_cali",
+    "vibration_cali",
+    "layer_inspect",
+)
 _PROJECT_KEYS: Final = frozenset(
     {
         "sequence_id",
@@ -120,18 +133,28 @@ def _is_int(value: Any) -> bool:
     return type(value) is int  # not bool, not float
 
 
-def _check_unit_slot(ams: Any, slot: Any) -> None:
-    if not (_is_int(ams) and ams in AMS_UNITS):
-        raise ValueError("ams must be an integer 0..3")
-    if not (_is_int(slot) and slot in AMS_SLOTS):
-        raise ValueError("slot must be an integer 0..3")
+def _check_unit_slot(ams: Any, slot: Any, profile: PrinterProfile) -> None:
+    """An AMS unit and slot within the profile's geometry, or the external spool when it has one."""
+    if _is_int(ams) and _is_int(slot) and (ams, slot) == EXTERNAL:
+        if not profile.external_spool:
+            raise ValueError(f"the {profile.model_name} profile has no external spool")
+        return
+    if not profile.has_ams:
+        raise ValueError(f"the {profile.model_name} has no AMS: only the external spool (ams 255, slot 254)")
+    if not (_is_int(ams) and 0 <= ams < profile.ams_units):
+        raise ValueError(f"ams must be an integer 0..{profile.ams_units - 1}")
+    if not (_is_int(slot) and 0 <= slot < profile.ams_slots):
+        raise ValueError(f"slot must be an integer 0..{profile.ams_slots - 1}")
 
 
-def _unit_slot_of(ams_id: Any, tray_id: Any) -> tuple[int, int] | None:
+def _unit_slot_of(ams_id: Any, tray_id: Any, profile: PrinterProfile) -> tuple[int, int] | None:
     """The inverse of ``tray_ids``: (unit, slot) for printer ids, None outside its image."""
     if not (_is_int(ams_id) and _is_int(tray_id)):  # True would hash like 1 in the lookup below
         return None
-    return {tray_ids(a, s): (a, s) for a in AMS_UNITS for s in AMS_SLOTS}.get((ams_id, tray_id))
+    image = {tray_ids(a, s): (a, s) for a in range(profile.ams_units) for s in range(profile.ams_slots)}
+    if profile.external_spool:
+        image[tray_ids(*EXTERNAL)] = EXTERNAL
+    return image.get((ams_id, tray_id))
 
 
 def _same_json(a: Any, b: Any) -> bool:
@@ -161,16 +184,20 @@ def tray_setting(
     color_rgba: str,
     nozzle_temp_min: int,
     nozzle_temp_max: int,
+    profile: PrinterProfile | None = None,
 ) -> dict:
-    """The ``ams_filament_setting`` payload for one AMS slot. ``ValueError`` on any bad field."""
-    _check_unit_slot(ams, slot)
+    """The ``ams_filament_setting`` payload for one AMS slot or the external spool (ams 255,
+    slot 254, unverified on any printer we have). ``profile`` defaults to the P2S.
+    ``ValueError`` on any bad field."""
+    profile = profile or load_profile()
+    _check_unit_slot(ams, slot, profile)
     if not (isinstance(tray_info_idx, str) and TRAY_INFO_IDX_RE.fullmatch(tray_info_idx)):
         raise ValueError("tray_info_idx must be 3..8 upper-case letters or digits")
     if not isinstance(tray_type, str) or tray_type not in TRAY_TYPES:
         raise ValueError(f"tray_type must be one of {', '.join(TRAY_TYPES)}")
     if not (isinstance(color_rgba, str) and _COLOR_RE.fullmatch(color_rgba)):
         raise ValueError("color_rgba must be RRGGBBAA in upper-case hex")
-    low, high = NOZZLE_TEMP_RANGE
+    low, high = profile.nozzle_temp_range
     for name, temp in (("nozzle_temp_min", nozzle_temp_min), ("nozzle_temp_max", nozzle_temp_max)):
         if not (_is_int(temp) and low <= temp <= high):
             raise ValueError(f"{name} must be an integer {low}..{high}")
@@ -192,7 +219,7 @@ def tray_setting(
     }
 
 
-def _is_tray_setting(payload: Any) -> bool:
+def _is_tray_setting(payload: Any, profile: PrinterProfile) -> bool:
     """True only for a payload ``tray_setting`` builds itself, key for key and type for type."""
     if not isinstance(payload, dict) or set(payload) != {"print"}:
         return False
@@ -202,7 +229,7 @@ def _is_tray_setting(payload: Any) -> bool:
     if body["command"] != AMS_FILAMENT_SETTING or body["sequence_id"] != "0":
         return False
     # The inverse of tray_ids, so whatever mapping it holds is read back the same way.
-    unit_slot = _unit_slot_of(body["ams_id"], body["tray_id"])
+    unit_slot = _unit_slot_of(body["ams_id"], body["tray_id"], profile)
     if unit_slot is None:
         return False
     try:
@@ -214,6 +241,7 @@ def _is_tray_setting(payload: Any) -> bool:
             color_rgba=body["tray_color"],
             nozzle_temp_min=body["nozzle_temp_min"],
             nozzle_temp_max=body["nozzle_temp_max"],
+            profile=profile,
         )
     except (ValueError, TypeError):
         return False
@@ -229,12 +257,17 @@ def project_file(
     task_id: str,
     ams: int,
     slot: int,
+    profile: PrinterProfile | None = None,
 ) -> dict:
-    """The ``project_file`` payload that prints ``plate`` of ``file`` from the USB root.
+    """The ``project_file`` payload that prints ``plate`` of ``file`` from the storage root.
 
-    As verified on the P2S in phase 0 (docs/phase0-report.md, row 4), one AMS slot.
-    ``ValueError`` on any bad field.
+    As verified on the P2S in phase 0 (docs/phase0-report.md, row 4), one AMS slot, with the
+    profile's flags (default P2S). From the external spool (ams 255, slot 254): ``use_ams``
+    false, ``ams_mapping`` [-1] and no ``ams_mapping2``, as ha-bambulab and Bambu Studio
+    send it; unverified on any printer we have (``external_spool`` in each profile's
+    ``unverified``). ``ValueError`` on any bad field.
     """
+    profile = profile or load_profile()
     if not (isinstance(file, str) and _FILE_RE.fullmatch(file)):
         raise ValueError("file must be 1..121 letters, digits, '.', '_' or '-' (not leading) plus .gcode.3mf")
     if not (_is_int(plate) and plate in PLATES):
@@ -245,8 +278,16 @@ def project_file(
         raise ValueError("subtask_name must be the file name without .gcode.3mf")
     if not (isinstance(task_id, str) and TASK_ID_RE.fullmatch(task_id)):
         raise ValueError("task_id must be 1..19 digits")
-    _check_unit_slot(ams, slot)
+    _check_unit_slot(ams, slot, profile)
     ams_id, slot_id = tray_ids(ams, slot)
+    if (ams, slot) == EXTERNAL:
+        feed: dict[str, Any] = {"use_ams": False, "ams_mapping": [-1]}
+    else:
+        feed = {
+            "use_ams": True,
+            "ams_mapping": [ams * profile.ams_slots + slot],
+            "ams_mapping2": [{"ams_id": ams_id, "slot_id": slot_id}],
+        }
     return {
         "print": {
             "sequence_id": "0",
@@ -260,37 +301,36 @@ def project_file(
             "profile_id": "0",
             "task_id": task_id,
             "subtask_id": "0",
-            "timelapse": False,
-            "bed_type": "auto",
-            "bed_leveling": True,
-            "bed_levelling": True,
-            "auto_bed_leveling": 2,
-            "flow_cali": False,
-            "vibration_cali": False,
-            "layer_inspect": True,
-            "use_ams": True,
-            "ams_mapping": [ams * len(AMS_SLOTS) + slot],
-            "ams_mapping2": [{"ams_id": ams_id, "slot_id": slot_id}],
+            **{key: profile.print_flags[key] for key in _FLAG_ORDER},
+            **feed,
         }
     }
 
 
-def _is_project_file(payload: Any) -> bool:
+def _is_project_file(payload: Any, profile: PrinterProfile) -> bool:
     """True only for a payload ``project_file`` builds itself, key for key and type for type."""
     if not isinstance(payload, dict) or set(payload) != {"print"}:
         return False
     body = payload["print"]
-    if not isinstance(body, dict) or set(body) != _PROJECT_KEYS or body["command"] != PROJECT_FILE:
+    if not isinstance(body, dict) or body.get("command") != PROJECT_FILE:
         return False
-    param, mapping2 = body["param"], body["ams_mapping2"]
+    param = body.get("param")
     match = _PLATE_PARAM_RE.fullmatch(param) if isinstance(param, str) else None
-    if match is None or not (isinstance(mapping2, list) and len(mapping2) == 1):
+    if match is None:
         return False
-    entry = mapping2[0]
-    if not isinstance(entry, dict) or set(entry) != {"ams_id", "slot_id"}:
-        return False
-    unit_slot = _unit_slot_of(entry["ams_id"], entry["slot_id"])
-    if unit_slot is None:
+    if set(body) == _PROJECT_KEYS - {"ams_mapping2"}:
+        unit_slot: tuple[int, int] | None = EXTERNAL  # the rebuild below checks use_ams and the mapping
+    elif set(body) == _PROJECT_KEYS:
+        mapping2 = body["ams_mapping2"]
+        if not (isinstance(mapping2, list) and len(mapping2) == 1):
+            return False
+        entry = mapping2[0]
+        if not isinstance(entry, dict) or set(entry) != {"ams_id", "slot_id"}:
+            return False
+        unit_slot = _unit_slot_of(entry["ams_id"], entry["slot_id"], profile)
+        if unit_slot is None or unit_slot == EXTERNAL:
+            return False
+    else:
         return False
     try:
         rebuilt = project_file(
@@ -301,17 +341,19 @@ def _is_project_file(payload: Any) -> bool:
             task_id=body["task_id"],
             ams=unit_slot[0],
             slot=unit_slot[1],
+            profile=profile,
         )
     except (ValueError, TypeError):
         return False
     return _same_json(rebuilt, payload)
 
 
-def _is_allowed(payload: Any) -> bool:
-    """The whole write allowlist: the reads, a tray setting, project_file, pause, stop."""
+def _is_allowed(payload: Any, profile: PrinterProfile) -> bool:
+    """The whole write allowlist: the reads, a tray setting, project_file, pause, stop,
+    each as built for ``profile``."""
     if any(_same_json(payload, fixed) for fixed in (*READ_COMMANDS, PAUSE_PRINT, STOP_PRINT)):
         return True
-    return _is_tray_setting(payload) or _is_project_file(payload)
+    return _is_tray_setting(payload, profile) or _is_project_file(payload, profile)
 
 
 class LinkStatus(Enum):
@@ -408,6 +450,7 @@ class PrinterLink:
         # Build the context first: a bad TLS setting must fail before anything connects.
         context = build_tls_context(settings, serial=secrets.serial)
         self._tls_mode = settings.tls_mode
+        self._profile = settings.profile  # the allowlist rebuilds every write for this printer
         self._pin = _normalise_pin(settings.cert_sha256) if settings.tls_mode == "pin" else None
         self._serial = secrets.serial
         self._host = secrets.host
@@ -480,6 +523,7 @@ class PrinterLink:
             color_rgba=color_rgba,
             nozzle_temp_min=nozzle_temp_min,
             nozzle_temp_max=nozzle_temp_max,
+            profile=self._profile,
         )
         if not self._publish(payload):
             raise PrinterNotConnected("printer link is not connected, nothing was sent")
@@ -513,7 +557,14 @@ class PrinterLink:
         replayed on reconnect: whether the print started is read from the reports.
         """
         payload = project_file(
-            file=file, plate=plate, md5=md5, subtask_name=subtask_name, task_id=task_id, ams=ams, slot=slot
+            file=file,
+            plate=plate,
+            md5=md5,
+            subtask_name=subtask_name,
+            task_id=task_id,
+            ams=ams,
+            slot=slot,
+            profile=self._profile,
         )
         self._send_once(payload)
         log.info("sent project_file: %s plate %d task_id %s AMS %d slot %d", file, plate, task_id, ams, slot)
@@ -539,7 +590,7 @@ class PrinterLink:
 
     def _publish(self, payload: dict) -> bool:
         """Publish an allowed payload. False when the link is not verified or paho refuses it."""
-        if not _is_allowed(payload):
+        if not _is_allowed(payload, self._profile):
             raise ValueError(
                 "only the read commands, a valid tray setting, project_file, pause and stop may be sent"
             )

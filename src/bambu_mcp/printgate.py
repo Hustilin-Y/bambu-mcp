@@ -14,9 +14,10 @@ from pathlib import Path
 from bambu_mcp.manifest import ManifestError, parse_manifest
 from bambu_mcp.messages import _HINT_WORDS, md_literal
 from bambu_mcp.printer.hms import hms_code, severity
-from bambu_mcp.printer.state import PrinterState
-from bambu_mcp.proposal import SlotChoice, _color_match, job_material, slot_number
+from bambu_mcp.printer.state import PrinterState, ordered_states
+from bambu_mcp.proposal import EXTERNAL_SLOT_NUMBER, SlotChoice, _color_match, job_material, slot_number, slot_words
 from bambu_mcp.store.models import CONFIRMATION_TTL_S, Job, Spool
+from bambu_profiles import PrinterProfile, load_profile
 from slice_agent.output import OutputError, read_output
 
 __all__ = [
@@ -34,7 +35,9 @@ __all__ = [
 ]
 
 SPOOL_MARGIN = 1.15  # the spool must hold the plate's grams plus 15 %
-START_STATES = frozenset({"IDLE", "FINISH", "FAILED"})
+START_STATES = load_profile().idle_states  # the P2S default; preflight reads its profile's
+# Storage kind -> (about it, without it), in the genitive the sentences need.
+_STORAGE = {"usb": ("флешке", "флешки"), "sd": ("microSD-карте", "microSD-карты")}
 BLOCKING_HMS = {"fatal": "критическая", "serious": "серьёзная"}
 NOZZLE_TOLERANCE_MM = 0.001
 _MD5_RE = re.compile(r"[0-9A-Fa-f]{32}")
@@ -108,6 +111,9 @@ class PrintFileInfo:
     minutes: float
     filament_types: tuple[str, ...]  # distinct materials of the plate, in file order
     filament_count: int = 1  # filament ids the plate uses: project_file maps exactly one slot
+    # What the file was sliced for; None only for an info built by hand (the check is skipped).
+    printer_model: str | None = None
+    bed_xy: tuple[int, int] | None = None
 
 
 def _plate_md5(path: Path, plate: int) -> str:
@@ -148,6 +154,8 @@ def print_file_info(path: Path, plate: int) -> PrintFileInfo:
         minutes=found.minutes,
         filament_types=types,
         filament_count=len(found.grams_by_filament),
+        printer_model=result.printer_model,
+        bed_xy=result.bed_xy,
     )
 
 
@@ -201,12 +209,17 @@ def _slot_lines(
     number = slot_number(slot_choice.ams, slot_choice.slot)
     tray = next((t for t in state.trays if (t.ams, t.slot) == (slot_choice.ams, slot_choice.slot)), None)
     loaded = tray is not None and isinstance(tray.tray_type, str) and tray.tray_type.strip()
+    words = slot_words(number)
+    external = number == EXTERNAL_SLOT_NUMBER
     if fresh and not loaded:
-        return [f"Слот {number} пустой, заправь его"]
+        return ["Внешняя катушка пустая, заправь её" if external else f"Слот {number} пустой, заправь его"]
     if spool is None:
-        return [f"К слоту {number} не привязана катушка, привяжи её"]
+        return [f"{words['to'].capitalize()} не привязана катушка, привяжи её"]
     if not spool.active:
-        return [f"Катушка {spool.id} в слоте {number} списана, привяжи к слоту другую"]
+        return [
+            f"Катушка {spool.id} {words['in']} списана, привяжи "
+            + ("другую" if external else "к слоту другую")
+        ]
     if info.filament_count > 1:
         n = info.filament_count
         return [f"Пластина нарезана под несколько филаментов ({n}), а печать идёт из одного слота"]
@@ -215,7 +228,7 @@ def _slot_lines(
         return [f"Материал пластины в файле: {listed}, а печать идёт из одного слота"]
     if fresh and tray is not None and _norm(tray.tray_type) != _norm(info.filament_types[0]):
         return [
-            f"В слоте {number} {md_literal(str(tray.tray_type))}, "
+            f"{words['in'].capitalize()} {md_literal(str(tray.tray_type))}, "
             f"а файл нарезан под {md_literal(info.filament_types[0])}"
         ]
     return []
@@ -241,8 +254,8 @@ def _warnings(
     sliced_slot = _result(job).get("slot")
     color = sliced_slot.get("color") if isinstance(sliced_slot, dict) else None  # the colour at slicing
     if tray is not None and isinstance(color, str) and color and not _color_match(tray, spool, color):
-        number = slot_number(tray.ams, tray.slot)
-        out.append(f"Цвет в слоте {number} не тот, что при нарезке ({md_literal(color)})")
+        where = slot_words(slot_number(tray.ams, tray.slot))["in"]
+        out.append(f"Цвет {where} не тот, что при нарезке ({md_literal(color)})")
     try:
         manifest = parse_manifest(json.loads(job.manifest_json))
     except (ValueError, ManifestError):
@@ -251,8 +264,8 @@ def _warnings(
     have = tray.tray_type if tray is not None else None
     if isinstance(have, str) and have.strip() and _norm(have) != _norm(want):
         because = f" ({md_literal(reason)})" if reason else ""
-        number = slot_number(tray.ams, tray.slot)
-        out.append(f"Задание просит {md_literal(want)}{because}, а в слоте {number} {md_literal(have)}")
+        where = slot_words(slot_number(tray.ams, tray.slot))["in"]
+        out.append(f"Задание просит {md_literal(want)}{because}, а {where} {md_literal(have)}")
     for p in manifest.plates:
         if p.index == plate and p.hint_conflicts:
             words = ", ".join(_HINT_WORDS.get(k, md_literal(k)) for k in p.hint_conflicts)
@@ -272,6 +285,7 @@ def preflight(
     nozzle: str,
     *,
     fresh: bool,
+    profile: PrinterProfile | None = None,
 ) -> Preflight:
     """The hard stops and warnings of a start, in the Global Constraints' order.
 
@@ -279,24 +293,28 @@ def preflight(
     Without it, or with an UNKNOWN state, everything read from printer reports is stale:
     one line says so instead of one per stale field. ``expected_sha256`` is the sha256
     recorded at slicing (None for a job sliced before phase 3), ``file_sha256`` the one of
-    the fetched file (None when it is missing).
+    the fetched file (None when it is missing). ``profile`` (default P2S) gives the
+    idle states a print may start from and the storage the printer prints from.
     """
+    profile = profile or load_profile()
+    start_states = ordered_states(profile.idle_states)
     fresh = fresh and state.gcode_state != "UNKNOWN"
     blocking: list[str] = []
     if not fresh:
         blocking.append("Принтер не на связи или ещё не прислал отчёт после подключения")
     else:
-        if state.gcode_state not in START_STATES:
-            blocking.append(f"Принтер занят: {md_literal(state.gcode_state)}, нужен IDLE, FINISH или FAILED")
+        if state.gcode_state not in profile.idle_states:
+            wanted = " или ".join([", ".join(start_states[:-1]), start_states[-1]] if len(start_states) > 1 else start_states)
+            blocking.append(f"Принтер занят: {md_literal(state.gcode_state)}, нужен {wanted}")
         for h in state.hms:
             level = BLOCKING_HMS.get(severity(h))
             if level is not None:
                 code = md_literal(f"HMS_{hms_code(h)}")
                 blocking.append(f"Ошибка принтера {code} ({level}), сначала устрани её")
         if state.sdcard is None:
-            blocking.append("Нет данных о флешке, подожди отчёт принтера")
+            blocking.append(f"Нет данных о {_STORAGE[profile.storage][0]}, подожди отчёт принтера")
         elif not state.sdcard:
-            blocking.append("В принтере нет флешки, вставь её")
+            blocking.append(f"В принтере нет {_STORAGE[profile.storage][1]}, вставь её")
         nozzle_line = _nozzle_line(state, nozzle)
         if nozzle_line:
             blocking.append(nozzle_line)
@@ -312,4 +330,14 @@ def preflight(
     file_line = _file_line(expected_sha256, file_sha256)
     if file_line:
         blocking.append(file_line)
+    # The slice-agent checks the file against its own profile, which may not be this printer's.
+    if info.printer_model is not None and info.printer_model != profile.model_name:
+        blocking.append(
+            f"Файл нарезан для {md_literal(info.printer_model or 'неизвестного принтера')}, "
+            f"а принтер {md_literal(profile.model_name)}: проверь printer в slice-agent.toml и нарежь заново"
+        )
+    elif info.bed_xy is not None and info.bed_xy != profile.bed_mm[:2]:
+        blocking.append(
+            f"Файл нарезан под стол {info.bed_xy[0]}x{info.bed_xy[1]}, а у принтера {profile.bed_area}: нарежь заново"
+        )
     return Preflight(blocking=blocking, warnings=_warnings(state, fresh, job, plate, slot_choice, spool))

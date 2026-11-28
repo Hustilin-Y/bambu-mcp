@@ -1,0 +1,17 @@
+# bambu-mcp as a systemd user unit, written by the bambu add-in's setup.
+[Unit]
+Description=bambu-mcp: Bambu Lab printer monitor and MCP server
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{BAMBU_HOME}}
+Environment=BAMBU_ENV=%h/.config/bambu/.env
+Environment=BAMBU_CONFIG=%h/.config/bambu/config.toml
+ExecStart={{BAMBU_HOME}}/.venv/bin/bambu-service
+MemoryMax=300M
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

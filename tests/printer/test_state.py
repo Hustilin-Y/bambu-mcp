@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from bambu_mcp.printer.state import PrinterState, apply, identity
+from bambu_mcp.printer.state import EXTERNAL_AMS, EXTERNAL_TRAY, PrinterState, Tray, apply, identity
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "p2s"
 
@@ -17,9 +17,10 @@ def test_full_report_idle():
     state = apply(PrinterState.empty(), report)
     assert state.gcode_state == report["print"]["gcode_state"].upper()
     assert state.nozzle_diameter == 0.4
-    assert len(state.trays) == 4
-    assert [t.tray_type for t in state.trays] == ["PETG", "PETG", "PETG", None]
-    assert all(t.remain_pct is None for t in state.trays)
+    assert len(state.trays) == 5  # 4 AMS slots and the external spool (vir_slot)
+    assert [t.tray_type for t in state.trays] == ["PETG", "PETG", "PETG", None, "PLA"]
+    assert all(t.remain_pct is None for t in state.trays[:4])
+    assert (state.trays[4].ams, state.trays[4].slot) == (EXTERNAL_AMS, EXTERNAL_TRAY)
     assert state.trays[1].color_rgba == "057748FF"
     assert (state.trays[0].ams, state.trays[3].slot) == (0, 3)
 
@@ -142,3 +143,54 @@ def test_state_parses_sdcard_and_task_id():
 def test_sdcard_only_a_boolean_counts(raw, parsed):
     known = apply(PrinterState.empty(), {"print": {"sdcard": True}})
     assert apply(known, {"print": {"sdcard": raw}}).sdcard is parsed
+
+
+# -- external spool -------------------------------------------------------------------
+
+
+def _ext(state):
+    return [t for t in state.trays if t.ams == EXTERNAL_AMS]
+
+
+@pytest.mark.synthetic
+def test_vt_tray_parsed_as_external():
+    report = {"print": {"vt_tray": {"id": "254", "tray_type": "PLA", "tray_color": "FFFFFFFF", "remain": 80}}}
+    state = apply(PrinterState.empty(), report)
+    assert state.trays == (Tray(EXTERNAL_AMS, EXTERNAL_TRAY, "PLA", "FFFFFFFF", 80),)
+
+
+@pytest.mark.synthetic
+def test_vir_slot_parsed_as_external():
+    report = {"print": {"vir_slot": [{"id": "255", "tray_type": "PETG", "tray_color": "000000FF", "remain": -1}]}}
+    state = apply(PrinterState.empty(), report)
+    assert state.trays == (Tray(EXTERNAL_AMS, EXTERNAL_TRAY, "PETG", "000000FF", None),)
+
+
+@pytest.mark.synthetic
+def test_vt_tray_kept_when_ams_absent():
+    state = apply(PrinterState.empty(), load("pushall_idle"))
+    later = apply(state, {"print": {"ams": {"ams": [{"id": "0", "tray": [{"id": "0", "tray_type": "ABS"}]}]}}})
+    assert _ext(later) == _ext(state)
+    assert [t.tray_type for t in later.trays if t.ams == 0] == ["ABS"]
+
+
+@pytest.mark.synthetic
+def test_ams_kept_when_vt_tray_absent():
+    state = apply(PrinterState.empty(), load("pushall_idle"))
+    later = apply(state, {"print": {"vt_tray": {"id": "254", "tray_type": "TPU"}}})
+    assert [t.tray_type for t in later.trays if t.ams == 0] == ["PETG", "PETG", "PETG", None]
+    assert [t.tray_type for t in _ext(later)] == ["TPU"]
+
+
+@pytest.mark.synthetic
+def test_empty_vt_tray_is_empty():
+    state = apply(PrinterState.empty(), {"print": {"vt_tray": {"id": "254", "tray_type": ""}}})
+    assert [t.tray_type for t in _ext(state)] == [None]
+
+
+@pytest.mark.synthetic
+@pytest.mark.parametrize("raw", [None, "x", [], [{"tray_type": "PLA"}, {"tray_type": "PETG"}], {"tray_type": 5}])
+def test_odd_external_blocks_keep_state(raw):
+    state = apply(PrinterState.empty(), {"print": {"vt_tray": {"id": "254", "tray_type": "PLA"}}})
+    later = apply(state, {"print": {"vir_slot": raw}})
+    assert _ext(later) == _ext(state)

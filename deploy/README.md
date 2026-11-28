@@ -1,6 +1,12 @@
 # Deploying bambu-service to workshop
 
-Target: the home Ubuntu server "workshop", user `shiba-srv`, about 3 GB RAM.
+Target: a small home Ubuntu server ("workshop" in these examples, about 3 GB RAM), run as a
+normal user, `bambu` here: put your own user name in `bambu-service.service` and the commands below.
+Addresses are examples: `192.0.2.10` is the server, `192.0.2.20` the PC.
+
+**Upgrading to the portable release:** the default `listen` is now loopback only. If your
+config.toml has no `listen`, add your LAN entry (`listen = ["<server IP>:8765", "127.0.0.1:8765"]`)
+before updating, or the PC loses the MCP server.
 
 | What | Where |
 | --- | --- |
@@ -15,7 +21,7 @@ Run the commands from the repo root on the PC unless stated otherwise.
 ## 1. Code
 
 ```
-ssh workshop 'sudo mkdir -p /srv/bambu/app /srv/bambu/data && sudo chown -R shiba-srv: /srv/bambu'
+ssh workshop 'sudo mkdir -p /srv/bambu/app /srv/bambu/data && sudo chown -R bambu: /srv/bambu'
 tar --exclude=.venv --exclude=__pycache__ --exclude=.git --exclude=.superpowers \
     --exclude=spike --exclude=data --exclude=.env --exclude=.pytest_cache \
     -czf - . | ssh workshop 'tar -xzf - -C /srv/bambu/app'
@@ -84,12 +90,15 @@ Options: `-o/--out` (required), `--prefix` (default `22E`, the P2S). Never commi
 
 ## 4. Unit
 
+Set `User=` in the unit to your service user first (the repo has the example `bambu`). The
+installed unit is yours: an update of the app does not need it copied again.
+
 ```
 scp deploy/bambu-service.service workshop:/tmp/
 ssh workshop 'sudo install -m 644 /tmp/bambu-service.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now bambu-service'
 ```
 
-The unit orders itself after `network-online.target` because the MCP listener binds `192.168.88.11` and does not retry a failed bind. `MemoryMax=150M`, `Restart=on-failure`, `RestartSec=10`.
+The unit orders itself after `network-online.target` because the MCP listener binds `192.0.2.10` and does not retry a failed bind. `MemoryMax=150M`, `Restart=on-failure`, `RestartSec=10`.
 
 ## 5. Notifications (optional)
 
@@ -110,7 +119,7 @@ Clients connect by IP: the Host allowlist accepts only the `listen` addresses, s
 Claude Code on the PC:
 
 ```
-claude mcp add --transport http bambu http://192.168.88.11:8765/mcp --header "Authorization: Bearer <CLIENT_TOKEN_PC>"
+claude mcp add --transport http bambu http://192.0.2.10:8765/mcp --header "Authorization: Bearer <CLIENT_TOKEN_PC>"
 ```
 
 The multiclaude assistant (owner only), through loopback, on the server:
@@ -134,7 +143,7 @@ Phase 2 takes print jobs from CAD Workshop, slices them on the PC through slice-
 
 Two ways, both owner only (the `CLIENT_TOKEN_<NAME>` tokens of step 2). The service copies the manifest and its 3MF into `data_dir/jobs/<job id>/`.
 
-- MCP `create_job(manifest_path)` reads a manifest on workshop itself. Off by default. Turn it on with `jobs_root_allowed`, an absolute path (a relative one fails the start). On workshop set it to the cad-workshop folder that holds the print-ready output, so multiclaude's `create_job` works. The manifest and its 3MF must both resolve inside it, links included, and `shiba-srv` must be able to read them.
+- MCP `create_job(manifest_path)` reads a manifest on workshop itself. Off by default. Turn it on with `jobs_root_allowed`, an absolute path (a relative one fails the start). On workshop set it to the cad-workshop folder that holds the print-ready output, so multiclaude's `create_job` works. The manifest and its 3MF must both resolve inside it, links included, and the service user must be able to read them.
 
   ```toml
   jobs_root_allowed = "/<cad-workshop checkout on workshop>"
@@ -149,17 +158,17 @@ Two ways, both owner only (the `CLIENT_TOKEN_<NAME>` tokens of step 2). The serv
   Then, in a new shell, from the repo root:
 
   ```
-  uv run bambu-mcp upload <path>\<name>.print.json --url http://192.168.88.11:8765 --token-env BAMBU_MCP_TOKEN
+  uv run bambu-mcp upload <path>\<name>.print.json --url http://192.0.2.10:8765 --token-env BAMBU_MCP_TOKEN
   ```
 
-  `--url` can come from `service_url` instead: put `service_url = "http://192.168.88.11:8765"` in a small TOML file on the PC and point the `BAMBU_CONFIG` environment variable at it. The file is read with the service's own loader, so only service keys are allowed in it.
+  `--url` can come from `service_url` instead: put `service_url = "http://192.0.2.10:8765"` in a small TOML file on the PC and point the `BAMBU_CONFIG` environment variable at it. The file is read with the service's own loader, so only service keys are allowed in it.
 
 ### Slicing: workshop side
 
 `config.toml`:
 
 ```toml
-gateway_url = "http://192.168.88.11:<gateway port>"   # [server] host and port of gateway.toml
+gateway_url = "http://192.0.2.10:<gateway port>"   # [server] host and port of gateway.toml
 slice_agent_url = "http://<PC address>:11436"
 ```
 

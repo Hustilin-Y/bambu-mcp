@@ -1,0 +1,19 @@
+bambu is on. What is left, once:
+
+1. Slicing. bambu-service sends jobs to a slice-agent with Bambu Studio. Pick one of the options in
+   {{BAMBU_HOME}}/deploy/slicing-options.md, then set slice_agent_url in ~/.config/bambu/config.toml
+   and SLICE_AGENT_TOKEN in ~/.config/bambu/.env, and run: systemctl --user restart bambu-service
+2. Spools. Tell the assistant your spools ("add a spool: Elegoo PLA white, 1 kg, 600 UAH"), then
+   "map it to slot 0" for the external holder. Without a mapped spool nothing can print.
+3. Costs. Your electricity tariff, currency and country, and the printer's wear per hour:
+   "tariff 4.32 per kWh", "amortization 9 per hour".
+4. Check the printer against its profile, and send the result as a pull request to bambu-mcp:
+     BAMBU_ENV=~/.config/bambu/.env {{BAMBU_HOME}}/.venv/bin/bambu-printer-check --out ~/printer-check
+   It only reads (add --upload-test for one small FTPS upload). It never starts a print. The fields
+   it confirms move out of `unverified` in src/bambu_profiles/<model>.toml in your PR.
+
+Trust, plainly: on multiclaude every assistant runs as the bot's Linux user. Any assistant on this
+machine can read the printer's access code and the service tokens in ~/.config/bambu/.env, and
+could start a print over MQTT itself. The Telegram button guards against a model misreading
+consent, not against an assistant set on forging it. One owner on the machine and
+"frontdesk": "router" in config.json keep the risk small.

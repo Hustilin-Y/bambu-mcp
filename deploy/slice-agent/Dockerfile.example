@@ -1,0 +1,33 @@
+# Example only: slice-agent and a pinned Bambu Studio AppImage in one image (option b in
+# deploy/slicing-options.md). Not built or published by bambu-mcp: adjust, build and own it.
+#
+#   docker build -f deploy/slice-agent/Dockerfile.example -t bambu-slice-agent .
+#
+# The AppImage is extracted at build time (no FUSE in containers). Pin the version the
+# service was checked with and check its download yourself.
+FROM ubuntu:24.04
+
+ARG STUDIO_APPIMAGE_URL
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates curl xvfb xauth libgl1 libegl1 libgtk-3-0 libwebkit2gtk-4.1-0 \
+        libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 locales \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+RUN useradd -m slicer
+WORKDIR /opt/studio
+RUN test -n "$STUDIO_APPIMAGE_URL" \
+    && curl -fsSL -o studio.AppImage "$STUDIO_APPIMAGE_URL" \
+    && chmod +x studio.AppImage && ./studio.AppImage --appimage-extract >/dev/null \
+    && rm studio.AppImage && chown -R slicer: /opt/studio
+
+COPY --chown=slicer . /home/slicer/bambu-mcp
+USER slicer
+WORKDIR /home/slicer/bambu-mcp
+RUN uv sync --frozen --no-dev
+
+# slice-agent.toml (with printer, studio_exe = "/opt/studio/squashfs-root/AppRun",
+# studio_resources = "/opt/studio/squashfs-root/resources/profiles/BBL") is mounted at
+# /home/slicer/.config/bambu-mcp/slice-agent.toml; SLICE_AGENT_TOKEN comes from the environment.
+EXPOSE 11436
+CMD ["xvfb-run", "-a", ".venv/bin/slice-agent", "serve"]

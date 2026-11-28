@@ -1,0 +1,22 @@
+# slice-agent on a Linux server, as a systemd user unit (deploy/slicing-options.md, option a).
+# Install: copy to ~/.config/systemd/user/, then
+#   systemctl --user daemon-reload && systemctl --user enable --now slice-agent
+# Runs while you are logged in, or always with lingering (root: loginctl enable-linger <user>).
+# Tokens live in the environment file (mode 600), never here:
+#   SLICE_AGENT_TOKEN=<the same value as SLICE_AGENT_TOKEN in bambu-service's .env>
+[Unit]
+Description=bambu-mcp slice-agent (Bambu Studio CLI)
+
+[Service]
+Type=simple
+# The bambu-mcp checkout, synced with `uv sync --frozen --no-dev`.
+WorkingDirectory=%h/bambu-mcp
+EnvironmentFile=%h/.config/bambu-mcp/slice-agent.env
+# Studio's CLI wants a display even when slicing: xvfb-run gives it a virtual one.
+ExecStart=/usr/bin/xvfb-run -a %h/bambu-mcp/.venv/bin/slice-agent serve
+Restart=on-failure
+RestartSec=10
+MemoryMax=4G
+
+[Install]
+WantedBy=default.target

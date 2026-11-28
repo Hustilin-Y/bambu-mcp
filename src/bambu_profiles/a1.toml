@@ -1,0 +1,45 @@
+# Bambu Lab A1 without an AMS. Filled from public sources (Bambu's specs, ha-bambulab,
+# Bambu Studio's presets), not from a printer we have. Everything in `unverified` is
+# a best guess: scripts/printer_check.py confirms what it can, and a PR moves the
+# confirmed names out of the list.
+model_name = "Bambu Lab A1"
+bed_mm = [256, 256, 256]
+hms_prefix = "N2S"
+camera = "jpeg_6000"
+storage = "sd"
+ams_units = 0
+ams_slots = 0
+external_spool = true
+nozzle_temp_range = [150, 300]
+heatup_kwh = 0.05
+filaments = ["Generic PLA @BBL A1", "Generic PETG @BBL A1"]
+plate_types = ["Textured PEI Plate", "Cool Plate", "Engineering Plate", "High Temp Plate", "Smooth PEI Plate"]
+idle_states = ["IDLE", "FINISH", "FAILED"]
+stoppable_states = ["PREPARE", "RUNNING", "PAUSE"]
+unverified = [
+  "hms_prefix", "camera", "storage", "ams_units", "ams_slots", "external_spool",
+  "machine_presets", "process_sets", "filaments", "plate_types", "layer_heights",
+  "nozzle_temp_range", "power_w", "heatup_kwh", "print_flags", "idle_states", "stoppable_states",
+]
+
+[machine_presets]
+"0.4" = "Bambu Lab A1 0.4 nozzle"
+
+[process_sets]
+standard = "0.20mm Standard @BBL A1"
+
+[layer_heights]
+"0.4" = [0.12, 0.16, 0.20, 0.24, 0.28]
+
+[power_w]  # the P2S values until measured on an A1
+PLA = 200.0
+
+[print_flags]
+timelapse = false
+bed_type = "auto"
+bed_leveling = true
+bed_levelling = true
+auto_bed_leveling = 2
+flow_cali = false
+vibration_cali = false
+layer_inspect = false  # the A1 has no lidar

@@ -23,7 +23,7 @@ from slice_agent.app import create_app
 from slice_agent.config import AgentConfig
 from slice_agent.runner import SliceRun
 
-GATEWAY = "http://192.168.88.11:8780"
+GATEWAY = "http://192.0.2.10:8780"
 GATEWAY_KEY = "gateway-secret-key"
 AGENT = "http://192.0.2.20:11436"
 TOKEN = "slice-secret-token"

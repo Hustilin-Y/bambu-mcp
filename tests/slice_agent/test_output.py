@@ -354,3 +354,12 @@ def test_streamed_byte_counter_stops_the_scan(monkeypatch):
     assert output._extruded_lengths(io.BytesIO(gcode)) is None
     monkeypatch.setattr(output, "MAX_GCODE_BYTES", len(gcode))
     assert output._extruded_lengths(io.BytesIO(gcode))["other"] == pytest.approx(50.0)
+
+
+def test_output_check_follows_profile(tmp_path):
+    from bambu_profiles import load_profile
+
+    res = read_output(make_3mf(tmp_path / "a.gcode.3mf"), plate=1)
+    check_output(res, "0.4", load_profile("p2s"))
+    with pytest.raises(OutputError, match="Bambu Lab A1"):
+        check_output(res, "0.4", load_profile("a1"))

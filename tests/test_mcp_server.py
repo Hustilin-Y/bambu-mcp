@@ -130,18 +130,19 @@ class FakeService:
         if self.set_tray_error is not None:
             raise self.set_tray_error
         self.trays_sent.append(fields)
-        return tray_setting(**fields)
+        return tray_setting(**fields, profile=getattr(self, "profile", None))
 
     def request_full_report(self) -> None:
         self.full_reports += 1
 
 
 class Harness:
-    def __init__(self, tmp_path, camera_result: bytes | None = JPEG) -> None:
-        self.settings = Settings(data_dir=tmp_path)
+    def __init__(self, tmp_path, camera_result: bytes | None = JPEG, printer: str = "p2s") -> None:
+        self.settings = Settings(data_dir=tmp_path, printer=printer)
         self.store = Store(tmp_path / "bambu.db")
         self.store.migrate()
         self.service = FakeService()
+        self.service.profile = self.settings.profile
         self.camera_calls = 0
 
         async def camera():
@@ -1212,7 +1213,7 @@ def test_bad_slot_lists_the_usable_ones_and_wakes_nothing(jh):
             assert text == (
                 f"slot {slot} is empty or has no active spool with a filament preset, usable: 1 PETG white"
             )
-        for slot in (0, 17):
+        for slot in (0, 17):  # 0, the external spool, is off for the P2S until its live check
             assert jh.error(tool, job_id=job_id, slot=slot) == f"slot must be 1..16, got {slot}"
     assert jh.waker.calls == 0 and jh.slicer.requests == []
     assert jh.store.outbox_count() == 0
@@ -1401,3 +1402,89 @@ def test_reset_settings_tool(jh):
     assert "being sliced or evaluated" in jh.error("reset_settings", job_id=job_id)
     assert jh.error("reset_settings", job_id=999) == "job 999 not found"
     assert jh.waker.calls == 0 and jh.slicer.requests == []
+
+
+def test_printer_status_names_profile(h):
+    status = h.call("printer_status")
+    assert status["printer"] == {"model": "Bambu Lab P2S", "profile": "p2s", "unverified": []}
+
+
+def test_instructions_name_the_model(h):
+    result = h.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}})
+    assert "Bambu Lab P2S" in result["instructions"]
+
+
+def test_map_slot_accepts_the_external_spool(h):
+    spool = h.call("add_spool", brand="Elegoo", material="PLA", color_name="белый", color_hex="#FFFFFF",
+                   price_uah=500.0, net_g=1000.0)
+    out = h.call("map_slot", ams=255, slot=254, spool_id=spool["id"])
+    assert out["spool"]["id"] == spool["id"]
+
+
+def test_slot_zero_accepted_by_propose(h):
+    from bambu_mcp.mcp_server import ToolError, _check_slot_number
+    from bambu_profiles import load_profile
+
+    _check_slot_number(16, load_profile("p2s"))
+    with pytest.raises(ToolError, match="1..16"):
+        _check_slot_number(0, load_profile("p2s"))
+    _check_slot_number(0, load_profile("a1"))
+    with pytest.raises(ToolError, match=r"0 \(external spool\)"):
+        _check_slot_number(1, load_profile("a1"))
+    with pytest.raises(ToolError, match="1..16"):
+        _check_slot_number(17, load_profile("p2s"))
+
+
+def test_load_spool_to_the_external_spool(tmp_path):
+    from bambu_mcp.printer.state import Tray
+
+    harness = Harness(tmp_path, printer="a1")
+    with harness.client:
+        _load_external(harness)
+    harness.store.close()
+
+
+def test_p2s_load_spool_refuses_the_external_spool(h):
+    _idle(h)
+    spool = _loadable_spool(h)
+    result = h.call_raw("load_spool", spool_id=spool["id"], ams=255, slot=254)
+    assert result.get("isError") and "no external spool" in result["content"][0]["text"]
+    assert h.service.trays_sent == []
+
+
+def _load_external(h):
+    from bambu_mcp.printer.state import Tray
+
+    _idle(h)
+    h.service.state = replace(h.service.state, trays=(*h.service.state.trays, Tray(255, 254, "PLA", None, None)))
+    spool = _loadable_spool(h)
+    out = h.call("load_spool", spool_id=spool["id"], ams=255, slot=254)
+    assert (out["sent"]["ams_id"], out["sent"]["tray_id"]) == (255, 254)
+    assert h.store.slot_spool(255, 254).id == spool["id"]
+
+
+def test_load_spool_external_needs_it_in_the_report(tmp_path):
+    harness = Harness(tmp_path, printer="a1")
+    with harness.client:
+        _idle(harness)
+        spool = _loadable_spool(harness)
+        result = harness.call_raw("load_spool", spool_id=spool["id"], ams=255, slot=254)
+        assert result.get("isError") and "no external spool" in result["content"][0]["text"]
+        assert harness.service.trays_sent == []
+    harness.store.close()
+
+
+@pytest.mark.parametrize("ams, slot", [(4, 0), (0, 4), (255, 0), (0, 254)])
+def test_load_spool_refuses_other_ids(h, ams, slot):
+    _idle(h)
+    spool = _loadable_spool(h)
+    result = h.call_raw("load_spool", spool_id=spool["id"], ams=ams, slot=slot)
+    assert result.get("isError")
+    assert h.service.trays_sent == []
+
+
+def test_load_spool_busy_message_keeps_the_state_order(h):
+    _idle(h, "RUNNING")
+    spool = _loadable_spool(h)
+    text = h.call_raw("load_spool", spool_id=spool["id"], ams=0, slot=0)["content"][0]["text"]
+    assert "load_spool works only when it is IDLE, FINISH, FAILED, nothing was sent" in text

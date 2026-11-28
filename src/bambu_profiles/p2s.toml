@@ -1,0 +1,39 @@
+# Bambu Lab P2S, as verified live in phases 0-3 (firmware 01.03, Studio 02.08.02.61).
+# Every field is verified except those named in `unverified`.
+model_name = "Bambu Lab P2S"
+bed_mm = [256, 256, 256]
+hms_prefix = "22E"
+camera = "rtsps_322"
+storage = "usb"  # FTPS writes need a USB stick (docs/phase0-report.md, row 4)
+ams_units = 4
+ams_slots = 4
+external_spool = false  # ams 255 / tray 254: on after its own live check on the P2S
+nozzle_temp_range = [150, 320]
+heatup_kwh = 0.05
+filaments = ["Generic PETG @BBL P2S"]
+plate_types = ["Textured PEI Plate", "Cool Plate", "Engineering Plate", "High Temp Plate", "Smooth PEI Plate"]
+idle_states = ["IDLE", "FINISH", "FAILED"]
+stoppable_states = ["PREPARE", "RUNNING", "PAUSE"]  # PREPARE: heating and levelling
+unverified = []
+
+[machine_presets]
+"0.4" = "Bambu Lab P2S 0.4 nozzle"
+
+[process_sets]
+standard = "0.20mm Standard @BBL P2S"
+
+[layer_heights]
+"0.4" = [0.12, 0.16, 0.20, 0.24, 0.28]
+
+[power_w]  # average draw per material, watts (Bambu's P2S FAQ)
+PLA = 200.0
+
+[print_flags]  # project_file fields, as verified in phase 0
+timelapse = false
+bed_type = "auto"
+bed_leveling = true
+bed_levelling = true
+auto_bed_leveling = 2
+flow_cali = false
+vibration_cali = false
+layer_inspect = true

@@ -250,7 +250,8 @@ def test_kit_plate_picks_its_md5_and_grams(tmp_path: Path):
     path = sliced_file(tmp_path / "desk-kit-9-kit.gcode.3mf")
     two = print_file_info(path, 2)
     assert two == PrintFileInfo(md5=MD5[2], grams=pytest.approx(18.0), minutes=pytest.approx(60.0),
-                                filament_types=("PLA",), filament_count=2)
+                                filament_types=("PLA",), filament_count=2,
+                                printer_model="Bambu Lab P2S", bed_xy=(256, 256))
     one = print_file_info(path, 1)
     assert one.md5 == MD5[1] and one.grams == pytest.approx(3.1) and one.minutes == pytest.approx(10.0)
     assert one.filament_count == 1
@@ -497,3 +498,57 @@ def test_lines_follow_the_constraint_order_and_style():
     assert "Цвет" in result.warnings[0] and "near a lamp" in result.warnings[1]
     for line in result.blocking + result.warnings:
         assert "—" not in line and ";" not in line
+
+
+def test_sd_storage_wording():
+    from bambu_profiles import load_profile
+
+    result = _check(state=_state(sdcard=False), profile=load_profile("a1"))
+    _only_blocking(result, "microSD")
+    assert "флешк" not in result.blocking[0]
+
+
+def test_usb_storage_wording_default():
+    _only_blocking(_check(state=_state(sdcard=False)), "флешк")
+
+
+def test_start_states_from_profile():
+    _only_blocking(_check(state=_state(gcode_state="RUNNING")), "IDLE, FINISH или FAILED")
+
+
+def test_wrong_printer_model_blocks():
+    from bambu_profiles import load_profile
+
+    info = PrintFileInfo(md5=MD5[1], grams=14.0, minutes=100.0, filament_types=("PETG",),
+                         printer_model="Bambu Lab P2S", bed_xy=(256, 256))
+    a1 = load_profile("a1")
+    result = _check(info=info, profile=a1, state=_state(trays=(Tray(255, 254, "PETG", None, None),)),
+                    slot_choice=SlotChoice(255, 254, 1, None, tray_type="PETG", color_name="чёрный", remaining_g=500.0))
+    assert any("Bambu Lab P2S" in line and "Bambu Lab A1" in line for line in result.blocking), result.blocking
+    assert _check(info=info).blocking == []  # the P2S profile accepts it
+
+
+def test_wrong_bed_blocks():
+    info = PrintFileInfo(md5=MD5[1], grams=14.0, minutes=100.0, filament_types=("PETG",),
+                         printer_model="Bambu Lab P2S", bed_xy=(180, 180))
+    _only_blocking(_check(info=info), "180x180")
+
+
+def test_external_spool_lines_name_it():
+    from bambu_profiles import load_profile
+
+    a1 = load_profile("a1")
+    ext_choice = SlotChoice(255, 254, 1, None, tray_type="PLA", color_name="белый", remaining_g=500.0)
+    info = PrintFileInfo(md5=MD5[1], grams=14.0, minutes=100.0, filament_types=("PETG",))
+    cases = [
+        _check(profile=a1, slot_choice=ext_choice, info=info, state=_state(trays=(Tray(255, 254, None, None, None),))),
+        _check(profile=a1, slot_choice=ext_choice, info=info, spool=None,
+               state=_state(trays=(Tray(255, 254, "PLA", None, None),))),
+        _check(profile=a1, slot_choice=ext_choice, info=info, spool=_spool(active=False),
+               state=_state(trays=(Tray(255, 254, "PLA", None, None),))),
+        _check(profile=a1, slot_choice=ext_choice, info=info, state=_state(trays=(Tray(255, 254, "PLA", None, None),))),
+    ]
+    lines = [line for c in cases for line in c.blocking + c.warnings]
+    assert lines, "each case must produce a line"
+    assert all("лот 0" not in line and "лоте 0" not in line and "лоту 0" not in line for line in lines), lines
+    assert any("внешн" in line.lower() for line in lines)

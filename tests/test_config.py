@@ -87,13 +87,13 @@ def test_settings_phase2_keys(tmp_path):
         f'jobs_root_allowed = "{root}"\n'
         'gateway_url = "http://127.0.0.1:8800"\n'
         'slice_agent_url = "http://192.0.2.10:11436"\n'
-        'service_url = "http://192.168.88.11:8765"\n'
+        'service_url = "http://192.0.2.10:8765"\n'
     )
     s = Settings.load(toml)
     assert s.jobs_root_allowed == Path(root)
     assert s.gateway_url == "http://127.0.0.1:8800"
     assert s.slice_agent_url == "http://192.0.2.10:11436"
-    assert s.service_url == "http://192.168.88.11:8765"
+    assert s.service_url == "http://192.0.2.10:8765"
 
 
 @pytest.mark.parametrize("value", ["cad/out", "./out", "out"])
@@ -180,3 +180,44 @@ def test_country_sets_the_default_timezone_only(tmp_path):
     assert with_country(Settings.load(empty), "PL").timezone == "Europe/Warsaw"
     assert with_country(Settings.load(empty), "ZZ").timezone == "Europe/Kyiv"  # unknown: kept
     assert with_country(Settings.load(explicit), "PL").timezone == "Europe/Kyiv"  # the config wins
+
+
+# -- printer profile ---------------------------------------------------------------
+
+
+def test_printer_defaults_to_p2s(tmp_path):
+    s = Settings.load(tmp_path / "missing.toml")
+    assert s.printer == "p2s"
+    assert s.profile.name == "p2s"
+    assert s.power_w == {"PLA": 200.0}
+    assert s.heatup_kwh == 0.05
+    assert s.camera_backend == "pyav"
+
+
+def test_printer_a1_defaults(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('printer = "a1"\n')
+    s = Settings.load(path)
+    assert s.profile.model_name == "Bambu Lab A1"
+    assert s.camera_backend == "jpeg_6000"
+
+
+def test_unknown_printer_rejected(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('printer = "x1c"\n')
+    with pytest.raises(ValueError, match="a1, p2s"):
+        Settings.load(path)
+
+
+def test_power_w_config_overrides_profile(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('printer = "a1"\nheatup_kwh = 0.02\n[power_w]\nPLA = 95.0\n')
+    s = Settings.load(path)
+    assert s.power_w == {"PLA": 95.0}
+    assert s.heatup_kwh == 0.02
+
+
+def test_camera_backend_config_overrides_profile(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('printer = "a1"\ncamera_backend = "pyav"\n')
+    assert Settings.load(path).camera_backend == "pyav"

@@ -164,7 +164,7 @@ A kit is sliced once, each plate is its own print, confirmation and journal row.
 
 **Later.** Multi-colour, queue, tolerance suggestions, OrcaSlicer, live camera, timelapse download, AMS drying.
 
-**Later, asked by the owner (2026-11-27): printer model as configuration.** Today the code assumes the owner's P2S. The owner wants a printer model to be a setting: a "model profile" that holds everything printer-specific, so that another Bambu model (or a second printer) is a new profile, not a code change. What is hard-coded now, file by file (2026-11-27, branch `phase3-print`):
+**Later, asked by the owner (2026-11-27): printer model as configuration.** *Done in the portable release (branch `portable`): `src/bambu_profiles`, see [2026-11-27-portable-addon-design.md](2026-11-27-portable-addon-design.md).* Today the code assumes the owner's P2S. The owner wants a printer model to be a setting: a "model profile" that holds everything printer-specific, so that another Bambu model (or a second printer) is a new profile, not a code change. What is hard-coded now, file by file (2026-11-27, branch `phase3-print`):
 
 | Where | What is P2S-specific |
 |---|---|

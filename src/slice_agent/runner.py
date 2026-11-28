@@ -14,13 +14,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from bambu_mcp.manifest import INFILL_PATTERNS
+from bambu_profiles import PrinterProfile, load_profile
 from slice_agent.config import AgentConfig
 from slice_agent.profiles import _slug
 
 DEFAULT_TIMEOUT_S = 300
 OUT_SUFFIX = ".gcode.3mf"
-PLATE_TYPES = ("Textured PEI Plate", "Cool Plate", "Engineering Plate", "High Temp Plate", "Smooth PEI Plate")
-LAYER_HEIGHTS = {"0.4": (0.12, 0.16, 0.20, 0.24, 0.28)}
+# The P2S defaults; a printer's own come from its profile (bambu_profiles).
+PLATE_TYPES = load_profile("p2s").plate_types
+LAYER_HEIGHTS = load_profile("p2s").layer_heights
 # Override whitelist values (global constraints); ranges are inclusive.
 DENSITY_RANGE = (0, 100)  # percent, sent as "<n>%"
 WALL_LOOPS_RANGE = (1, 10)
@@ -57,8 +59,13 @@ def _number_in_range(bounds: tuple[int, int]):
     return lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and bounds[0] <= v <= bounds[1]
 
 
-def _checks(nozzle: str) -> dict:
-    """The override whitelist: key -> validator. Its keys are ``OVERRIDE_KEYS``, in order."""
+def _checks(nozzle: str, profile: PrinterProfile | None = None) -> dict:
+    """The override whitelist: key -> validator. Its keys are ``OVERRIDE_KEYS``, in order.
+
+    Plate types and layer heights come from ``profile`` (default P2S).
+    """
+    profile = profile or load_profile()
+    heights = profile.layer_heights.get(nozzle, ())
     return {
         "sparse_infill_density": _in_range(DENSITY_RANGE),
         "sparse_infill_pattern": _choice(INFILL_PATTERNS),
@@ -67,10 +74,8 @@ def _checks(nozzle: str) -> dict:
         "enable_support": lambda v: isinstance(v, bool),
         "support_type": _choice(SUPPORT_TYPES),
         "brim_type": _choice(BRIM_TYPES),
-        "curr_bed_type": _choice(PLATE_TYPES),
-        "layer_height": lambda v: (
-            isinstance(v, (int, float)) and not isinstance(v, bool) and v in LAYER_HEIGHTS.get(nozzle, ())
-        ),
+        "curr_bed_type": _choice(profile.plate_types),
+        "layer_height": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and v in heights,
         "top_shell_layers": _in_range(SHELL_LAYERS_RANGE),
         "bottom_shell_layers": _in_range(SHELL_LAYERS_RANGE),
         "outer_wall_speed": _number_in_range(OUTER_WALL_SPEED_RANGE),
@@ -89,8 +94,8 @@ class Overrides:
     values: dict[str, object]
 
     @classmethod
-    def parse(cls, raw: dict, nozzle: str) -> Overrides:
-        checks = _checks(nozzle)
+    def parse(cls, raw: dict, nozzle: str, profile: PrinterProfile | None = None) -> Overrides:
+        checks = _checks(nozzle, profile)
         for key, value in raw.items():
             if key not in checks:
                 raise ValueError(f"unknown override: {key}")
@@ -143,7 +148,7 @@ def build_command(
     if filament not in cfg.filaments:
         raise ValueError(f"unknown filament: {filament!r}")
     plate_type = str(overrides.values.get("curr_bed_type", plate_type))
-    if plate_type not in PLATE_TYPES:
+    if plate_type not in cfg.profile.plate_types:
         raise ValueError(f"unknown plate_type: {plate_type!r}")
     prof = cfg.profiles_dir
     return [

@@ -21,6 +21,7 @@ from bambu_mcp.proposal import (
     resolve_settings,
     slot_number,
 )
+from bambu_mcp.proposal import EXTERNAL_LABEL, EXTERNAL_SLOT_NUMBER, SlotUnusable, slot_position, usable_slots
 from bambu_mcp.store.models import Amortization, Job, Spool, Tariff
 from slice_agent.runner import Overrides
 
@@ -537,7 +538,7 @@ def test_slot_number_round_trip_over_16_slots():
 
     assert [slot_number(*slot_position(n)) for n in range(1, 17)] == list(range(1, 17))
     assert [slot_position(n) for n in (1, 2, 4, 5, 16)] == [(0, 0), (0, 1), (0, 3), (1, 0), (3, 3)]
-    for bad in (0, 17, -1, True):
+    for bad in (17, -1, True):  # 0 is the external spool
         with pytest.raises(ValueError, match="1..16"):
             slot_position(bad)
 
@@ -644,3 +645,82 @@ def test_precedence_with_goal_and_variant():
                            nozzle="0.6")
     assert "layer_height" not in out and "wall_loops" not in out
     Overrides.parse(out, "0.6")
+
+
+# -- external spool -------------------------------------------------------------------
+
+
+def test_slot_number_external_roundtrip():
+    assert slot_number(255, 254) == EXTERNAL_SLOT_NUMBER == 0
+    assert slot_position(0) == (255, 254)
+    assert slot_position(16) == (3, 3)
+
+
+def test_slot_position_ranges():
+    with pytest.raises(ValueError, match="1..16"):
+        slot_position(17)
+    with pytest.raises(ValueError):
+        slot_position(1, max_slot=0)
+    assert slot_position(0, max_slot=0) == (255, 254)
+
+
+def test_pick_slot_external_only():
+    ext = _tray(255, 254, "PLA", "FFFFFFFF")
+    spool = _spool(material="PLA", color="белый")
+    choice = pick_slot([ext], {(255, 254): spool}, "PLA", None)
+    assert (choice.ams, choice.slot, choice.spool_id) == (255, 254, spool.id)
+    assert choice.warning is None
+
+
+def test_unmapped_external_spool_is_not_loaded():
+    # The P2S reports its external holder as PLA even when it is empty: without a spool
+    # mapped to slot 0 it must never be picked.
+    ams = _tray(0, 0, "PETG")
+    ext = _tray(255, 254, "PLA")
+    choice = pick_slot([ams, ext], {}, "PLA", None)
+    assert (choice.ams, choice.slot) == (0, 0)
+    assert choice.warning is not None
+
+
+def test_ams_preferred_over_external():
+    ams = _tray(0, 1, "PLA")
+    ext = _tray(255, 254, "PLA")
+    spools = {(0, 1): _spool(material="PLA"), (255, 254): _spool(id=2, material="PLA")}
+    assert (pick_slot([ams, ext], spools, "PLA", None).ams) == 0
+
+
+def test_external_label():
+    spool = replace(_spool(material="PLA", color="белый"), filament_preset="Generic PLA @BBL A1")
+    (usable,) = usable_slots([_tray(255, 254, "PLA")], {(255, 254): spool})
+    assert usable.number == 0
+    assert usable.label == f"{EXTERNAL_LABEL} PLA белый"
+    assert EXTERNAL_LABEL == "внешняя катушка"
+
+
+def test_proposal_names_external_spool():
+    choice = SlotChoice(255, 254, 1, None, tray_type="PLA", color_name="белый", remaining_g=800.0)
+    text = _unescape(render_proposal(_job("part"), SETTINGS, choice, "Textured PEI Plate", None))
+    assert "внешняя катушка PLA белый" in text
+    assert "слот 0" not in text
+
+
+def test_external_slot_button():
+    from bambu_mcp.messages import slot_buttons
+    from bambu_mcp.proposal import UsableSlot
+
+    ext = UsableSlot(0, 255, 254, _spool(material="PLA", color="белый"))
+    ams = UsableSlot(1, 0, 0, _spool(id=2, material="PETG", color="синий"))
+    (row,) = slot_buttons(5, [ext, ams], chosen=0)
+    assert row[0].id == "job:5:slot:0"
+    assert "внешняя PLA белый" in row[0].text
+    assert row[1].id == "job:5:slot:1"
+
+
+def test_external_mismatch_warning_names_it():
+    ext = _tray(255, 254, "PLA")
+    spool = replace(_spool(material="PLA", color="белый"), filament_preset="Generic PLA @BBL A1")
+    auto = pick_slot([ext], {(255, 254): spool}, "PETG", None)
+    forced = pick_slot([ext], {(255, 254): spool}, "PETG", None, forced=(255, 254))
+    for choice in (auto, forced):
+        assert "слот 0" not in choice.warning
+        assert "внешняя катушка" in choice.warning

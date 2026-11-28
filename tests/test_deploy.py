@@ -18,7 +18,7 @@ def test_unit_limits_memory_and_restarts():
     assert service["MemoryMax"] == "150M"
     assert service["Restart"] == "on-failure"
     assert service["RestartSec"] == "10"
-    assert service["User"] == "shiba-srv"
+    assert service["User"] == "bambu"
     assert service["ExecStart"] == "/srv/bambu/app/.venv/bin/bambu-service"
 
 
@@ -38,7 +38,7 @@ def test_example_config_loads_with_defaults():
 SLICE_DIR = ROOT / "deploy" / "slice-agent"
 AGENT_KEYS = {
     "studio_exe", "studio_data", "studio_resources", "profiles_dir", "sliced_dir",
-    "listen", "machine", "process_sets", "filaments",
+    "listen", "machine", "process_sets", "filaments", "printer",
 }
 
 
@@ -56,8 +56,8 @@ def test_slice_agent_example_config_loads_with_defaults(tmp_path):
     env = _agent_env(tmp_path)
     path = SLICE_DIR / "slice-agent.example.toml"
     assert path.is_file()  # load_config falls back to the defaults for a missing file
-    example = load_config(path, env)
-    assert example == load_config(tmp_path / "missing.toml", env)
+    example = load_config(path, env, platform="win32")  # the example is the PC's file
+    assert example == load_config(tmp_path / "missing.toml", env, platform="win32")
     assert example.listen == ("0.0.0.0", 11436)
     assert example.process_sets["standard"]
 
@@ -103,7 +103,7 @@ def test_install_script_registers_a_non_elevated_logon_task():
 
 def test_install_script_firewall_rule_is_server_only():
     text = _install_script()
-    assert '"192.168.88.11"' in text
+    assert "[Parameter(Mandatory = $true)][string]$ServerAddress" in text  # no owner default
     assert "11436" in text
     assert "New-NetFirewallRule" in text
     assert "-RemoteAddress $ServerAddress" in text
@@ -138,3 +138,36 @@ def test_deploy_readme_covers_phase3():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for tool in ("prepare_print", "pause_print", "request_stop", "load_spool", "printer_status"):
         assert tool in readme, tool
+
+
+# -- slicing on a Linux server (deploy/slicing-options.md) -----------------------------
+
+
+def test_slice_agent_user_unit_example():
+    import configparser
+
+    unit = configparser.ConfigParser(strict=False, interpolation=None)
+    unit.optionxform = str
+    unit.read(SLICE_DIR / "slice-agent.service", encoding="utf-8")
+    service = unit["Service"]
+    assert "xvfb-run -a" in service["ExecStart"]
+    assert "slice-agent serve" in service["ExecStart"]
+    assert service["EnvironmentFile"] == "%h/.config/bambu-mcp/slice-agent.env"
+    text = (SLICE_DIR / "slice-agent.service").read_text(encoding="utf-8")
+    assert not any(line.startswith("Environment=") for line in text.splitlines())  # tokens: the file only
+    assert unit["Install"]["WantedBy"] == "default.target"
+
+
+def test_slicing_options_doc_covers_the_three_options():
+    text = (ROOT / "deploy" / "slicing-options.md").read_text(encoding="utf-8")
+    for needle in ("AppImage", "xvfb-run", "Docker", "slice_agent_url", "SLICE_AGENT_TOKEN",
+                   "02.08.02.61", "printer =", "studio_exe", "studio_resources"):
+        assert needle in text, needle
+    for name in ("Dockerfile.example", "compose.example.yaml", "slice-agent.service"):
+        assert (SLICE_DIR / name).is_file(), name
+
+
+def test_addon_next_steps_never_syncs_the_live_venv():
+    text = (ROOT / "multiclaude" / "addon" / "next-steps").read_text(encoding="utf-8")
+    assert "uv run " not in text  # it would sync dev packages into the venv the service runs from
+    assert ".venv/bin/bambu-printer-check" in text

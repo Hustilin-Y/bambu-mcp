@@ -414,7 +414,7 @@ class VariantMetrics:
 
 # Rounding before comparing, so close results tie and the secondary goal decides.
 _ROUND = {"time": 0, "cost": 2, "grams": 1, "strength": 2, "layer": 2, "risk": 2, "shell": 0}
-_DEFAULT_LAYER = 0.2  # the P2S 0.4 mm process when the settings leave it to the preset
+_DEFAULT_LAYER = 0.2  # the 0.20 mm standard process when the settings leave it to the preset
 
 
 def _setting(settings: Mapping, key: str, default: float) -> float:

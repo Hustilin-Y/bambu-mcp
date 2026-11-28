@@ -2,14 +2,20 @@
 # Secrets (access code, serial, host, tokens) live in .env, never here.
 # Deployed copy: /srv/bambu/config.toml (override the path with BAMBU_CONFIG).
 
+# Printer model: a profile in src/bambu_profiles (p2s, a1). It sets the model's
+# defaults (camera backend, power_w, heatup_kwh, HMS table, AMS geometry).
+printer = "p2s"
+
 # Relative paths resolve against the working directory (the app dir), so the
-# deployed config must set an absolute path. Holds bambu.db, hms_en_22E.json
-# and the CA bundle.
+# deployed config must set an absolute path. Holds bambu.db, the HMS table
+# (hms_en_<prefix>.json, see scripts/extract_hms.py) and the CA bundle.
 data_dir = "data"
 
 # "host:port" entries. PC client on the LAN address, assistant on loopback.
 # MCP clients must connect by one of these addresses (Host header allowlist).
-listen = ["192.168.88.11:8765", "127.0.0.1:8765"]
+# Default: loopback only. Add the LAN address for clients on other machines (the PC):
+# listen = ["192.0.2.10:8765", "127.0.0.1:8765"]
+listen = ["127.0.0.1:8765"]
 
 # "ca": verify chain against the Bambu root bundle, check CN == serial
 #       (needs ca_file and BAMBU_SERIAL).
@@ -38,14 +44,16 @@ tls_mode = "ca"
 
 # Default --url of `bambu-mcp upload` when this file is named by BAMBU_CONFIG
 # (the token comes from the BAMBU_MCP_TOKEN environment variable, never from here).
-# service_url = "http://192.168.88.11:8765"
+# service_url = "http://192.0.2.10:8765"
 
-camera_backend = "pyav"
-heatup_kwh = 0.05
+# Default from the profile: "pyav" (RTSPS, port 322) or "jpeg_6000" (A1 and P1 series).
+# camera_backend = "pyav"
+# heatup_kwh = 0.05  # default from the profile
 # Omit timezone to take it from the country (MCP set_country, default UA: Europe/Kyiv).
 # A timezone set here always wins over the country's.
 timezone = "Europe/Kyiv"
 
-# Average power draw per filament type, watts.
-[power_w]
-PLA = 200.0
+# Average power draw per filament type, watts. Default from the profile; when set,
+# it must have a PLA entry (the fallback for other materials).
+# [power_w]
+# PLA = 200.0

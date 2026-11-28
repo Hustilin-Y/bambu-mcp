@@ -12,11 +12,10 @@ import json
 import re
 from pathlib import Path
 
+from bambu_profiles import PrinterProfile
 from slice_agent.config import AgentConfig
 
 KINDS = ("machine", "process", "filament")
-BED_AREA = "256x256"
-BED_HEIGHT = "256"
 # Keys of a template that must not leak into the preset including it.
 _TEMPLATE_SKIP = {"name", "type", "from", "instantiation", "setting_id"}
 # Machine keys that stay in process and filament (identity, not machine settings).
@@ -82,11 +81,11 @@ def _finish(kind: str, name: str, data: dict, machine_keys: set[str]) -> dict:
     return data
 
 
-def _check_machine(nozzle: str, m: dict) -> None:
+def _check_machine(nozzle: str, m: dict, profile: PrinterProfile) -> None:
     area = m.get("printable_area") or []
-    if BED_AREA not in area:
-        raise AssertionError(f"unexpected bed {area}, expected {BED_AREA}")
-    if m.get("printable_height") != BED_HEIGHT:
+    if profile.bed_area not in area:
+        raise AssertionError(f"unexpected bed {area}, expected {profile.bed_area}")
+    if m.get("printable_height") != profile.bed_height:
         raise AssertionError(f"unexpected printable_height {m.get('printable_height')!r}")
     if m.get("nozzle_diameter") != [nozzle]:
         raise AssertionError(f"unexpected nozzle {m.get('nozzle_diameter')!r}, expected {[nozzle]}")
@@ -141,7 +140,7 @@ def flatten_all(cfg: AgentConfig) -> list[Path]:
 
     for nozzle, name in cfg.machine.items():
         data = _finish("machine", name, machines[nozzle], machine_keys)
-        _check_machine(nozzle, data)
+        _check_machine(nozzle, data, cfg.profile)
         write(f"machine-{nozzle}.json", data)
     for key, name in cfg.process_sets.items():
         write(f"process-{key}.json", _finish("process", name, _resolve("process", name, idx), machine_keys))

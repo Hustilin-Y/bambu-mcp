@@ -1,6 +1,8 @@
 # slice-agent on the PC
 
-slice-agent slices print jobs for bambu-service with the Bambu Studio CLI on the owner's Windows PC. It runs as the owner's standard user (not elevated), started at logon by a scheduled task, and listens on `0.0.0.0:11436`. A firewall rule lets only workshop (`192.168.88.11`) reach the port, and every endpoint but `/health` needs the bearer token.
+slice-agent slices print jobs for bambu-service with the Bambu Studio CLI on the owner's Windows PC. It runs as the owner's standard user (not elevated), started at logon by a scheduled task, and listens on `0.0.0.0:11436`. A firewall rule lets only the server (`-ServerAddress`, `192.0.2.10` in these examples) reach the port, and every endpoint but `/health` needs the bearer token.
+
+On a Linux server instead of a Windows PC, see [../slicing-options.md](../slicing-options.md).
 
 | What | Where |
 | --- | --- |
@@ -111,14 +113,14 @@ Rotating `SLICE_AGENT_TOKEN`: set the new value on both sides, restart the task 
 ## 5. Install
 
 ```
-powershell -ExecutionPolicy Bypass -File .\deploy\slice-agent\install.ps1
+powershell -ExecutionPolicy Bypass -File .\deploy\slice-agent\install.ps1 -ServerAddress <server IP>
 ```
 
 Run it as the owner, **not** elevated: the task is registered for the user who runs the script. It prints every change and is safe to run again.
 
 1. Checks: the repo root, `uv` on PATH, whether both user variables are set (never their values), whether `slice-agent.toml` exists.
 2. Scheduled task `bambu-mcp slice-agent`: at logon of this user, run level Limited, no time limit, restart every minute on failure, one instance. The action is `uvw.exe run slice-agent serve` (uvw is uv without a console window) in the repo root. It holds no token. The task is kept when it already matches, replaced otherwise.
-3. Firewall rule `bambu-mcp slice-agent`: inbound TCP 11436 from `192.168.88.11` only, any profile. This needs an administrator: from a normal shell the script leaves the rule alone and prints the exact one-line `Start-Process ... -Verb RunAs ... -FirewallOnly` command to run. It also warns about inbound BLOCK rules for Python (a cancelled "allow access" prompt leaves them, and they win over the allow rule).
+3. Firewall rule `bambu-mcp slice-agent`: inbound TCP 11436 from `-ServerAddress` only, any profile. This needs an administrator: from a normal shell the script leaves the rule alone and prints the exact one-line `Start-Process ... -Verb RunAs ... -FirewallOnly` command to run. It also warns about inbound BLOCK rules for Python (a cancelled "allow access" prompt leaves them, and they win over the allow rule).
 4. Starts the task unless it is already running or `SLICE_AGENT_TOKEN` is missing, then polls `http://127.0.0.1:11436/health` for up to about 30 s.
 
 The script re-resolves the uv path each run: run it again after uv moves.

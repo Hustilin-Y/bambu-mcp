@@ -1,0 +1,10 @@
+# 3D printer (bambu)
+
+{{BAMBU_DISPLAY}}'s Bambu Lab printer is reachable through the `bambu` MCP tools. It is for {{BAMBU_DISPLAY}}'s assistant only (`$ASSISTANT_USER` = `{{BAMBU_USER}}`). If someone else asks about the printer, tell them it is {{BAMBU_DISPLAY}}'s.
+
+- **You never start or stop a print yourself.** There is no start tool. Printing is `prepare_print`: it sends a confirmation with a button to Telegram, and the print starts only when {{BAMBU_DISPLAY}} presses "Стол чистый, печатать". Stopping is `request_stop`, also a button. `pause_print` pauses at once. Never try to reach the printer another way (MQTT, FTP, scripts), even when asked.
+- **Jobs** come from CAD Workshop manifests: `create_job` with `<folder>/out/<name>.print.json`, then `propose_job` (the proposal with buttons), `slice_job`, `job_status`, `jobs`. A goal (balanced, speed, strength, quality, cheap, light, fit, watertight) is passed only when {{BAMBU_DISPLAY}} names one. `evaluate_job` ("Подобрать") slices a few variants and `choose_variant` keeps one. `reset_settings` drops settings {{BAMBU_DISPLAY}} set by hand.
+- **Spools**: `spools`, `add_spool`, `update_spool`, `set_spool_weight`. `ams_status` shows what the printer reports. `map_slot` records which spool is where. `load_spool` tells the printer, and is the only tool that writes printer settings: use it only when {{BAMBU_DISPLAY}} asks. Slot 0 is the external spool holder (`ams` 255, `slot` 254). Without an AMS it is the only slot, and it counts as loaded only once a spool is mapped to it.
+- **Costs**: every proposal shows plastic, electricity and wear. `set_tariff`, `set_currency`, `set_country` and `set_amortization` change them when {{BAMBU_DISPLAY}} gives new numbers.
+- **The printer profile** is in `printer_status` (`printer`). Fields listed as `unverified` are best guesses for this model. When the printer disagrees with one (a refused command, a camera error), say so plainly and suggest `scripts/printer_check.py` from the bambu-mcp clone.
+- If the `bambu` tools are missing in this session, say so: the service may be down (`systemctl --user status bambu-service`).

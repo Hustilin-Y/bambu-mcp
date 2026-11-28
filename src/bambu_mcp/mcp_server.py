@@ -45,6 +45,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from bambu_mcp import camera as camera_module
 from bambu_mcp.config import Secrets, Settings, country_timezone, with_country
+from bambu_profiles import PrinterProfile, load_profile
 from bambu_mcp.cost import tariff_reminder_enabled
 from bambu_mcp.evaluation import job_goal, parse_goal
 from bambu_mcp.jobs import (
@@ -64,15 +65,13 @@ from bambu_mcp.messages import render_variants
 from bambu_mcp.manifest import INFILL_PATTERNS, MAX_MANIFEST_BYTES, ManifestError, parse_manifest
 from bambu_mcp.printer.hms import hms_code, severity
 from bambu_mcp.printer.link import (
-    AMS_SLOTS,
-    AMS_UNITS,
     NOZZLE_TEMP_RANGE,
     TRAY_INFO_IDX_RE,
     TRAY_TYPES,
     LinkStatus,
     PrinterNotConnected,
 )
-from bambu_mcp.printer.state import PrinterState
+from bambu_mcp.printer.state import EXTERNAL_AMS, EXTERNAL_TRAY, PrinterState, ordered_states
 from bambu_mcp.printgate import ControlRefused, PrintRefused
 from bambu_mcp.proposal import MAX_SLOT_NUMBER, NAMED_SETS, slot_number
 from bambu_mcp.store.db import Store
@@ -81,10 +80,8 @@ from slice_agent.runner import (
     BRIM_TYPES,
     DENSITY_RANGE,
     IRONING_TYPES,
-    LAYER_HEIGHTS,
     OUTER_WALL_SPEED_RANGE,
     OVERRIDE_KEYS,
-    PLATE_TYPES,
     SEAM_POSITIONS,
     SHELL_LAYERS_RANGE,
     SUPPORT_TYPES,
@@ -108,7 +105,6 @@ AMORT_RATE_MAX = 1e6  # per hour of printing, the same reason
 SET_KEY = "set"  # slice_job settings: the named set to start from
 PATH_INTAKE_OFF = "path intake is off: upload with `bambu-mcp upload`"
 # gcode_state values (phase 1 names) in which the AMS may be reconfigured.
-LOADABLE_STATES = ("IDLE", "FINISH", "FAILED")
 _SPOOL_HEX_RE = re.compile(r"#[0-9A-Fa-f]{6}", re.ASCII)  # a spool's color_hex, exactly
 LOAD_SPOOL_NOTE = (
     "Sent once, not retried. Check the AMS slot on the printer screen; "
@@ -116,7 +112,7 @@ LOAD_SPOOL_NOTE = (
 )
 
 INSTRUCTIONS = (
-    "Bambu Lab P2S: status, camera, journal, inventory, print jobs. A print starts or stops only "
+    "{model}: status, camera, journal, inventory, print jobs. A print starts or stops only "
     "on the owner's press in Telegram: prepare_print and request_stop send the confirmation."
 )
 PREPARE_NOTE = (
@@ -352,9 +348,10 @@ def _tool_errors() -> Iterator[None]:
 
 # -- jobs ----------------------------------------------------------------------------
 
-def _allowed_values(key: str, nozzle: str) -> str:
+def _allowed_values(key: str, nozzle: str, profile: PrinterProfile | None = None) -> str:
     """What ``Overrides.parse`` accepts for ``key`` (one of ``OVERRIDE_KEYS``), for error messages."""
-    heights = ", ".join(f"{h:g}" for h in LAYER_HEIGHTS.get(nozzle, ()))
+    profile = profile or load_profile()
+    heights = ", ".join(f"{h:g}" for h in profile.layer_heights.get(nozzle, ()))
     return {
         "sparse_infill_density": "an integer {}..{} (percent)".format(*DENSITY_RANGE),
         "sparse_infill_pattern": ", ".join(INFILL_PATTERNS),
@@ -363,7 +360,7 @@ def _allowed_values(key: str, nozzle: str) -> str:
         "enable_support": "true or false",
         "support_type": ", ".join(SUPPORT_TYPES),
         "brim_type": ", ".join(BRIM_TYPES),
-        "curr_bed_type": ", ".join(PLATE_TYPES),
+        "curr_bed_type": ", ".join(profile.plate_types),
         "layer_height": heights or f"nothing for nozzle {nozzle}",
         "top_shell_layers": "an integer {}..{}".format(*SHELL_LAYERS_RANGE),
         "bottom_shell_layers": "an integer {}..{}".format(*SHELL_LAYERS_RANGE),
@@ -374,7 +371,7 @@ def _allowed_values(key: str, nozzle: str) -> str:
 
 
 def explicit_settings(
-    settings: Mapping[str, Any] | None, nozzle: str
+    settings: Mapping[str, Any] | None, nozzle: str, profile: PrinterProfile | None = None
 ) -> tuple[dict[str, object], str | None]:
     """(explicit overrides, named set) from a ``slice_job`` request (ruling R6).
 
@@ -382,6 +379,7 @@ def explicit_settings(
     keys go on top, so both outrank the part's last settings and its hints. Raises
     ``ToolError`` naming the key and what it accepts.
     """
+    profile = profile or load_profile()
     raw = dict(settings or {})
     named = raw.pop(SET_KEY, None)
     if named is not None and (not isinstance(named, str) or named not in NAMED_SETS):
@@ -391,12 +389,12 @@ def explicit_settings(
         if key not in OVERRIDE_KEYS:
             raise ToolError(f"{key}: unknown setting, allowed: {', '.join((SET_KEY, *OVERRIDE_KEYS))}")
         try:
-            Overrides.parse({key: value}, nozzle)
+            Overrides.parse({key: value}, nozzle, profile)
         except ValueError:
             origin = "" if key in raw else f" (from set {named!r})"
             raise ToolError(
                 f"{key}: {value!r}{origin} is not allowed for nozzle {nozzle}, "
-                f"allowed: {_allowed_values(key, nozzle)}"
+                f"allowed: {_allowed_values(key, nozzle, profile)}"
             ) from None
     return explicit, named
 
@@ -565,10 +563,18 @@ def _slot_warning(result: Mapping) -> str | None:
     return warning if isinstance(warning, str) and warning else None
 
 
-def _check_slot_number(slot: int | None) -> None:
-    """The owner's slot number range; whether it can be printed from is the service's check."""
-    if slot is not None and not 1 <= slot <= MAX_SLOT_NUMBER:
-        raise ToolError(f"slot must be 1..{MAX_SLOT_NUMBER}, got {slot}")
+def _check_slot_number(slot: int | None, profile: PrinterProfile) -> None:
+    """The owner's slot number range; whether it can be printed from is the service's check.
+
+    0 is the external spool (when the profile has one), 1..``max_slot_number`` the AMS slots.
+    """
+    if slot is None:
+        return
+    low = 0 if profile.external_spool else 1
+    if not low <= slot <= profile.max_slot_number:
+        top = profile.max_slot_number
+        ranges = [r for r in ("0 (external spool)" if low == 0 else "", f"1..{top}" if top else "") if r]
+        raise ToolError(f"slot must be {' or '.join(ranges) or 'nothing: no slots'}, got {slot}")
 
 
 def _spool_by_id(store: Store, spool_id: int) -> Spool:
@@ -646,9 +652,17 @@ def _tray_fields(spool: Spool) -> dict[str, Any]:
     }
 
 
-def _check_printer_ready(service: StatusSource, ams: int, slot: int) -> None:
-    if ams not in AMS_UNITS or slot not in AMS_SLOTS:
-        raise ToolError("ams and slot must each be 0..3")
+def _check_printer_ready(service: StatusSource, ams: int, slot: int, profile: PrinterProfile) -> None:
+    external = (ams, slot) == (EXTERNAL_AMS, EXTERNAL_TRAY)
+    if external and not profile.external_spool:
+        raise ToolError(f"the {profile.model_name} profile has no external spool")
+    if not external and not (0 <= ams < profile.ams_units and 0 <= slot < profile.ams_slots):
+        if not profile.has_ams:
+            raise ToolError(f"the {profile.model_name} has no AMS: use ams 255, slot 254 (the external spool)")
+        raise ToolError(
+            f"ams must be 0..{profile.ams_units - 1} and slot 0..{profile.ams_slots - 1}, "
+            "or ams 255, slot 254 for the external spool"
+        )
     link = service.link_status
     if link is not LinkStatus.CONNECTED:
         raise ToolError(f"the printer is not connected (link {link.value}), nothing was sent")
@@ -658,13 +672,17 @@ def _check_printer_ready(service: StatusSource, ams: int, slot: int) -> None:
             "nothing was sent"
         )
     state = service.state
-    if state.gcode_state not in LOADABLE_STATES:
+    loadable = profile.idle_states
+    if state.gcode_state not in loadable:
         raise ToolError(
             f"the printer is {state.gcode_state}: load_spool works only when it is "
-            f"{', '.join(LOADABLE_STATES)}, nothing was sent"
+            f"{', '.join(ordered_states(loadable))}, nothing was sent"
         )
-    units = sorted({t.ams for t in state.trays})
-    if ams not in units:
+    units = sorted({t.ams for t in state.trays if t.ams != EXTERNAL_AMS})
+    if external:
+        if not any(t.ams == EXTERNAL_AMS for t in state.trays):
+            raise ToolError("the printer's last report has no external spool, nothing was sent")
+    elif ams not in units:
         found = ", ".join(map(str, units)) or "none"
         raise ToolError(f"no AMS unit {ams} in the printer's last report (units: {found}), nothing was sent")
 
@@ -690,14 +708,22 @@ def build_mcp(
     service: StatusSource, store: Store, settings: Settings, camera: Camera
 ) -> MCPServer:
     tz = ZoneInfo(settings.timezone)
-    mcp = MCPServer(SERVER_NAME, instructions=INSTRUCTIONS)
+    profile = settings.profile  # the tools below shadow `settings` with their own argument
+    mcp = MCPServer(SERVER_NAME, instructions=INSTRUCTIONS.format(model=profile.model_name))
 
     # -- read ------------------------------------------------------------------
 
     @mcp.tool(annotations=READ)
     async def printer_status() -> dict[str, Any]:
         """Current printer state as last reported, plus the MQTT link status."""
-        return _status(service.state, service.link_status)
+        return {
+            **_status(service.state, service.link_status),
+            "printer": {
+                "model": profile.model_name,
+                "profile": profile.name,
+                "unverified": sorted(profile.unverified),
+            },
+        }
 
     @mcp.tool(annotations=READ)
     async def ams_status() -> dict[str, Any]:
@@ -848,7 +874,10 @@ def build_mcp(
 
     @mcp.tool(annotations=WRITE)
     async def map_slot(ams: int, slot: int, spool_id: int | None) -> dict[str, Any]:
-        """Record which spool sits in an AMS slot (null clears it). Sends nothing to the printer."""
+        """Record which spool sits in an AMS slot (null clears it). Sends nothing to the printer.
+
+        The external spool holder is ams 255, slot 254 (the owner's slot 0).
+        """
         if ams < 0 or slot < 0:
             raise ToolError("ams and slot must not be negative")
         if spool_id is not None:
@@ -863,13 +892,13 @@ def build_mcp(
         and map the spool to that slot. The only tool that writes to the printer.
 
         Needs an idle printer (IDLE, FINISH or FAILED), ams and slot 0..3 of a reported
-        AMS unit, and a spool with material, color_hex, tray_info_idx and nozzle_temp_min/max.
+        AMS unit (or ams 255, slot 254: the external spool, unverified on the printer), and a spool with material, color_hex, tray_info_idx and nozzle_temp_min/max.
         Sent once: check the printer screen afterwards.
         """
         spool = _spool_by_id(store, spool_id)
         fields = _tray_fields(spool)
         # Synchronous from here on: no await between the checks and the send.
-        _check_printer_ready(service, ams, slot)
+        _check_printer_ready(service, ams, slot, profile)
         try:
             sent = service.set_tray(ams=ams, slot=slot, **fields)["print"]
         except PrinterNotConnected as exc:
@@ -1040,7 +1069,7 @@ def build_mcp(
         """Send the job's proposal (settings, AMS slot, plate, goal) to Telegram with slice, change,
         slot and goal buttons.
 
-        `slot` (1..16, AMS 1 is 1..4, AMS 2 is 5..8) is the owner's choice of AMS slot: pass it
+        `slot` (1..16, AMS 1 is 1..4, AMS 2 is 5..8, 0 the external spool) is the owner's choice of slot: pass it
         only when the owner names one. It is stored with the job and used by later slices.
         Without it the stored slot is used, else the slot whose material matches the part.
         `goal` is the owner's print goal, pass it only when the owner names one: balanced,
@@ -1050,7 +1079,7 @@ def build_mcp(
         sliced or printed.
         """
         job_or_error(job_id)
-        _check_slot_number(slot)
+        _check_slot_number(slot, profile)
         _check_goal(goal)
         try:
             text = await service.propose(job_id, slot, goal)
@@ -1076,8 +1105,8 @@ def build_mcp(
         support_type, brim_type, curr_bed_type, layer_height, top_shell_layers and
         bottom_shell_layers (0..20), outer_wall_speed (20..300 mm/s), seam_position, ironing_type.
         They win over the part's last settings and its hints, and are stored with the job:
-        later slices and evaluate_job keep them fixed. `slot` (1..16) is the owner's
-        choice of AMS slot: pass it only when the owner names one. It is stored with the job. Without it the job's stored slot
+        later slices and evaluate_job keep them fixed. `slot` (1..16, 0 the external
+        spool) is the owner's choice of slot: pass it only when the owner names one. It is stored with the job. Without it the job's stored slot
         is used, else the slot whose material matches the part. `goal` (as in propose_job, only
         when the owner names one) is stored with the job and its base settings apply under
         `settings`. Follow it with job_status; the
@@ -1085,8 +1114,8 @@ def build_mcp(
         Russian) or null: tell the owner.
         """
         job = job_or_error(job_id)
-        explicit, named = explicit_settings(settings, _job_nozzle(job))
-        _check_slot_number(slot)
+        explicit, named = explicit_settings(settings, _job_nozzle(job), profile)
+        _check_slot_number(slot, profile)
         _check_goal(goal)
         options: dict[str, Any] = {"named_set": named} if named else {}
         if slot is not None:
@@ -1129,7 +1158,7 @@ def build_mcp(
         choose_variant or slice_job.
         """
         job = job_or_error(job_id)
-        explicit, _named = explicit_settings(settings, _job_nozzle(job))  # a set is expanded into it
+        explicit, _named = explicit_settings(settings, _job_nozzle(job), profile)  # a set is expanded into it
         _check_goal(goal)
         try:
             task = service.start_evaluate(job_id, goal, explicit or None)

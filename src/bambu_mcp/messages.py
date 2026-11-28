@@ -15,6 +15,8 @@ from bambu_mcp.manifest import Manifest, PlateInfo, parse_manifest
 from bambu_mcp.notify import Button
 from bambu_mcp.printer.hms import HmsTexts, describe, hms_code
 from bambu_mcp.proposal import (
+    EXTERNAL_LABEL,
+    EXTERNAL_SLOT_NUMBER,
     MAX_SLOT_NUMBER,
     SlotChoice,
     UsableSlot,
@@ -317,7 +319,8 @@ def slot_buttons(
     buttons = [
         Button(
             f"job:{job_id}:slot:{u.number}",
-            f"{CHOSEN_MARK if u.number == chosen else ''}{keycap(u.number)} "
+            f"{CHOSEN_MARK if u.number == chosen else ''}"
+            f"{keycap(u.number) if u.number != EXTERNAL_SLOT_NUMBER else 'внешняя'} "
             f"{u.spool.material} {u.spool.color_name}"[:_BUTTON_TEXT_MAX],
         )
         for u in shown
@@ -567,7 +570,8 @@ def _shell_parts(settings: Mapping) -> list[str]:
 def _slot_text(choice: SlotChoice) -> str:
     if choice.ams is None or choice.slot is None:
         return "слот не выбран"
-    words = [f"слот {slot_number(choice.ams, choice.slot)}"]
+    number = slot_number(choice.ams, choice.slot)
+    words = [EXTERNAL_LABEL if number == EXTERNAL_SLOT_NUMBER else f"слот {number}"]
     if choice.tray_type:
         words.append(md_literal(choice.tray_type))
     if choice.color_name:

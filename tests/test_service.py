@@ -3570,3 +3570,11 @@ async def test_fetch_refusal_is_russian_for_the_owner_english_for_claude(harness
     assert "HTTP 404" in str(info.value) and "slice-agent" in str(info.value)
     (line,) = info.value.lines
     assert "ПК не отдал" in line and "slice-agent" not in line
+
+
+def test_tray_now_254_is_the_external_spool():
+    from bambu_mcp.service import _tray_slot
+
+    assert _tray_slot({"print": {"ams": {"tray_now": "254"}}}) == (255, 254)
+    assert _tray_slot({"print": {"ams": {"tray_now": "255"}}}) is None  # nothing feeding
+    assert _tray_slot({"print": {"ams": {"tray_now": "2"}}}) == (0, 2)
