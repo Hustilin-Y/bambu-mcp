@@ -597,7 +597,7 @@ def _pf_without(key: str) -> dict:
 @pytest.mark.parametrize(
     "payload",
     [
-        {"print": {"sequence_id": "0", "command": "resume", "param": ""}},
+        {"print": {"sequence_id": "0", "command": "resume", "param": "1"}},
         {"print": {"sequence_id": "0", "command": "resume"}},
         {"print": {"sequence_id": "0", "command": "gcode_line", "param": "G28"}},
         {"print": {"sequence_id": "0", "command": "gcode_line", "param": ""}},
@@ -681,7 +681,7 @@ def test_publish_refuses_everything_else(h, payload):
 def test_publish_accepts_exactly_the_allowed_payloads(h):
     h.client.fire_connect()
     h.client.calls.clear()
-    allowed = (GET_VERSION, PUSH_ALL, TRAY_PAYLOAD, PROJECT_PAYLOAD, PAUSE_PRINT, STOP_PRINT)
+    allowed = (GET_VERSION, PUSH_ALL, TRAY_PAYLOAD, PROJECT_PAYLOAD, PAUSE_PRINT, RESUME_PRINT, STOP_PRINT)
     for payload in allowed:
         h.link._publish(payload)
     assert _sent(h) == list(allowed)
