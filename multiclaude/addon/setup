@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Run by `assistant addon enable bambu` as the bot's user, never as root: installs bambu-mcp from
+# its clone as a systemd user unit, asks for the printer once, issues the service-notify key and
+# registers the `bambu` MCP server for the owner's assistant. Safe to run again: it keeps what is
+# there. Steps that need root are printed, not run. install.sh filled in the paths and the person.
+set -euo pipefail
+
+BAMBU_HOME="{{BAMBU_HOME}}"
+OWNER="{{BAMBU_USER}}"
+ROOT="{{ASSISTANT_ROOT}}"
+CONF_DIR="$HOME/.config/bambu"          # the unit names these with %h: keep them in step
+DATA_DIR="$HOME/.local/share/bambu"
+ENV_FILE="$CONF_DIR/.env"
+CONFIG="$CONF_DIR/config.toml"
+UNIT_DIR="$HOME/.config/systemd/user"
+WORKSPACE="$HOME/workspaces/$OWNER"
+CA_URL="https://raw.githubusercontent.com/greghesp/ha-bambulab/main/custom_components/bambu_lab/pybambu/certs/bambu.cert"
+MCP_URL="http://127.0.0.1:8765/mcp"
+export PATH="$HOME/.local/bin:$PATH"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# -- 1. what it needs -----------------------------------------------------------------
+for cmd in uv jq curl python3 systemctl; do
+  command -v "$cmd" >/dev/null || die "bambu needs $cmd"
+done
+[ -f "$BAMBU_HOME/pyproject.toml" ] || die "no bambu-mcp at $BAMBU_HOME; run its multiclaude/install.sh again"
+jq -e '.addons // [] | any(. == "service-notify")' "$ROOT/config.json" >/dev/null 2>&1 ||
+  die "bambu needs the service-notify add-in (the print and stop buttons in Telegram). \
+Upstream multiclaude does not have it yet: see https://github.com/korsicheg/multiclaude/pulls"
+
+# -- 2. the app -----------------------------------------------------------------------
+(cd "$BAMBU_HOME" && uv sync --frozen --no-dev)
+
+# -- 3. the printer: .env (mode 600) --------------------------------------------------
+umask 077
+mkdir -p "$CONF_DIR" "$DATA_DIR" "$UNIT_DIR"
+[ -f "$ENV_FILE" ] || : > "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+
+has() { grep -qE "^$1=." "$ENV_FILE"; }
+# A prompt reads the terminal when there is one, else stdin. Values go to the file through
+# printf, a shell builtin: never into an argv, a log or the screen.
+if [ -t 0 ] && [ -r /dev/tty ]; then INPUT=/dev/tty; else INPUT=/dev/stdin; fi
+ask() {  # ask NAME "prompt" hidden(0|1): stores NAME=<answer> unless .env has it
+  local name=$1 prompt=$2 hidden=$3 value=
+  has "$name" && return 0
+  printf '%s: ' "$prompt" >&2
+  if [ "$hidden" = 1 ]; then IFS= read -rs value < "$INPUT" || true; echo >&2
+  else IFS= read -r value < "$INPUT" || true; fi
+  [ -n "$value" ] || die "$name is required"
+  printf '%s=%s\n' "$name" "$value" >> "$ENV_FILE"
+}
+ask BAMBU_HOST "Printer IP address (printer screen: Settings, WLAN)" 0
+ask BAMBU_SERIAL "Printer serial number (Settings, Device)" 0
+ask BAMBU_ACCESS_CODE "Printer access code (Settings, WLAN; LAN-only mode on), not shown" 1
+
+if [ ! -f "$CONFIG" ]; then
+  models=$(cd "$BAMBU_HOME/src/bambu_profiles" && ls ./*.toml | sed 's|^\./||; s|\.toml$||' | tr '\n' ' ')
+  printf 'Printer model, one of: %s[a1]: ' "$models" >&2
+  IFS= read -r model < "$INPUT" || true
+  model=${model:-a1}
+  [ -f "$BAMBU_HOME/src/bambu_profiles/$model.toml" ] || die "no printer profile '$model' (known: $models)"
+fi
+
+# -- 4. the service-notify key --------------------------------------------------------
+if ! has NOTIFY_TOKEN; then
+  token=$("$ROOT/bin/assistant" service key bambu)
+  [ -n "$token" ] || die "assistant service key bambu printed no token"
+  printf 'NOTIFY_TOKEN=%s\n' "$token" >> "$ENV_FILE"
+  unset token
+fi
+
+# -- 5. the assistant's client token --------------------------------------------------
+if ! has CLIENT_TOKEN_ASSISTANT; then
+  printf 'CLIENT_TOKEN_ASSISTANT=%s\n' "$(python3 -I -c 'import secrets; print(secrets.token_urlsafe(32))')" >> "$ENV_FILE"
+fi
+
+# -- 6. config.toml (only when absent: yours after that) ------------------------------
+if [ ! -f "$CONFIG" ]; then
+  port=$(jq -r '.service_notify.port // 8790' "$ROOT/config.json")
+  {
+    echo "# bambu-mcp settings, written once by the bambu add-in's setup; edit freely."
+    echo "# Every key: $BAMBU_HOME/config.example.toml. Secrets stay in .env."
+    echo "printer = \"$model\""
+    echo "data_dir = \"$DATA_DIR\""
+    echo "listen = [\"127.0.0.1:8765\"]"
+    echo "tls_mode = \"ca\""
+    echo "ca_file = \"$DATA_DIR/bambu.cert\""
+    echo "notify_url = \"http://127.0.0.1:$port\""
+    if jq -e '.addons // [] | any(. == "cad-workshop")' "$ROOT/config.json" >/dev/null 2>&1 &&
+       [ -d "$WORKSPACE/cad-workshop" ]; then
+      echo "jobs_root_allowed = \"$WORKSPACE/cad-workshop\""
+    fi
+    echo "# Slicing: see $BAMBU_HOME/deploy/slicing-options.md, then set"
+    echo "# slice_agent_url = \"http://127.0.0.1:11436\" and SLICE_AGENT_TOKEN in .env."
+  } > "$CONFIG"
+  chmod 644 "$CONFIG"
+fi
+
+# -- 7. the Bambu CA bundle (ha-bambulab, MIT) ----------------------------------------
+if [ ! -s "$DATA_DIR/bambu.cert" ]; then
+  curl -fsSL -o "$DATA_DIR/bambu.cert.tmp" "$CA_URL" || die "cannot download the Bambu CA bundle from $CA_URL"
+  grep -q "BEGIN CERTIFICATE" "$DATA_DIR/bambu.cert.tmp" || die "the CA bundle download is not a certificate"
+  mv "$DATA_DIR/bambu.cert.tmp" "$DATA_DIR/bambu.cert"
+  chmod 644 "$DATA_DIR/bambu.cert"
+fi
+
+# -- 8. the user unit -----------------------------------------------------------------
+install -m 644 "$(dirname "$(readlink -f "$0")")/bambu-service.service" "$UNIT_DIR/bambu-service.service"
+if systemctl --user daemon-reload 2>/dev/null; then
+  systemctl --user enable bambu-service >/dev/null 2>&1 || true
+  systemctl --user restart bambu-service || echo "warning: bambu-service did not start: journalctl --user -u bambu-service" >&2
+else
+  echo "warning: no systemd user manager for $(id -un) right now. After the linger step below:" >&2
+  echo "  systemctl --user daemon-reload && systemctl --user enable --now bambu-service" >&2
+fi
+if command -v loginctl >/dev/null && ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q '=yes'; then
+  echo "To keep bambu-service running without a login session, root runs once:"
+  echo "  sudo loginctl enable-linger $(id -un)"
+fi
+
+# -- 9. the MCP server for the owner's assistant --------------------------------------
+# Local scope in the owner's workspace, as `claude mcp add` writes it, edited with jq. The token
+# goes through a mode-600 file (--rawfile), never an argv.
+claude_json="$HOME/.claude.json"
+[ -f "$claude_json" ] || echo '{}' > "$claude_json"
+tok_file=$(mktemp "$CONF_DIR/.tok.XXXXXX")
+out_file=$(mktemp "$HOME/.claude.json.XXXXXX")
+trap 'rm -f "$tok_file" "$out_file"' EXIT
+grep -E '^CLIENT_TOKEN_ASSISTANT=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '\n' > "$tok_file"
+jq --rawfile tok "$tok_file" --arg ws "$WORKSPACE" --arg url "$MCP_URL" \
+  '.projects[$ws].mcpServers.bambu = {type: "http", url: $url, headers: {Authorization: ("Bearer " + $tok)}}' \
+  "$claude_json" > "$out_file"
+chmod 600 "$out_file"
+cp -p "$claude_json" "$claude_json.bak-bambu"
+mv "$out_file" "$claude_json"
+
+echo "bambu is set up: the $(grep -E '^printer' "$CONFIG" | cut -d'"' -f2) profile, settings in $CONF_DIR, data in $DATA_DIR."
+echo "Restart the owner's assistant session so it picks up the bambu MCP server."
