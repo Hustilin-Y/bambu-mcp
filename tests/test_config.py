@@ -221,3 +221,13 @@ def test_camera_backend_config_overrides_profile(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text('printer = "a1"\ncamera_backend = "pyav"\n')
     assert Settings.load(path).camera_backend == "pyav"
+
+
+def test_app_tokens_loaded(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text(
+        "BAMBU_ACCESS_CODE=a\nBAMBU_SERIAL=s\nBAMBU_HOST=h\nAPP_TOKEN_MINIAPP=t1\nCLIENT_TOKEN_ASSISTANT=t2\nAPP_TOKEN_=x\n"
+    )
+    s = Secrets.load(env)
+    assert s.app_tokens == {"miniapp": "t1"}
+    assert s.client_tokens == {"assistant": "t2"}

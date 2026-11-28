@@ -15,6 +15,7 @@ CameraBackend = Literal["pyav", "jpeg_6000"]
 _PROFILE_CAMERA = {"rtsps_322": "pyav", "jpeg_6000": "jpeg_6000"}
 
 _CLIENT_PREFIX = "CLIENT_TOKEN_"
+_APP_PREFIX = "APP_TOKEN_"  # tokens that reach only /v1/ (the Mini App tab)
 
 # The default timezone of a country (store meta "country"), when config.toml names none.
 # One zone per country: countries with several zones set `timezone` in config.toml.
@@ -72,6 +73,7 @@ class Secrets:
     host: str
     notify_token: str | None = None
     client_tokens: dict[str, str] = field(default_factory=dict)
+    app_tokens: dict[str, str] = field(default_factory=dict)  # reach only /v1/, never /mcp or /jobs
     gateway_key: str | None = None  # orchestra-gateway key, to wake the PC
     slice_agent_token: str | None = None  # bearer for slice-agent on the PC
 
@@ -91,12 +93,14 @@ class Secrets:
             notify_token=env.get("NOTIFY_TOKEN") or None,
             gateway_key=env.get("GATEWAY_KEY") or None,
             slice_agent_token=env.get("SLICE_AGENT_TOKEN") or None,
-            client_tokens={
-                k[len(_CLIENT_PREFIX):].lower(): v
-                for k, v in env.items()
-                if k.startswith(_CLIENT_PREFIX) and len(k) > len(_CLIENT_PREFIX) and v
-            },
+            client_tokens=_prefixed(env, _CLIENT_PREFIX),
+            app_tokens=_prefixed(env, _APP_PREFIX),
         )
+
+
+def _prefixed(env: dict[str, str], prefix: str) -> dict[str, str]:
+    """``PREFIX_NAME=value`` lines as ``{"name": value}``, empty names and values skipped."""
+    return {k[len(prefix):].lower(): v for k, v in env.items() if k.startswith(prefix) and len(k) > len(prefix) and v}
 
 
 def _default_listen() -> list[tuple[str, int]]:

@@ -94,6 +94,7 @@ log = logging.getLogger(__name__)
 
 MCP_PATH = "/mcp"
 JOBS_PATH = "/jobs"
+APP_PREFIX = "/v1/"  # the Mini App tab's API: app tokens only
 _BODY_SLACK = 64 * 1024  # multipart boundaries and part headers
 SERVER_NAME = "bambu-mcp"
 GRACEFUL_SHUTDOWN_S = 5
@@ -192,11 +193,16 @@ class StatusSource(Protocol):
 
 
 class BearerTokenMiddleware:
-    """Pure ASGI: only requests carrying a known client token reach the app."""
+    """Pure ASGI: only requests carrying a known token reach the app.
 
-    def __init__(self, app: ASGIApp, tokens: dict[str, str]) -> None:
+    A client token (MCP) reaches everything but ``/v1/``, an app token only ``/v1/``.
+    An unknown token gets 401, a known one in the wrong area 403.
+    """
+
+    def __init__(self, app: ASGIApp, tokens: dict[str, str], app_tokens: dict[str, str] | None = None) -> None:
         self._app = app
-        self._tokens = [(name, value.encode("utf-8")) for name, value in tokens.items() if value]
+        self._tokens = [("mcp", name, value.encode("utf-8")) for name, value in tokens.items() if value]
+        self._tokens += [("app", name, value.encode("utf-8")) for name, value in (app_tokens or {}).items() if value]
 
     def _client(self, scope: Scope) -> str | None:
         header = b""
@@ -208,9 +214,9 @@ class BearerTokenMiddleware:
         if scheme.lower() != b"bearer" or not presented:
             return None
         found = None
-        for name, token in self._tokens:  # compare against all, no early exit
+        for kind, name, token in self._tokens:  # compare against all, no early exit
             if hmac.compare_digest(presented.strip(), token) and found is None:
-                found = name
+                found = (kind, name)
         return found
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -231,8 +237,17 @@ class BearerTokenMiddleware:
             )
             await response(scope, receive, send)
             return
-        scope.setdefault("state", {})["mcp_client"] = client
-        log.debug("MCP %s %s from client %s", scope.get("method", ""), scope.get("path", ""), client)
+        kind, name = client
+        wanted = "app" if str(scope.get("path", "")).startswith(APP_PREFIX) else "mcp"
+        if kind != wanted:
+            log.warning("request from %s refused: client %s may not use %s", peer[0], name, scope.get("path", ""))
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+                return
+            await JSONResponse({"error": "forbidden"}, status_code=403)(scope, receive, send)
+            return
+        scope.setdefault("state", {})["app_client" if kind == "app" else "mcp_client"] = name
+        log.debug("%s %s %s from client %s", kind, scope.get("method", ""), scope.get("path", ""), name)
         await self._app(scope, receive, send)
 
 
@@ -1298,6 +1313,7 @@ def build_app(
     *,
     camera: Camera | None = None,
     max_job_file_bytes: int = MAX_FILE_BYTES,
+    app_routes: list[Route] | None = None,
 ) -> Starlette:
     """The MCP Streamable HTTP app at ``/mcp`` and ``POST /jobs``, behind the bearer-token middleware."""
     if camera is None:
@@ -1313,7 +1329,8 @@ def build_app(
     app.router.routes.append(
         Route(JOBS_PATH, _jobs_endpoint(store, settings, max_job_file_bytes), methods=["POST"])
     )
-    app.add_middleware(BearerTokenMiddleware, tokens=secrets.client_tokens)
+    app.router.routes.extend(app_routes or [])
+    app.add_middleware(BearerTokenMiddleware, tokens=secrets.client_tokens, app_tokens=secrets.app_tokens)
     return app
 
 
@@ -1413,8 +1430,8 @@ async def serve(
     service: StatusSource, store: Store, secrets: Secrets, settings: Settings
 ) -> None:
     """Serve MCP on every ``settings.listen`` address until cancelled."""
-    if not secrets.client_tokens:
-        log.warning("no CLIENT_TOKEN_* configured, MCP server not started")
+    if not secrets.client_tokens and not secrets.app_tokens:
+        log.warning("no CLIENT_TOKEN_* or APP_TOKEN_* configured, MCP server not started")
         return
     app = build_app(service, store, secrets, settings)
     sockets = _bind(settings.listen)
@@ -1431,7 +1448,7 @@ async def serve(
     log.info(
         "MCP server listening on %s for clients %s",
         ", ".join(str(s.getsockname()[:2]) for s in sockets),
-        ", ".join(sorted(secrets.client_tokens)),
+        ", ".join(sorted(secrets.client_tokens) + [f"{name} (app)" for name in sorted(secrets.app_tokens)]),
     )
     task = asyncio.ensure_future(_run(server, sockets))
     try:

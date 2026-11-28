@@ -1488,3 +1488,40 @@ def test_load_spool_busy_message_keeps_the_state_order(h):
     spool = _loadable_spool(h)
     text = h.call_raw("load_spool", spool_id=spool["id"], ams=0, slot=0)["content"][0]["text"]
     assert "load_spool works only when it is IDLE, FINISH, FAILED, nothing was sent" in text
+
+
+# -- app tokens (/v1/) ---------------------------------------------------------------
+
+
+def _app_harness(tmp_path):
+    from starlette.responses import JSONResponse as _JSON
+    from starlette.routing import Route as _Route
+
+    async def snap(request):
+        return _JSON({"client": request.scope["state"].get("app_client")})
+
+    secrets = replace(SECRETS, app_tokens={"miniapp": "app-token-xyz"})
+    settings = Settings(data_dir=tmp_path)
+    store = Store(tmp_path / "bambu.db")
+    store.migrate()
+    app = build_app(FakeService(), store, secrets, settings, app_routes=[_Route("/v1/snapshot", snap)])
+    return TestClient(app, base_url=BASE_URL), store
+
+
+def _bearer(token):
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json, text/event-stream"}
+
+
+def test_app_token_only_reaches_v1(tmp_path, caplog):
+    client, store = _app_harness(tmp_path)
+    caplog.set_level(logging.DEBUG)
+    with client:
+        assert client.post("/mcp", json=TOOLS_LIST, headers=_bearer("app-token-xyz")).status_code == 403
+        assert client.post("/jobs", headers=_bearer("app-token-xyz")).status_code == 403
+        assert client.get("/v1/snapshot", headers=_bearer("pc-token-abc")).status_code == 403
+        assert client.get("/v1/snapshot", headers=_bearer("nope")).status_code == 401
+        r = client.get("/v1/snapshot", headers=_bearer("app-token-xyz"))
+        assert r.status_code == 200 and r.json() == {"client": "miniapp"}
+        assert client.post("/mcp", json=TOOLS_LIST, headers=_bearer("pc-token-abc")).status_code == 200
+    store.close()
+    assert "app-token-xyz" not in caplog.text
