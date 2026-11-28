@@ -5,7 +5,9 @@
 #   multiclaude/install.sh [--root DIR] --uninstall      turn it off and remove it
 #
 # DIR is the multiclaude checkout: $ASSISTANT_ROOT, or ~/assistant. NAME is the multiclaude user
-# whose assistant drives the printer (default: the owner in users.json). The service itself runs
+# whose assistant drives the printer (default: the owner in users.json). install adds one line to
+# multiclaude's tracked lib/multiclaude/addons/__init__.py (the Mini App tab): before a `git pull` in
+# that checkout, run --uninstall, pull, then install again (as local-gpu's install.sh asks too). The service itself runs
 # from this clone of bambu-mcp. The add-in needs the service-notify add-in (the print and stop
 # buttons in Telegram); `setup` stops with a pointer when it is missing.
 set -euo pipefail
@@ -20,7 +22,7 @@ while [ $# -gt 0 ]; do
     --root) ROOT="${2:?--root needs a directory}"; shift 2 ;;
     --user) user="${2:?--user needs a name}"; shift 2 ;;
     --uninstall) action=uninstall; shift ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done

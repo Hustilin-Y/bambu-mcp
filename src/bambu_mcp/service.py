@@ -234,6 +234,7 @@ STOP_NOT_FRESH_TEXT = "Принтер ещё не прислал свежий о
 STOP_OVER_TEXT = "Эта печать уже не идёт, останавливать нечего"
 STOP_UNSURE_TEXT = "⚠️ Не знаю, дошла ли команда остановки. Посмотри на принтер, повторно она не отправляется"
 APP_NOTES_KEPT = 5
+RESUME_RETRY_S = 60  # a resume the printer didn't act on may be pressed again after this
 SNAPSHOT_TEXT = "📷 Снимок"
 CONTROL_NOT_RUNNING_TEXT = "Печать не идёт, ставить на паузу нечего"
 CONTROL_NOT_PAUSED_TEXT = "Печать не на паузе, продолжать нечего"
@@ -525,7 +526,7 @@ class Service:
         self.app_notes: collections.deque[dict[str, Any]] = collections.deque(maxlen=APP_NOTES_KEPT)
         self._app_preparing: asyncio.Task | None = None  # the Mini App's prepare, one at a time
         self._control: dict[str, bool] = {}  # task id -> paused variant last put on its control message
-        self._resumed: set[str] = set()  # resume sent, the printer not yet out of PAUSE
+        self._resumed: dict[str, float] = {}  # task id -> when resume was sent, the printer not yet out of PAUSE
         self._own_tasks: set[str] = set()  # task ids this process sent: their start gets the stop button
         self._last_task_id = 0
 
@@ -2425,6 +2426,7 @@ class Service:
         if text is None:
             return
         assert confirmation is not None
+        self._note_press(press, text)
         try:
             edited = await self._notifier.edit(press.message_id, text)
         except Exception:
@@ -2451,6 +2453,7 @@ class Service:
             except _StartRefused as exc:
                 log.warning("print start refused: %s", exc.reason)
                 self._finish_start(confirm_id, f"refused:{exc.reason}", name, exc.lines)
+                self._note_press(press, "Печать не началась: " + ". ".join(line.rstrip(".") for line in exc.lines))
             except _StartSent:
                 try:
                     self._record_unconfirmed(confirm_id, name)
@@ -2461,8 +2464,10 @@ class Service:
             except Exception:
                 log.exception("print start failed")
                 self._finish_start(confirm_id, "refused:internal", name, [INTERNAL_TEXT])
+                self._note_press(press, f"Печать не началась: {INTERNAL_TEXT}")
             else:
                 log.info("print start %s (press via %s)", outcome, press.via)
+                self._note_press(press, "Печать началась" if outcome == "started" else "Старт не подтвердился, проверь принтер")
         finally:
             self._start_lock.release()
 
@@ -2672,6 +2677,11 @@ class Service:
     def _app_note(self, text: str) -> None:
         self.app_notes.append({"at": self._clock().timestamp(), "text": text})
 
+    def _note_press(self, press: Press, text: str) -> None:
+        """What became of a press made in the Mini App, for the tab too (Telegram shows it anyway)."""
+        if press.via == "miniapp":
+            self._app_note(_plain(text))
+
     def send_snapshot(self) -> bool:
         """One camera frame to the owner's Telegram, at most one queued a minute."""
         minute = int(self._clock().timestamp() // 60)
@@ -2814,6 +2824,7 @@ class Service:
             log.exception("recording a stop outcome failed")
         log.info("stop press: %s (via %s)", outcome, press.via)
         await self._notifier.edit(press.message_id, text)
+        self._note_press(press, text)
 
     async def _stop_claimed(self, confirmation: Any) -> tuple[str, str]:
         """(outcome, the owner's answer) of a claimed stop. Sends ``stop`` at most once."""
@@ -2851,25 +2862,26 @@ class Service:
         action, task_id = parsed
         if not self.state_fresh:
             await self._refresh_state()
-        refusal, paused_after = self._control_refusal(action, task_id), None
+        refusal = self._control_refusal(action, task_id)
         if refusal is None:
             link = self._link
             assert link is not None  # _control_refusal
             try:
                 if action == "pause":
                     link.pause()
-                    paused_after = True
                 else:
                     link.resume()
-                    self._resumed.add(task_id)
-                    paused_after = False
-                log.info("%s sent from its button", action)
+                    self._resumed[task_id] = self._clock().timestamp()
+                log.info("%s sent from its button (via %s)", action, press.via)
             except PrinterNotConnected:
                 refusal = STOP_NOT_CONNECTED_TEXT.replace("остановка", "команда")
         if refusal is not None:
-            log.info("%s press refused", action)
+            log.info("%s press refused (via %s)", action, press.via)
             self._enqueue("control_refused", f"{'⏸' if action == 'pause' else '▶️'} {refusal}", f"control|{uuid.uuid4().hex}")
-        await self._put_control(task_id, paused_after)
+            self._note_press(press, refusal)
+        # The buttons follow the printer's reports, never what was asked: until the printer says
+        # PAUSE the message keeps Pause, so a label never offers what the press would refuse.
+        await self._put_control(task_id)
 
     def _control_refusal(self, action: str, task_id: str) -> str | None:
         """Why a pause or resume press can't be sent now, None when it can."""
@@ -2885,26 +2897,26 @@ class Service:
         if action == "resume":
             if state.gcode_state != "PAUSE":
                 return CONTROL_NOT_PAUSED_TEXT
-            if task_id in self._resumed:
+            sent_at = self._resumed.get(task_id)
+            if sent_at is not None and self._clock().timestamp() - sent_at < RESUME_RETRY_S:
                 return CONTROL_RESUME_SENT_TEXT
         return None
 
-    async def _put_control(self, task_id: str, paused: bool | None = None) -> None:
-        """Put a print's control message back as it was sent, with the buttons for ``paused``
-        (the printer's state when None), or with none once that print is over."""
+    async def _put_control(self, task_id: str) -> None:
+        """Put a print's control message back as it was sent, with the buttons for the printer's
+        state (Pause or Resume), or with none once that print is over."""
         sent = self._store.sent_message(f"control:{task_id}")
         if sent is None:
             return
         state = self._state
         live = (state.task_id or "") == task_id and state.gcode_state in self._settings.profile.stoppable_states
         if live:
-            if paused is None:
-                paused = state.gcode_state == "PAUSE"
+            paused = state.gcode_state == "PAUSE"
             self._control[task_id] = paused
             buttons = control_buttons(task_id, paused)
         else:
             self._control.pop(task_id, None)
-            self._resumed.discard(task_id)
+            self._resumed.pop(task_id, None)
             buttons = []
         await self._notifier.edit(sent.message_id, sent.text, buttons=buttons)
 
@@ -2912,13 +2924,11 @@ class Service:
         """After a state report: control messages whose buttons no longer fit the printer get
         them changed (a pause from the printer's screen shows Resume, an ended print none)."""
         if state.gcode_state != "PAUSE":
-            self._resumed.discard(state.task_id or "")
+            self._resumed.pop(state.task_id or "", None)
         for task_id, paused in list(self._control.items()):
             live = (state.task_id or "") == task_id and state.gcode_state in self._settings.profile.stoppable_states
             if live and paused == (state.gcode_state == "PAUSE"):
                 continue
-            if live and task_id in self._resumed:
-                continue  # resume sent, the buttons already say Pause
             if not live:
                 self._control.pop(task_id, None)
             else:

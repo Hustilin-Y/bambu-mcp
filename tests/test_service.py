@@ -3662,7 +3662,7 @@ async def test_started_without_task_id_gets_no_control_buttons(harness):
     assert harness.store.sent_message("control:x12") is None
 
 
-async def test_pause_press_pauses_and_offers_resume(harness):
+async def test_pause_press_pauses_and_buttons_follow_the_printer(harness):
     _service, _job, printer = await print_harness(harness)
     await _printing(harness, printer)
     message_id, message = _control_message(harness)
@@ -3670,6 +3670,10 @@ async def test_pause_press_pauses_and_offers_resume(harness):
     await until(lambda: "pause" in harness.events and harness.notifier.edits)
     assert harness.events.count("pause") == 1
     assert harness.notifier.edits[-1] == (message_id, message["text"])
+    # the printer still says RUNNING: the buttons say what is true, not what was asked
+    assert plain(harness.notifier.edit_buttons[-1])[0][0][0] == "pause:777"
+    await running(harness, printer, state="PAUSE")
+    await until(lambda: len(harness.notifier.edits) >= 2)
     assert plain(harness.notifier.edit_buttons[-1]) == [[("resume:777", "▶️ Продолжить"), ("stop:ask:777", "Остановить…")]]
 
 
@@ -3784,3 +3788,66 @@ async def test_send_snapshot_queues_once_a_minute(tmp_path):
     await service.send_next()
     assert notifier.sent[0]["files"] == [("snapshot.jpg", JPEG)]
     store.close()
+
+
+
+# -- final review fixes (2026-11-28) -----------------------------------------------------
+
+
+async def test_a_lost_resume_can_be_pressed_again(harness):
+    _service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, _message = _control_message(harness)
+    await running(harness, printer, state="PAUSE")
+    await press(harness, "resume:777", message_id)
+    await until(lambda: "resume" in harness.events)
+    # the printer never left PAUSE: the buttons still offer Resume, a second press soon is refused
+    await until(lambda: plain(harness.notifier.edit_buttons[-1])[0][0][0] == "resume:777")
+    await press(harness, "resume:777", message_id)
+    await until(lambda: harness.store.outbox_count() == 0 and any("уже отправлена" in m["text"] for m in harness.notifier.sent))
+    assert harness.events.count("resume") == 1
+    harness.clock.advance(seconds=61)
+    await press(harness, "resume:777", message_id)
+    await until(lambda: harness.events.count("resume") == 2)
+
+
+async def test_tab_press_refusal_becomes_a_note(harness):
+    service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, _message = _control_message(harness)
+    harness.seq = getattr(harness, "seq", 0) + 1
+    await harness.notifier.press_queue.put(Press(harness.seq, message_id, "resume:777", T0, "miniapp"))
+    await until(lambda: service.app_notes)
+    assert "не на паузе" in service.app_notes[-1]["text"]
+
+
+async def test_telegram_press_refusal_makes_no_note(harness):
+    service, _job, printer = await print_harness(harness)
+    await _printing(harness, printer)
+    message_id, _message = _control_message(harness)
+    await press(harness, "resume:777", message_id)
+    await until(lambda: any("не на паузе" in m["text"] for m in harness.notifier.sent))
+    assert not service.app_notes
+
+
+async def test_tab_stop_outcome_becomes_a_note(harness):
+    service, _job, printer = await print_harness(harness)
+    await running(harness, printer)
+    cid = (await service.request_stop()).confirm_id
+    harness.seq = getattr(harness, "seq", 0) + 1
+    await harness.notifier.press_queue.put(Press(harness.seq, "m7", f"stop:{cid}:go", T0, "miniapp"))
+    await until(lambda: service.app_notes)
+    assert "остановки отправлена" in service.app_notes[-1]["text"]
+
+
+async def test_tab_start_refusal_becomes_a_note(harness):
+    service, job, printer = await print_harness(harness)
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await until(lambda: harness.store.outbox_count() == 0)
+    await running(harness, printer)  # busy now: the start's own re-check refuses
+    harness.seq = getattr(harness, "seq", 0) + 1
+    await harness.notifier.press_queue.put(Press(harness.seq, "m1", f"start:{cid}:go", T0, "miniapp"))
+    await until(lambda: harness.store.confirmation(cid).outcome is not None, timeout=5)
+    assert harness.store.confirmation(cid).outcome.startswith("refused")
+    await until(lambda: service.app_notes)
+    assert service.app_notes[-1]["text"].startswith("Печать не началась")

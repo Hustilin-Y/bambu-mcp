@@ -4,7 +4,7 @@ What the tests can't see: the tab in Telegram on a real phone with the real prin
 
 ## Deploy (Claude does it on workshop, with the owner's OK)
 
-1. In `~/assistant`: the multiclaude change with `press_from_app` (service-notify) is merged and pulled.
+1. In `~/assistant`: `~/bambu-mcp/multiclaude/install.sh --uninstall` if the tab was installed before, then the multiclaude change with `press_from_app` (service-notify) is merged and pulled.
 2. In `~/bambu-mcp`: this branch is merged and pulled, then `multiclaude/install.sh` and `assistant addon enable bambu`. `setup` adds `APP_TOKEN_MINIAPP` to `~/.config/bambu/.env`, writes `~/.config/bambu/miniapp.json` and restarts `bambu-service`.
 3. `assistant relay deploy`, so the relay serves `addons/bambu/print.js`.
 4. Restart the router the way the workshop-server skill says, so it loads the `bambu` module.

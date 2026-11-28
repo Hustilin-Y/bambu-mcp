@@ -20,6 +20,7 @@ ADDON = "bambu"
 SERVICE = "bambu"  # the service's name in service-notify
 DOWN_ERROR = "Сервис принтера не отвечает."
 OWNER_ONLY = "Только для владельца."
+FAST_FOR = 60  # seconds of quick reads after an action: its outcome shows soon, not at the next idle read
 PRESS_REFUSALS = {"answered": "Уже нажато.", "expired": "Кнопка истекла, нажми «Печать» снова."}
 POSTS = {  # action -> (path, what the tab shows when the service took it)
     "pause": ("/v1/pause", "Пауза отправлена."),
@@ -40,6 +41,8 @@ class _Person:
         self.state = None      # the state last put on the page
         self.due = 0.0         # when to read again
         self.reading = False
+        self.dirty = False     # an action came during a read: read again as soon as it ends
+        self.fast_until = 0.0  # read every POLL_ACTIVE seconds until then
 
 
 def make_client():
@@ -150,7 +153,10 @@ def _read(chat, user, person):
     try:
         state = client.tab_state(person.snapshot, person.last_ok, time.time(), person.down)
         same = person.state is not None and {**person.state, "updated": 0} == {**state, "updated": 0}
-        again = time.time() + client.poll_every(person.snapshot)
+        now = time.time()
+        every = client.POLL_ACTIVE if now < person.fast_until else client.poll_every(person.snapshot)
+        again = 0.0 if person.dirty else now + every
+        person.dirty = False
         if not same:
             if chat.feed_add(user, _event(state)):
                 person.state = state
@@ -162,8 +168,11 @@ def _read(chat, user, person):
 
 
 def _read_soon(user):
+    """After an action: read at once (or as soon as a running read ends), then quickly for a minute."""
     person = _people.get(user.name)
     if person is not None:
+        person.fast_until = time.time() + FAST_FOR
+        person.dirty = person.reading
         person.due = 0.0
 
 

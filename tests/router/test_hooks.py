@@ -235,3 +235,29 @@ def test_threads_are_daemons(mc):
     readers = [t for t in threading.enumerate() if t.name.startswith("bambu-tab")]
     assert readers and all(t.daemon for t in readers)
     tick_and_wait(mc, now=0)
+
+
+
+def test_action_during_a_read_still_makes_the_next_read_due(mc):
+    mc.chat.open = {"alice"}
+    mc.client.sleep = 0.3
+    mc.client.snap = {**SNAPSHOT, "status": {"gcode_state": "PAUSE"}}
+    mc.bambu.on_tick(desk(OWNER), time.time())  # a read starts
+    mc.bambu.chat_tab_action(OWNER, "pause", {})  # while it runs
+    tick_and_wait(mc, now=time.time())
+    mc.client.sleep = 0
+    mc.client.snap = {**SNAPSHOT, "status": {"gcode_state": "FINISH"}}
+    tick_and_wait(mc, now=time.time())  # due at once, not in 5 or 30 s
+    assert states(mc)[-1]["snapshot"]["status"]["gcode_state"] == "FINISH"
+
+
+def test_reads_are_fast_for_a_minute_after_an_action(mc):
+    idle = {**SNAPSHOT, "status": {"gcode_state": "IDLE"}}
+    mc.client.snap = idle
+    mc.chat.open = {"alice"}
+    tick_and_wait(mc, now=0)
+    person = mc.bambu._people["alice"]
+    assert person.due - time.time() > 20  # idle: 30 s
+    mc.bambu.chat_tab_action(OWNER, "prepare", {"job_id": "7", "plate": "1"})
+    tick_and_wait(mc, now=time.time())
+    assert person.due - time.time() <= 5.5  # just asked: 5 s
