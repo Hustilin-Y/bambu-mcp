@@ -662,12 +662,19 @@ class Service:
                 expired = _EXPIRED_ON_SEND.get(row.kind, _SPENT_TEXTS["expired"])
                 text, buttons, expires_in = f"{text}\n\n{expired}", None, None
         try:
-            await self._notifier.send(text, buttons=buttons, files=files, dedupe=row.dedupe, expires_in=expires_in)
+            message_id = await self._notifier.send(
+                text, buttons=buttons, files=files, dedupe=row.dedupe, expires_in=expires_in
+            )
         except SendError as exc:
             return self._delivery_failed(row, exc)
         except Exception as exc:  # a bug in the client must not stop the outbox
             log.exception("sending a %s message failed", row.kind)
             return self._delivery_failed(row, SendError(None, type(exc).__name__))
+        if row.ref is not None and message_id is not None:
+            try:
+                self._store.record_sent(row.ref, message_id, text, now)
+            except Exception:  # the message went out: only the Mini App's view of it is lost
+                log.exception("recording a sent %s message failed", row.kind)
         self._drop(row)
         self._quiet.reset("outbox")
         return 0
@@ -752,8 +759,12 @@ class Service:
         buttons: list[list[Button]] | None = None,
         snapshot: bool = False,
         expires_at: float | None = None,
+        ref: str | None = None,
     ) -> None:
-        """Queue a message. ``expires_at`` (epoch seconds): when its buttons stop working."""
+        """Queue a message. ``expires_at`` (epoch seconds): when its buttons stop working.
+
+        ``ref`` names what the message is for, so its Telegram id can be found once sent.
+        """
         self._store.outbox_add(
             kind,
             text,
@@ -762,6 +773,7 @@ class Service:
             snapshot=snapshot,
             now=self._clock().timestamp(),
             expires_at=expires_at,
+            ref=ref,
         )
         if self._outbox_wake is not None:
             self._outbox_wake.set()
@@ -2159,6 +2171,7 @@ class Service:
                 f"start|{_id_tag(confirmation.id)}",
                 buttons=start_buttons(confirmation.id),
                 expires_at=confirmation.expires_at,
+                ref=f"confirm:{confirmation.id}",
             )
         log.info("job %d plate %d: start confirmation sent", target.job.id, plate)
         return PrepareResult(confirmation.id, text, list(check.warnings))
@@ -2705,6 +2718,7 @@ class Service:
                 f"stop|{_id_tag(confirmation.id)}",
                 buttons=stop_buttons(confirmation.id),
                 expires_at=confirmation.expires_at,
+                ref=f"confirm:{confirmation.id}",
             )
         log.info("stop confirmation sent")
         return StopRequest(confirmation.id, text)

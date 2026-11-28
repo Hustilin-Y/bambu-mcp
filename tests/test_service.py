@@ -41,6 +41,7 @@ from bambu_mcp.service import (
 )
 from bambu_mcp.slicer import FetchError, SliceOutcome, WakeError
 from bambu_mcp.store.db import Store
+from bambu_mcp.store.models import SentRef
 
 FIXTURES = Path(__file__).parent / "fixtures" / "p2s"
 T0 = datetime(2026, 11, 22, 10, 0, tzinfo=UTC)
@@ -3609,3 +3610,15 @@ def test_tray_now_254_is_the_external_spool():
     assert _tray_slot({"print": {"ams": {"tray_now": "254"}}}) == (255, 254)
     assert _tray_slot({"print": {"ams": {"tray_now": "255"}}}) is None  # nothing feeding
     assert _tray_slot({"print": {"ams": {"tray_now": "2"}}}) == (0, 2)
+
+
+async def test_send_records_the_message_of_a_ref(tmp_path):
+    clock = Clock(T0)
+    notifier = RecordingNotifier()
+    service, store = bare_service(tmp_path, notifier, clock)
+    service._enqueue("stop_confirm", "stop?", "stop|x", ref="confirm:abc")
+    service._enqueue("started", "go", "started|x")
+    await service.send_next()
+    await service.send_next()
+    assert store.sent_message("confirm:abc") == SentRef("m1", "stop?")
+    store.close()
