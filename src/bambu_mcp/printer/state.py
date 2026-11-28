@@ -179,7 +179,10 @@ def apply(state: PrinterState, report: dict) -> PrinterState:
     if not isinstance(report, dict):
         return state
     p = report.get("print")
-    if not isinstance(p, dict) or p.get("command") == "gcode_line":
+    # Only status pushes describe the printer. A command's echo (project_file, gcode_line, ...)
+    # repeats the request: project_file names the new job while the printer still reports the
+    # last one's FINISH, which would hide the start (events._deferred_start).
+    if not isinstance(p, dict) or p.get("command", "push_status") != "push_status":
         return state
 
     changes: dict[str, Any] = {}

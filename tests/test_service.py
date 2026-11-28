@@ -2597,6 +2597,7 @@ class PrintLink(FakeLink):
         self.answer: str | None = "RUNNING"
         self.refuse = False
         self.after_send: Exception | None = None  # raised once the project_file is out
+        self.echo = False  # answer a project_file with its echo first, as the printer does
         self.events: list[str] = []
 
     def request_full_report(self) -> None:
@@ -2621,6 +2622,11 @@ class PrintLink(FakeLink):
             raise PrinterNotConnected("printer link is not connected, nothing was sent")
         self.events.append("project_file")
         self.projects.append(fields)
+        if self.echo:
+            self.on_report({"print": {
+                "command": "project_file", "sequence_id": "1", "result": "success", "param": "Metadata/plate_1.gcode",
+                "subtask_name": fields["subtask_name"], "task_id": fields["task_id"],
+            }})
         if self.answer is not None:
             self.on_report({"print": {
                 "gcode_state": self.answer, "task_id": fields["task_id"], "subtask_name": fields["subtask_name"],
@@ -2828,6 +2834,31 @@ async def test_press_starts_once_then_started_message(harness):
         "file": job.sliced_file, "plate": 1, "md5": MD5_1.lower(),
         "subtask_name": job.sliced_file.removesuffix(".gcode.3mf"), "task_id": task_id, "ams": 0, "slot": 0,
     }
+    started = [m for m in harness.notifier.sent if "Печать началась" in m["text"]]
+    assert len(started) == 1
+    assert plain(started[0]["buttons"]) == [[(f"stop:ask:{task_id}", "Остановить…")]]
+
+
+async def test_a_start_after_a_finished_print_is_announced_once(harness):
+    # 2026-11-28: from FINISH, the echo of project_file (new name and task id) came before
+    # PREPARE, so the start was held a report and the fallback message went out as well.
+    service, job, printer = await print_harness(harness)
+    printer["print"].update(gcode_state="FINISH", subtask_name="last-job-1-p1", task_id="1795858419")
+    link = harness.links[-1]
+    link.echo, link.answer = True, "PREPARE"
+    cid = (await service.prepare_print(job.id)).confirm_id
+    await until(lambda: harness.store.outbox_count() == 0)
+
+    await press(harness, f"start:{cid}:go")
+    assert await pressed_to_the_end(harness, cid) == "started"
+
+    task_id = link.projects[0]["task_id"]
+    name = link.projects[0]["subtask_name"]
+    await harness.feed_report({"print": {
+        "command": "push_status", "gcode_state": "RUNNING", "subtask_name": name, "task_id": task_id,
+        "mc_percent": 0, "layer_num": 0, "total_layer_num": 50,
+    }})
+    await until(lambda: harness.store.outbox_count() == 0)
     started = [m for m in harness.notifier.sent if "Печать началась" in m["text"]]
     assert len(started) == 1
     assert plain(started[0]["buttons"]) == [[(f"stop:ask:{task_id}", "Остановить…")]]
