@@ -1,6 +1,8 @@
 # bambu
 
-One person's assistant runs their Bambu Lab printer through [bambu-mcp](https://github.com/Hustilin-Y/bambu-mcp): status, camera, spools, print jobs from CAD Workshop, slicing, cost estimates. A print starts or stops only when that person presses a button in Telegram.
+One person's assistant runs their Bambu Lab printer through [bambu-mcp](https://github.com/Hustilin-Y/bambu-mcp): status, camera, spools, print jobs from CAD Workshop, slicing, cost estimates. A print starts, resumes or stops only when that person presses the service's button, in Telegram or in the chat Mini App's Print tab.
+
+With the chat add-in on, the owner gets a **Печать** tab in the Mini App: the printer, slots, jobs, history, what the system can do, and Pause, Resume, Stop and Print. `install.sh` puts its router module into multiclaude (`lib/multiclaude/addons/bambu/`, and one line adding `bambu` at the end of the add-in list), `setup` writes `~/.config/bambu/miniapp.json` (mode 600) with the tab's own token, which reaches only the service's `/v1/` API. Run `assistant relay deploy` after installing so the relay serves the tab's page.
 
 ## What it needs
 

@@ -6,7 +6,8 @@ A Python service that monitors and drives a Bambu Lab 3D printer over its local 
 
 1. Monitor: read-only status, print tracking, energy and cost estimates, notifications.
 2. Jobs: print jobs from CAD Workshop, sliced on the owner's PC, spool inventory, `load_spool`.
-3. Printing: start a sliced job, pause and stop. A print starts or stops only on the owner's press in Telegram.
+3. Printing: start a sliced job, pause, resume and stop. A print starts, resumes or stops only on the owner's press on the service's button, in Telegram or the Mini App.
+4. The Print tab in the multiclaude chat Mini App (owner only): status, slots, jobs, history, what the system can do, Pause, Resume, Stop and Print. Design: [docs/superpowers/specs/2026-11-28-miniapp-print-tab-design.md](docs/superpowers/specs/2026-11-28-miniapp-print-tab-design.md).
 
 ## MCP tools
 
@@ -16,7 +17,7 @@ A Python service that monitors and drives a Bambu Lab 3D printer over its local 
 | Write (service data) | `add_spool`, `update_spool`, `set_spool_weight`, `map_slot`, `add_plate`, `set_default_plate`, `set_tariff`, `set_currency`, `set_country`, `set_amortization`, `update_print`, `create_job`, `propose_job`, `slice_job`, `evaluate_job`, `choose_variant`, `reset_settings` |
 | Printer writes | `load_spool` (AMS slot or external spool setting), `prepare_print` (sends the start confirmation, starts nothing), `pause_print` (only while `RUNNING`), `request_stop` (sends the stop confirmation, stops nothing) |
 
-There is no `start_print` tool and no resume. See [deploy/README.md](deploy/README.md), step 8, for what phase 3 needs and what is never exposed.
+There is no `start_print` tool and no resume tool: resume is the owner's Resume button only. The Mini App's `/v1/` API (an `APP_TOKEN_*` token, never valid on `/mcp`) reads a snapshot and capabilities and can pause, ask to stop, prepare and send a snapshot. See [deploy/README.md](deploy/README.md), step 8, for what phase 3 needs and what is never exposed.
 
 ## Printer models
 
